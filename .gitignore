@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.password
+*.secret
+
+# Runtime data: staged Steam files, uploaded replays, logs
+runtime/
+
+# JavaScript/Tauri build output
+node_modules/
+dist/
+build/
+src-tauri/target/
+src-tauri/binaries/*.exe
+src-tauri/gen/
+wod-replay-server.spec
+tools/python-probe-dll/target/
+
+# Local tooling noise
+.idea/
+.vscode/
+*.log
+out.txt
+err.txt

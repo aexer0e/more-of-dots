@@ -1,0 +1,22 @@
+[package]
+name = "wod-replay-desktop"
+version = "0.1.0"
+description = "War of Dots local replay simulator"
+authors = ["War of Dots Replay"]
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "wod_replay_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-autostart = "2"
+tauri-plugin-shell = "2"

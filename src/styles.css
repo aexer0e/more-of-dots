@@ -208,6 +208,64 @@ input[type="range"] {
   font-weight: 850;
 }
 
+.seek-bar {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  min-height: 28px;
+  outline: none;
+  touch-action: none;
+  width: 100%;
+}
+
+.seek-track {
+  background: rgba(117, 123, 128, 0.36);
+  border-radius: 999px;
+  height: 6px;
+  overflow: visible;
+  position: relative;
+  width: 100%;
+}
+
+.seek-loaded,
+.seek-played {
+  border-radius: inherit;
+  height: 100%;
+  left: 0;
+  position: absolute;
+  top: 0;
+}
+
+.seek-loaded {
+  background: rgba(235, 240, 242, 0.62);
+}
+
+.seek-played {
+  background: #ffffff;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.28);
+}
+
+.seek-thumb {
+  background: #ffffff;
+  border-radius: 50%;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.38);
+  height: 14px;
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 14px;
+}
+
+.seek-bar:focus-visible .seek-thumb {
+  outline: 2px solid rgba(255, 255, 255, 0.78);
+  outline-offset: 3px;
+}
+
+.seek-bar:hover .seek-track,
+.seek-bar:focus-visible .seek-track {
+  height: 8px;
+}
+
 .welcome-screen,
 .loading-screen,
 .drop-overlay {
@@ -235,6 +293,14 @@ input[type="range"] {
   text-align: center;
 }
 
+.loading-card {
+  display: grid;
+  grid-template-rows: 36px 58px 14px 22px 154px;
+  height: 344px;
+  overflow: hidden;
+  width: min(560px, calc(100vw - 48px));
+}
+
 .welcome-screen.drop-active .welcome-card {
   border-color: rgba(242, 193, 78, 0.7);
 }
@@ -251,11 +317,16 @@ input[type="range"] {
 
 .welcome-card h2,
 .loading-card h2 {
+  align-items: center;
   color: var(--text);
+  display: flex;
   font-size: 26px;
+  justify-content: center;
   letter-spacing: 0;
   line-height: 1.12;
-  margin: 0 0 10px;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
   text-transform: none;
 }
 
@@ -263,7 +334,9 @@ input[type="range"] {
 .loading-card p {
   color: var(--muted);
   line-height: 1.5;
-  margin: 0 0 18px;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .backend-line {
@@ -279,7 +352,7 @@ input[type="range"] {
   border-radius: 999px;
   height: 12px;
   overflow: hidden;
-  width: min(420px, 72vw);
+  width: 100%;
 }
 
 .progress-fill {
@@ -295,8 +368,8 @@ input[type="range"] {
   display: flex;
   font-size: 12px;
   gap: 12px;
-  justify-content: space-between;
-  margin-top: 10px;
+  justify-content: center;
+  margin-top: 8px;
 }
 
 .progress-meta span {
@@ -314,8 +387,11 @@ input[type="range"] {
 .progress-facts {
   display: grid;
   gap: 7px;
+  grid-auto-rows: 34px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  height: 154px;
   margin-top: 14px;
+  overflow: hidden;
   text-align: left;
 }
 
@@ -326,6 +402,7 @@ input[type="range"] {
   color: #c8d4da;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  height: 34px;
   min-width: 0;
   overflow: hidden;
   padding: 7px 8px;

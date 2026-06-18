@@ -1,4 +1,7 @@
-use std::fs;
+use std::collections::BTreeMap;
+use std::env;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +12,8 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
 
+const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
+
 #[derive(Serialize)]
 struct ArtifactPayload {
     filename: String,
@@ -17,8 +22,17 @@ struct ArtifactPayload {
     bytes: u64,
 }
 
+#[derive(Serialize)]
+struct UnitAssetsPayload {
+    asset_dir: String,
+    assets: BTreeMap<String, String>,
+}
+
 fn app_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(&path).map_err(|error| error.to_string())?;
     Ok(path)
 }
@@ -56,7 +70,22 @@ fn latest_progress_event(path: &Path) -> (Option<Value>, usize) {
     (latest, count)
 }
 
-async fn run_backend(app: &AppHandle, command: &str, extra_args: Vec<String>) -> Result<Value, String> {
+fn steam_game_dir() -> PathBuf {
+    env::var_os("WOD_STEAM_GAME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STEAM_GAME_DIR))
+}
+
+fn png_data_url(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(format!("data:image/png;base64,{}", BASE64.encode(bytes)))
+}
+
+async fn run_backend(
+    app: &AppHandle,
+    command: &str,
+    extra_args: Vec<String>,
+) -> Result<Value, String> {
     let runtime_dir = app_runtime_dir(app)?;
     let mut args = vec![
         "--desktop-command".to_string(),
@@ -111,7 +140,12 @@ async fn stage_game(app: AppHandle) -> Result<Value, String> {
 
 #[tauri::command]
 async fn list_jobs(app: AppHandle) -> Result<Value, String> {
-    run_backend(&app, "list-jobs", vec!["--limit".to_string(), "20".to_string()]).await
+    run_backend(
+        &app,
+        "list-jobs",
+        vec!["--limit".to_string(), "20".to_string()],
+    )
+    .await
 }
 
 #[tauri::command]
@@ -120,7 +154,11 @@ async fn get_job(app: AppHandle, job_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn capture_replay(app: AppHandle, filename: String, replay_base64: String) -> Result<Value, String> {
+async fn capture_replay(
+    app: AppHandle,
+    filename: String,
+    replay_base64: String,
+) -> Result<Value, String> {
     let runtime_dir = app_runtime_dir(&app)?;
     let uploads_dir = runtime_dir.join("desktop-uploads");
     fs::create_dir_all(&uploads_dir).map_err(|error| error.to_string())?;
@@ -151,14 +189,26 @@ async fn capture_replay(app: AppHandle, filename: String, replay_base64: String)
     result
 }
 
-fn artifact_path(runtime_dir: &Path, job_id: &str, kind: &str) -> Result<(PathBuf, String, String), String> {
+fn artifact_path(
+    runtime_dir: &Path,
+    job_id: &str,
+    kind: &str,
+) -> Result<(PathBuf, String, String), String> {
     if job_id.is_empty() || !job_id.chars().all(|char| char.is_ascii_hexdigit()) {
         return Err("Invalid job id.".to_string());
     }
 
     let (file_name, download_name, mime_type) = match kind {
-        "simulated-replay" => ("simulated.rep", format!("{job_id}-simulated.rep"), "application/gzip"),
-        "stats" => ("stats.json", format!("{job_id}-stats.json"), "application/json"),
+        "simulated-replay" => (
+            "simulated.rep",
+            format!("{job_id}-simulated.rep"),
+            "application/gzip",
+        ),
+        "stats" => (
+            "stats.json",
+            format!("{job_id}-stats.json"),
+            "application/json",
+        ),
         "logs" => ("logs.txt", format!("{job_id}-logs.txt"), "text/plain"),
         _ => return Err(format!("Unknown artifact kind: {kind}")),
     };
@@ -170,10 +220,15 @@ fn artifact_path(runtime_dir: &Path, job_id: &str, kind: &str) -> Result<(PathBu
 }
 
 #[tauri::command]
-async fn read_artifact(app: AppHandle, job_id: String, kind: String) -> Result<ArtifactPayload, String> {
+async fn read_artifact(
+    app: AppHandle,
+    job_id: String,
+    kind: String,
+) -> Result<ArtifactPayload, String> {
     let runtime_dir = app_runtime_dir(&app)?;
     let (path, filename, mime_type) = artifact_path(&runtime_dir, &job_id, &kind)?;
-    let bytes = fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     Ok(ArtifactPayload {
         filename,
         mime_type,
@@ -183,13 +238,137 @@ async fn read_artifact(app: AppHandle, job_id: String, kind: String) -> Result<A
 }
 
 #[tauri::command]
-async fn capture_progress(app: AppHandle, filename: String, started_after_ms: u64) -> Result<Value, String> {
+async fn capture_partial_stats(app: AppHandle, job_id: String) -> Result<Option<Value>, String> {
+    if job_id.is_empty() || !job_id.chars().all(|char| char.is_ascii_hexdigit()) {
+        return Err("Invalid job id.".to_string());
+    }
+    let runtime_dir = app_runtime_dir(&app)?;
+    let path = runtime_dir
+        .join("jobs")
+        .join(job_id)
+        .join("stats.json.partial.json");
+    Ok(read_json_file(&path))
+}
+
+#[tauri::command]
+async fn capture_sample_delta(app: AppHandle, job_id: String, offset: u64) -> Result<Value, String> {
+    if job_id.is_empty() || !job_id.chars().all(|char| char.is_ascii_hexdigit()) {
+        return Err("Invalid job id.".to_string());
+    }
+    let runtime_dir = app_runtime_dir(&app)?;
+    let root = runtime_dir.join("jobs").join(job_id);
+    let sample_path = root.join("stats.json.samples.jsonl");
+    let meta_path = root.join("stats.json.partial.meta.json");
+    let final_stats_path = root.join("stats.json");
+    let meta = read_json_file(&meta_path);
+    let final_stats = read_json_file(&final_stats_path);
+
+    let Ok(metadata) = fs::metadata(&sample_path) else {
+        return Ok(json!({
+            "found": false,
+            "offset": 0u64,
+            "samples": [],
+            "meta": meta,
+            "final_stats": final_stats,
+        }));
+    };
+
+    let len = metadata.len();
+    let start = offset.min(len);
+    let mut file = File::open(&sample_path).map_err(|error| format!("Could not open {}: {error}", sample_path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("Could not seek {}: {error}", sample_path.display()))?;
+
+    let max_bytes = 2_000_000usize;
+    let mut buffer = vec![0u8; max_bytes];
+    let bytes_read = file
+        .read(&mut buffer)
+        .map_err(|error| format!("Could not read {}: {error}", sample_path.display()))?;
+    buffer.truncate(bytes_read);
+
+    let mut consumed = bytes_read as u64;
+    if bytes_read == max_bytes {
+        if let Some(position) = buffer.iter().rposition(|byte| *byte == b'\n') {
+            buffer.truncate(position + 1);
+            consumed = (position + 1) as u64;
+        } else {
+            buffer.clear();
+            consumed = 0;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buffer);
+    let samples = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let next_offset = start.saturating_add(consumed).min(len);
+
+    Ok(json!({
+        "found": true,
+        "offset": next_offset,
+        "samples": samples,
+        "meta": meta,
+        "final_stats": final_stats,
+        "stream_bytes": len,
+    }))
+}
+
+#[tauri::command]
+async fn unit_assets() -> Result<UnitAssetsPayload, String> {
+    let asset_dir = steam_game_dir().join("assets");
+    let colors = ["blue", "red", "purple", "orange"];
+    let mut names = Vec::new();
+    for color in colors {
+        for suffix in [
+            "inf1",
+            "inf2",
+            "inf3",
+            "tank1",
+            "tank2",
+            "tank3",
+            "ship",
+            "heavy_ship",
+        ] {
+            names.push(format!("{color}_{suffix}"));
+        }
+    }
+    names.push("black_ship".to_string());
+    names.push("capital".to_string());
+    names.push("city_icon".to_string());
+    for color in colors {
+        names.push(format!("{color}_flag"));
+    }
+
+    let mut assets = BTreeMap::new();
+    for name in names {
+        let path = asset_dir.join(format!("{name}.png"));
+        if let Some(data_url) = png_data_url(&path) {
+            assets.insert(name, data_url);
+        }
+    }
+
+    Ok(UnitAssetsPayload {
+        asset_dir: asset_dir.to_string_lossy().to_string(),
+        assets,
+    })
+}
+
+#[tauri::command]
+async fn capture_progress(
+    app: AppHandle,
+    filename: String,
+    started_after_ms: u64,
+) -> Result<Value, String> {
     let runtime_dir = app_runtime_dir(&app)?;
     let jobs_dir = runtime_dir.join("jobs");
     let mut best: Option<(u64, PathBuf, Value)> = None;
+    let mut fallback_best: Option<(u64, PathBuf, Value)> = None;
     let cutoff = started_after_ms.saturating_sub(15_000);
 
-    let entries = fs::read_dir(&jobs_dir).map_err(|error| format!("Could not read {}: {error}", jobs_dir.display()))?;
+    let entries = fs::read_dir(&jobs_dir)
+        .map_err(|error| format!("Could not read {}: {error}", jobs_dir.display()))?;
     for entry in entries.flatten() {
         let root = entry.path();
         if !root.is_dir() {
@@ -199,16 +378,18 @@ async fn capture_progress(app: AppHandle, filename: String, started_after_ms: u6
         let Some(job) = read_json_file(&job_path) else {
             continue;
         };
-        if job.get("filename").and_then(Value::as_str) != Some(filename.as_str()) {
-            continue;
-        }
+        let filename_matches = job.get("filename").and_then(Value::as_str) == Some(filename.as_str());
         let progress_path = root.join("live-capture-artifact.json.progress.jsonl");
         let stats_path = root.join("stats.json");
+        let partial_meta_path = root.join("stats.json.partial.meta.json");
+        let sample_stream_path = root.join("stats.json.samples.jsonl");
         let artifact_path = root.join("live-capture-artifact.json");
         let latest_mtime = [
             file_modified_millis(&job_path),
             file_modified_millis(&progress_path),
             file_modified_millis(&stats_path),
+            file_modified_millis(&partial_meta_path),
+            file_modified_millis(&sample_stream_path),
             file_modified_millis(&artifact_path),
         ]
         .into_iter()
@@ -217,23 +398,55 @@ async fn capture_progress(app: AppHandle, filename: String, started_after_ms: u6
         if latest_mtime < cutoff {
             continue;
         }
-        if best.as_ref().map(|(mtime, _, _)| latest_mtime > *mtime).unwrap_or(true) {
-            best = Some((latest_mtime, root, job));
+        if filename_matches {
+            if best
+                .as_ref()
+                .map(|(mtime, _, _)| latest_mtime > *mtime)
+                .unwrap_or(true)
+            {
+                best = Some((latest_mtime, root, job));
+            }
+        } else if fallback_best
+            .as_ref()
+            .map(|(mtime, _, _)| latest_mtime > *mtime)
+            .unwrap_or(true)
+        {
+            fallback_best = Some((latest_mtime, root, job));
         }
     }
 
-    let Some((latest_mtime_ms, root, job)) = best else {
+    let Some((latest_mtime_ms, root, job)) = best.or(fallback_best) else {
         return Ok(json!({ "found": false }));
     };
 
     let progress_path = root.join("live-capture-artifact.json.progress.jsonl");
     let artifact_path = root.join("live-capture-artifact.json");
     let stats_path = root.join("stats.json");
+    let partial_meta_path = root.join("stats.json.partial.meta.json");
     let (event, event_count) = latest_progress_event(&progress_path);
     let artifact = read_json_file(&artifact_path);
     let stats = read_json_file(&stats_path);
+    let partial_stats = read_json_file(&partial_meta_path);
     let stats_summary = stats.as_ref().and_then(|value| {
-        let samples = value.get("samples").and_then(Value::as_array).map(|items| items.len()).unwrap_or(0);
+        let samples = value
+            .get("samples")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        Some(json!({
+            "source": value.get("source"),
+            "sample_rate_hz": value.get("sample_rate_hz"),
+            "sample_count": samples,
+            "summary": value.get("summary").cloned().unwrap_or(Value::Null),
+            "replay_metadata": value.get("replay_metadata").cloned().unwrap_or(Value::Null),
+        }))
+    });
+    let partial_stats_summary = partial_stats.as_ref().and_then(|value| {
+        let samples = value
+            .get("samples")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
         Some(json!({
             "source": value.get("source"),
             "sample_rate_hz": value.get("sample_rate_hz"),
@@ -259,16 +472,13 @@ async fn capture_progress(app: AppHandle, filename: String, started_after_ms: u6
         "event_count": event_count,
         "artifact": artifact_summary,
         "stats": stats_summary,
+        "partial_stats": partial_stats_summary,
     }))
 }
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--background"]),
-        ))
         .invoke_handler(tauri::generate_handler![
             backend_status,
             stage_game,
@@ -276,6 +486,9 @@ pub fn run() {
             get_job,
             capture_replay,
             read_artifact,
+            capture_partial_stats,
+            capture_sample_delta,
+            unit_assets,
             capture_progress
         ])
         .run(tauri::generate_context!())

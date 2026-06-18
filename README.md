@@ -2,7 +2,7 @@
 
 Local Windows replay simulator for War of Dots. The installed Tauri app validates `.rep` files, launches the staged game on a private Windows desktop, injects the local Python probe, captures live gamestate from the game's replay scene, and returns stats plus a synthesized replay artifact. Normal capture fails closed if it cannot produce game-backed samples.
 
-The desktop target is a single Tauri app with a bundled backend command executable. The UI talks to Tauri commands, not a localhost web API, so normal app use does not start a persistent server or bind a port.
+The desktop target is a single Tauri app with a bundled backend command executable. The UI talks to Tauri commands, not a localhost web API, so normal app use does not start a persistent server or bind a port. The packaged sidecar is command-mode only; install the optional API/dev dependencies before using `scripts\run-server.ps1`.
 
 ## Quick Start
 
@@ -12,6 +12,7 @@ npm run build
 ```
 
 The Tauri NSIS installer is emitted under `src-tauri\target\release\bundle\nsis`.
+The build also writes a non-failing size report to `build\size-audit.json`.
 
 ## Desktop App
 
@@ -66,7 +67,7 @@ Window strategy is still applied after a window handle is found. Supported value
 
 For the current War of Dots build, `game-live-python` is the practical hidden-game path. It does not open a visible game window and it does not need a VM, but it still requires a logged-in Windows session because the game client expects a desktop/GPU context.
 
-Normal live capture runs until the replay end tick is reached. `WOD_LIVE_CAPTURE_SECONDS` is only honored for diagnostic windowed captures when `WOD_LIVE_CAPTURE_MODE` is set to `window`, `sample`, `samples`, or `fixed`; otherwise the app refuses partial playback. Hidden game capture defaults to a 20x pump via `WOD_LIVE_SIM_SPEED`; replay packets are scheduled through `ReplayConnection.download_data(...)`, then each frame uses the real game-core `update()` path via `WOD_LIVE_FAST_FORWARD_STEP_METHOD=game-update`.
+Normal live capture runs until the replay end tick is reached. `WOD_LIVE_CAPTURE_SECONDS` is only honored for diagnostic windowed captures when `WOD_LIVE_CAPTURE_MODE` is set to `window`, `sample`, `samples`, or `fixed`; otherwise the app refuses partial playback. Hidden game capture defaults to a 120x internal pump via `WOD_LIVE_SIM_SPEED`, bypassing the visible replay UI's 10x keyboard cap. Replay packets are scheduled through `ReplayConnection.download_data(...)`, then each frame uses the real game-core `update()` path via `WOD_LIVE_FAST_FORWARD_STEP_METHOD=game-update`. Capture quality is controlled separately with `WOD_LIVE_REPLAY_SAMPLE_HZ`, which defaults to `2` samples per replay second. At War of Dots' 30 tick/sec clock this captures about every 15 ticks while still running with `WOD_LIVE_CAPTURE_THROTTLE_SECONDS=0`; speed comes from removing wall-clock waits, not from skipping 8-10 seconds of gameplay between samples.
 
 ## Capture R&D Commands
 

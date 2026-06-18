@@ -127,6 +127,11 @@ def _run_game_python_capture(paths: JobPaths, metadata: dict[str, Any]) -> dict[
     )
 
 
+def _cleanup_capture_processes(paths: JobPaths, reason: str) -> None:
+    cleanup = replay_runner.cleanup_game_processes(paths.job_id)
+    store.append_log(paths, f"{reason} staged game process cleanup: {cleanup}")
+
+
 def _capture_error(capture: dict[str, Any]) -> str:
     return (
         capture.get("message")
@@ -229,6 +234,8 @@ def run_capture_job(job_id: str) -> None:
 
     with capture_lock:
         try:
+            store.update_job(paths, status="cleaning_stale_game_processes")
+            _cleanup_capture_processes(paths, "Pre-capture")
             job = store.update_job(paths, status="local_runner_starting")
             capture_source = settings.capture_source.lower()
             if capture_source == "game-python":
@@ -245,7 +252,9 @@ def run_capture_job(job_id: str) -> None:
                 return
 
             if capture_source == "game-live-python":
+                store.update_job(paths, status="spawning_hidden_game_process")
                 store.update_job(paths, status="launching_hidden_game")
+                store.update_job(paths, status="running_hidden_game_capture")
                 _finalize_capture(paths, _run_game_python_capture(paths, job["metadata"]))
                 return
 
@@ -254,7 +263,9 @@ def run_capture_job(job_id: str) -> None:
                 runner_state = replay_runner.describe()
                 if runner_state.get("game_live_capture_available"):
                     store.append_log(paths, "Trying live Python capture from hidden game.")
+                    store.update_job(paths, status="spawning_hidden_game_process", error=None)
                     store.update_job(paths, status="launching_hidden_game", error=None)
+                    store.update_job(paths, status="running_hidden_game_capture", error=None)
                     live_capture = _run_game_python_capture(paths, job["metadata"])
                     if live_capture.get("status") == "succeeded" and _has_authoritative_samples(live_capture):
                         _finalize_capture(paths, live_capture)
@@ -284,6 +295,7 @@ def run_capture_job(job_id: str) -> None:
             _write_capture_request(paths, job["metadata"], profile)
 
             store.update_job(paths, status="starting_game")
+            store.update_job(paths, status="spawning_hidden_game_process")
             store.update_job(paths, status="opening_replay")
             store.update_job(paths, status="sampling_memory")
             capture = replay_runner.capture_replay(job_id, timeout_seconds=settings.capture_timeout_seconds)
@@ -294,6 +306,8 @@ def run_capture_job(job_id: str) -> None:
         except Exception as exc:
             store.append_log(paths, f"Capture failed unexpectedly: {exc}")
             store.update_job(paths, status="failed", error=str(exc))
+        finally:
+            _cleanup_capture_processes(paths, "Post-capture")
 
 
 @app.get("/healthz")

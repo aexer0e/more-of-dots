@@ -41,16 +41,36 @@ $PyInstallerArgs = @(
     '--clean',
     '--noconfirm',
     '--noupx',
+    '--windowed',
     '--onefile',
+    '--optimize',
+    '2',
     '--name',
     'wod-replay-server'
 )
+if ($env:WOD_PYINSTALLER_STRIP -match '^(1|true|yes|on)$') {
+    $PyInstallerArgs += '--strip'
+}
 foreach ($DataPath in $AddData) {
     $PyInstallerArgs += @('--add-data', $DataPath)
 }
+$ExcludedModules = @(
+    'fastapi',
+    'starlette',
+    'pydantic',
+    'pydantic_core',
+    'uvicorn',
+    'watchfiles',
+    'websockets',
+    'httptools',
+    'yaml',
+    'multipart',
+    'python_multipart'
+)
+foreach ($Module in $ExcludedModules) {
+    $PyInstallerArgs += @('--exclude-module', $Module)
+}
 $PyInstallerArgs += @(
-    '--hidden-import',
-    'wod_replay_server.app',
     '--hidden-import',
     'wod_replay_server.desktop_cli',
     (Join-Path $Root 'wod_replay_server\sidecar.py')
@@ -64,4 +84,5 @@ if (-not (Test-Path $BuiltExe)) {
 
 $TauriExe = Join-Path $BinaryDir "wod-replay-server-$TargetTriple.exe"
 Copy-Item -LiteralPath $BuiltExe -Destination $TauriExe -Force
-Write-Host "Built Tauri sidecar: $TauriExe"
+$SidecarSize = [Math]::Round(((Get-Item -LiteralPath $TauriExe).Length / 1MB), 2)
+Write-Host "Built Tauri sidecar: $TauriExe ($SidecarSize MB)"

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from .config import AppSettings
+
+
+def _hidden_process_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kwargs
 
 
 def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -15,6 +23,7 @@ def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=timeout,
         check=False,
+        **_hidden_process_kwargs(),
     )
 
 
@@ -39,6 +48,26 @@ class LocalSessionRunner:
     @property
     def game_exe(self) -> Path:
         return self.settings.staged_game_dir / "game.exe"
+
+    def cleanup_game_processes(self, job_id: str | None) -> dict[str, Any]:
+        if not job_id:
+            return {"status": "skipped", "message": "No job id supplied."}
+        try:
+            command = self._runner_command(["-CleanupJob", "-JobId", job_id], timeout_ms=15_000)
+        except (OSError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+        try:
+            result = _run(command, timeout=20)
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "message": "Timed out while cleaning staged game process."}
+        parsed = _parse_json_result(result.stdout) or {}
+        return {
+            "status": "succeeded" if result.returncode == 0 else "failed",
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            **parsed,
+        }
 
     def describe(self) -> dict[str, Any]:
         game_python_probe = (
@@ -106,6 +135,43 @@ class LocalSessionRunner:
             **(parsed or {}),
         }
 
+    def _run_owned_runner_command(
+        self,
+        command: list[str],
+        *,
+        job_id: str,
+        timeout_seconds: int,
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
+        cleanup_events: list[dict[str, Any]] = []
+        cleanup_events.append({"phase": "before_start", **self.cleanup_game_processes(job_id)})
+
+        process = subprocess.Popen(  # noqa: S603 - arguments are constructed internally and shell=False.
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_hidden_process_kwargs(),
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr), cleanup_events
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            timeout_cleanup = self.cleanup_game_processes(job_id)
+            cleanup_events.append({"phase": "timeout", **timeout_cleanup})
+            message = f"Local runner timed out after {timeout_seconds}s; staged game cleanup was requested."
+            stderr = "\n".join(part for part in [stderr.strip(), message] if part)
+            return subprocess.CompletedProcess(command, 124, stdout, stderr), cleanup_events
+        finally:
+            cleanup_events.append({"phase": "after_finish", **self.cleanup_game_processes(job_id)})
+
     def capture_replay(self, job_id: str, *, timeout_seconds: int) -> dict[str, Any]:
         try:
             command = self._runner_command(
@@ -123,7 +189,7 @@ class LocalSessionRunner:
         except (OSError, ValueError) as exc:
             return {"status": "failed", "phase": "local_runner", "message": str(exc)}
 
-        result = _run(command, timeout=timeout_seconds + 30)
+        result, cleanup_events = self._run_owned_runner_command(command, job_id=job_id, timeout_seconds=timeout_seconds + 30)
         parsed = _parse_json_result(result.stdout) or {}
         status = "succeeded" if result.returncode == 0 else "failed"
         capture: dict[str, Any] = {
@@ -134,6 +200,7 @@ class LocalSessionRunner:
             "stdout": result.stdout.strip(),
             "stderr": result.stderr.strip(),
             "runner_result": parsed,
+            "process_cleanup": cleanup_events,
         }
 
         stats_path = self.settings.jobs_dir / job_id / "stats.json"
@@ -162,7 +229,7 @@ class LocalSessionRunner:
         except (OSError, ValueError) as exc:
             return {"status": "failed", "phase": "game_live_python_capture", "source": "game-live-python", "message": str(exc)}
 
-        result = _run(command, timeout=timeout_seconds + 30)
+        result, cleanup_events = self._run_owned_runner_command(command, job_id=job_id, timeout_seconds=timeout_seconds + 30)
         parsed = _parse_json_result(result.stdout) or {}
         status = "succeeded" if result.returncode == 0 else "failed"
         capture: dict[str, Any] = {
@@ -173,6 +240,7 @@ class LocalSessionRunner:
             "stdout": result.stdout.strip(),
             "stderr": result.stderr.strip(),
             "runner_result": parsed,
+            "process_cleanup": cleanup_events,
         }
 
         stats_path = self.settings.jobs_dir / job_id / "stats.json"
@@ -210,7 +278,16 @@ class LocalSessionRunner:
         except (OSError, ValueError) as exc:
             return {"status": "failed", "phase": "probe", "message": str(exc)}
 
-        result = _run(command, timeout=timeout_seconds + 30)
+        job_id = ""
+        for index, item in enumerate(runner_args[:-1]):
+            if item == "-JobId":
+                job_id = runner_args[index + 1]
+                break
+        if job_id:
+            result, cleanup_events = self._run_owned_runner_command(command, job_id=job_id, timeout_seconds=timeout_seconds + 30)
+        else:
+            result = _run(command, timeout=timeout_seconds + 30)
+            cleanup_events = []
         parsed = _parse_json_result(result.stdout) or {}
         status = "succeeded" if result.returncode == 0 else "failed"
         return {
@@ -219,6 +296,7 @@ class LocalSessionRunner:
             "stdout": result.stdout.strip(),
             "stderr": result.stderr.strip(),
             "runner_result": parsed,
+            "process_cleanup": cleanup_events,
         }
 
     def calibrate_memory(self, *, timeout_seconds: int = 120) -> dict[str, Any]:

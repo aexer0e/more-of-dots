@@ -8,11 +8,11 @@
     "dev": "tauri dev",
     "build:web": "tsc && vite build",
     "build:sidecar": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1",
-    "build": "npm run build:sidecar && tauri build"
+    "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
+    "build": "npm run build:sidecar && tauri build && npm run size:audit"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-autostart": "^2.0.0"
+    "@tauri-apps/api": "^2.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

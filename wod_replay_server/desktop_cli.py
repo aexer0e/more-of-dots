@@ -134,20 +134,32 @@ def _capture_error(capture: dict[str, Any]) -> str:
 
 def _has_authoritative_samples(capture: dict[str, Any]) -> bool:
     stats = capture.get("stats")
-    if not isinstance(stats, dict):
-        return False
-    source = capture.get("source") or stats.get("source")
-    samples = stats.get("samples")
-    return source in AUTHORITATIVE_CAPTURE_SOURCES and isinstance(samples, list) and len(samples) > 0
+    stats_summary = capture.get("stats_summary")
+    source = capture.get("source")
+    if isinstance(stats, dict):
+        source = source or stats.get("source")
+        samples = stats.get("samples")
+        if source in AUTHORITATIVE_CAPTURE_SOURCES and isinstance(samples, list) and len(samples) > 0:
+            return True
+    if isinstance(stats_summary, dict):
+        source = source or stats_summary.get("source")
+        sample_count = stats_summary.get("sample_count")
+        if not isinstance(sample_count, int):
+            summary = stats_summary.get("summary")
+            sample_count = summary.get("sample_count") if isinstance(summary, dict) else 0
+        return source in AUTHORITATIVE_CAPTURE_SOURCES and isinstance(sample_count, int) and sample_count > 0
+    return False
 
 
 def _stats_public_summary(stats: dict[str, Any]) -> dict[str, Any]:
     samples = stats.get("samples")
+    summary = stats.get("summary", {})
+    sample_count = summary.get("sample_count") if isinstance(summary, dict) else None
     return {
         "source": stats.get("source"),
         "sample_rate_hz": stats.get("sample_rate_hz"),
-        "sample_count": len(samples) if isinstance(samples, list) else 0,
-        "summary": stats.get("summary", {}),
+        "sample_count": sample_count if isinstance(sample_count, int) else (len(samples) if isinstance(samples, list) else 0),
+        "summary": summary if isinstance(summary, dict) else {},
         "replay_metadata": stats.get("replay_metadata", {}),
     }
 
@@ -177,7 +189,7 @@ def _finalize_capture(ctx, paths: JobPaths, capture: dict[str, Any]) -> None:
         ctx.store.update_job(paths, status="failed", capture=public_capture, error=message)
         return
 
-    source = capture.get("source") or capture.get("stats", {}).get("source")
+    source = capture.get("source") or capture.get("stats", {}).get("source") or capture.get("stats_summary", {}).get("source")
     if source not in AUTHORITATIVE_CAPTURE_SOURCES and source != "replay-file-derived":
         ctx.store.update_job(
             paths,
@@ -196,17 +208,14 @@ def _finalize_capture(ctx, paths: JobPaths, capture: dict[str, Any]) -> None:
         )
         return
 
-    stats = capture.get("stats")
-    if isinstance(stats, dict):
-        samples = stats.get("samples")
-        if source in AUTHORITATIVE_CAPTURE_SOURCES and (not isinstance(samples, list) or not samples):
-            ctx.store.update_job(
-                paths,
-                status="failed",
-                capture=public_capture,
-                error="Authoritative game-backed capture produced no playable samples.",
-            )
-            return
+    if source in AUTHORITATIVE_CAPTURE_SOURCES and not _has_authoritative_samples(capture):
+        ctx.store.update_job(
+            paths,
+            status="failed",
+            capture=public_capture,
+            error="Authoritative game-backed capture produced no playable samples.",
+        )
+        return
 
     ctx.store.update_job(paths, status="synthesizing_replay")
     synthesis = synthesize_replay(

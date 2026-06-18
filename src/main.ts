@@ -28,13 +28,6 @@ type Job = {
   error: null | string;
 };
 
-type ArtifactPayload = {
-  filename: string;
-  mime_type: string;
-  base64: string;
-  bytes: number;
-};
-
 type UnitAssetsPayload = {
   asset_dir: string;
   assets: Record<string, string>;
@@ -91,8 +84,8 @@ type CaptureSampleDeltaPayload = {
   found: boolean;
   offset: number;
   samples: Sample[];
-  meta?: Omit<Stats, "samples"> | null;
-  final_stats?: Stats | null;
+  meta?: (Omit<Stats, "samples"> & { samples?: Sample[] }) | null;
+  final_stats?: (Omit<Stats, "samples"> & { samples?: Sample[] }) | null;
   stream_bytes?: number;
 };
 
@@ -154,6 +147,8 @@ type TeamMetric = {
   health_total?: number;
   strength?: number | null;
   troops_estimate?: number | null;
+  displayed_casualties?: number | null;
+  casualties_displayed?: number | null;
   casualties?: number | null;
   casualties_estimate?: number | null;
   troop_casualties?: number | null;
@@ -195,6 +190,39 @@ type Stats = {
 
 type Bounds = { minX: number; minY: number; maxX: number; maxY: number };
 type Phase = "booting" | "idle" | "loading" | "ready" | "error";
+type GraphKind = "troops" | "funds" | "units" | "morale" | "casualties";
+type GraphDefinition = {
+  kind: GraphKind;
+  title: string;
+  approximate?: boolean;
+};
+type GraphWindow = {
+  id: string;
+  kind: GraphKind;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  visible: boolean;
+  z: number;
+};
+type GraphDragState = {
+  id: string;
+  pointerId: number;
+  offsetX: number;
+  offsetY: number;
+};
+type GraphResizeState = {
+  id: string;
+  pointerId: number;
+  edge: string;
+  startClientX: number;
+  startClientY: number;
+  startX: number;
+  startY: number;
+  startWidth: number;
+  startHeight: number;
+};
 
 const foundAppRoot = document.querySelector<HTMLDivElement>("#app");
 if (!foundAppRoot) {
@@ -206,16 +234,35 @@ const PLAYER_COLORS = ["#063bff", "#ff1616", "#1ebd5a", "#ffdd22", "#7d35ff", "#
 const AUTHORITATIVE_SOURCES = new Set(["game-live-python", "memory", "local-session-memory-capture"]);
 const GAME_TICKS_PER_SECOND = 30;
 const GRAPH_HISTORY_SECONDS = 300;
+const MAX_BUFFERED_SAMPLES = 6000;
+const MAX_PROJECTION_MEMORY_UNITS = 1000;
 const PATH_REACHED_DISTANCE = 18;
 const PATH_TRIM_DISTANCE = 28;
 const CITY_MARKER_COLOR = "#f2df25";
 const POWER_PROJECTION_GRID_PX = 11;
 const UNIT_PROJECTION_INFLUENCE_RADIUS = 132;
 const UNIT_PROJECTION_LOCAL_RADIUS = 50;
-const UNIT_PROJECTION_LOCAL_WEIGHT = 1.75;
+const UNIT_PROJECTION_LOCAL_WEIGHT = 4.375;
 const UNIT_PROJECTION_GUARD_RADIUS = 20;
-const UNIT_PROJECTION_GUARD_WEIGHT = 14;
+const UNIT_PROJECTION_GUARD_WEIGHT = 35;
+const UNIT_PROJECTION_POWER_SCALE = 0.6;
 const CITY_PROJECTION_GUARD_WEIGHT = 80;
+const GRAPH_COMPACT_SIZE = { width: 272, height: 166 };
+const GRAPH_MIN_SIZE = { width: 220, height: 132 };
+const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
+  troops: { kind: "troops", title: "Troops", approximate: true },
+  funds: { kind: "funds", title: "Funds" },
+  units: { kind: "units", title: "Units" },
+  morale: { kind: "morale", title: "Morale" },
+  casualties: { kind: "casualties", title: "Casualties", approximate: true },
+};
+const DEFAULT_GRAPH_WINDOWS: GraphWindow[] = [
+  { id: "graph-troops", kind: "troops", x: 18, y: 78, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: true, z: 9 },
+  { id: "graph-funds", kind: "funds", x: 306, y: 78, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 10 },
+  { id: "graph-units", kind: "units", x: 594, y: 78, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 11 },
+  { id: "graph-morale", kind: "morale", x: 18, y: 260, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 12 },
+  { id: "graph-casualties", kind: "casualties", x: 306, y: 260, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 13 },
+];
 
 let statusPayload: BackendStatus | null = null;
 let jobs: Job[] = [];
@@ -228,7 +275,10 @@ let notice: { tone: "info" | "success" | "error"; text: string } | null = null;
 let progress: ProgressState = { value: 0, label: "Starting", detail: "Opening the local replay backend.", facts: [] };
 let progressTimer = 0;
 let captureProgressTimer = 0;
+let sampleDeltaTimer = 0;
 let captureProgressToken = 0;
+let captureProgressInFlight = false;
+let sampleDeltaInFlight = false;
 let sampleStreamOffset = 0;
 let liveCaptureActive = false;
 let liveEdgePaused = false;
@@ -252,6 +302,11 @@ let unitAssetsLoading = false;
 const unitImageCache = new Map<string, { image: HTMLImageElement; source: string; ready: boolean }>();
 let projectionPathMemory = new Map<string, ProjectionPathState>();
 let projectionMemoryFrame = -1;
+let graphWindows = DEFAULT_GRAPH_WINDOWS.map((windowState) => ({ ...windowState }));
+let graphDrag: GraphDragState | null = null;
+let graphResize: GraphResizeState | null = null;
+let graphPaletteCloseTimer = 0;
+let graphZCounter = 20;
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -260,14 +315,6 @@ function escapeHtml(value: unknown): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-}
-
-function formatBytes(value: unknown): string {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  if (number < 1024) return `${number} B`;
-  if (number < 1024 * 1024) return `${(number / 1024).toFixed(1)} KB`;
-  return `${(number / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function formatTime(value: number): string {
@@ -446,6 +493,8 @@ function interpolateTeamMetrics(current: TeamMetric[] = [], next: TeamMetric[] =
       health_total: lerpOptional(team.health_total, target?.health_total, amount) ?? team.health_total,
       strength: lerpOptional(team.strength, target?.strength, amount),
       troops_estimate: lerpOptional(team.troops_estimate, target?.troops_estimate, amount),
+      displayed_casualties: lerpOptional(team.displayed_casualties, target?.displayed_casualties, amount),
+      casualties_displayed: lerpOptional(team.casualties_displayed, target?.casualties_displayed, amount),
       casualties: lerpOptional(team.casualties, target?.casualties, amount),
       casualties_estimate: lerpOptional(team.casualties_estimate, target?.casualties_estimate, amount),
       troop_casualties: lerpOptional(team.troop_casualties, target?.troop_casualties, amount),
@@ -478,18 +527,18 @@ function sampleAtFrame(): Sample | null {
 }
 
 function firstCapturedTick(stats = activeStats): number {
-  const summaryTick = Number(stats?.summary?.first_tick);
   const sampleTick = Number(stats?.samples.at(0)?.tick);
-  if (Number.isFinite(summaryTick)) return summaryTick;
   if (Number.isFinite(sampleTick)) return sampleTick;
+  const summaryTick = Number(stats?.summary?.first_tick);
+  if (Number.isFinite(summaryTick)) return summaryTick;
   return 0;
 }
 
 function lastCapturedTick(stats = activeStats): number {
-  const summaryTick = Number(stats?.summary?.last_tick);
   const sampleTick = Number(stats?.samples.at(-1)?.tick);
-  if (Number.isFinite(summaryTick)) return summaryTick;
   if (Number.isFinite(sampleTick)) return sampleTick;
+  const summaryTick = Number(stats?.summary?.last_tick);
+  if (Number.isFinite(summaryTick)) return summaryTick;
   return 0;
 }
 
@@ -574,26 +623,8 @@ function seekRatioFromPointer(event: PointerEvent, element: HTMLElement): number
   return (event.clientX - rect.left) / rect.width;
 }
 
-function metadataValue(key: string): unknown {
-  return activeJob?.metadata?.[key] ?? activeStats?.replay_metadata?.[key] ?? "-";
-}
-
 function players(): string[] {
   return playerNamesFromMetadata(activeJob?.metadata ?? activeStats?.replay_metadata);
-}
-
-function messages(): Array<{ tick: number; player: string; text: string }> {
-  const output: Array<{ tick: number; player: string; text: string }> = [];
-  const names = players();
-  for (const sample of activeStats?.samples ?? []) {
-    for (const [key, value] of Object.entries(sample.events ?? {})) {
-      if (key.startsWith("message") && typeof value === "string" && value.trim()) {
-        const index = Number(key.replace("message", ""));
-        output.push({ tick: sample.tick, player: names[index] ?? `Player ${index + 1}`, text: value.trim() });
-      }
-    }
-  }
-  return output.slice(-24).reverse();
 }
 
 function troopBounds(samples: Sample[]): Bounds {
@@ -769,11 +800,299 @@ function metricForTeam(sample: Sample, index: number): TeamMetric {
   return sample.metrics?.teams?.find((metric) => Number(metric.index) === index) ?? { index };
 }
 
-function troopMetricValue(sample: Sample, teamIndex: number): number | null {
+function teamAliveUnitCount(sample: Sample, teamIndex: number): number {
+  return (sample.troops ?? []).filter((troop) => troop.alive && ownerIndex(troop.owner) === teamIndex).length;
+}
+
+function teamMoraleTotal(sample: Sample, teamIndex: number): number | null {
+  const metric = metricForTeam(sample, teamIndex) as TeamMetric & {
+    morale_total?: number | null;
+    morale?: number | null;
+    average_morale?: number | null;
+  };
+  const metricValue = numeric(metric.morale_total ?? metric.morale);
+  if (metricValue !== null) return metricValue;
+
+  let total = 0;
+  let count = 0;
+  for (const troop of sample.troops ?? []) {
+    if (!troop.alive || ownerIndex(troop.owner) !== teamIndex) continue;
+    const ratio = unitMoraleRatio(troop);
+    if (ratio === null) continue;
+    total += ratio * 100;
+    count += 1;
+  }
+  if (count > 0) return total;
+
+  const averageMorale = numeric(metric.average_morale);
+  const unitCount = numeric(metric.alive_units) ?? teamAliveUnitCount(sample, teamIndex);
+  return averageMorale !== null && unitCount > 0 ? averageMorale * unitCount : null;
+}
+
+function graphMetricValue(kind: GraphKind, sample: Sample, teamIndex: number): number | null {
   const metric = metricForTeam(sample, teamIndex);
-  const value = metric.troops_estimate ?? metric.strength ?? metric.alive_units;
+  const value =
+    kind === "troops"
+      ? metric.troops_estimate ?? metric.strength ?? metric.alive_units
+      : kind === "funds"
+        ? metric.funds
+        : kind === "units"
+          ? metric.alive_units ?? teamAliveUnitCount(sample, teamIndex)
+          : kind === "morale"
+            ? teamMoraleTotal(sample, teamIndex)
+            : metric.displayed_casualties ?? metric.casualties_displayed ?? metric.casualties_estimate ?? metric.casualties ?? metric.troop_casualties;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function graphMetricHistory(kind: GraphKind, teamIndex: number, sample: Sample): Array<{ tick: number; value: number }> {
+  const currentTick = Number(sample.tick);
+  if (!activeStats || !Number.isFinite(currentTick)) return [];
+  const minTick = currentTick - GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS;
+  const history = activeStats.samples
+    .filter((candidate) => candidate.tick >= minTick && candidate.tick <= currentTick)
+    .map((candidate) => {
+      const value = graphMetricValue(kind, candidate, teamIndex);
+      return value === null ? null : { tick: candidate.tick, value };
+    })
+    .filter((point): point is { tick: number; value: number } => point !== null);
+  const currentValue = graphMetricValue(kind, sample, teamIndex);
+  if (currentValue !== null && (history.at(-1)?.tick ?? -1) < currentTick) {
+    history.push({ tick: currentTick, value: currentValue });
+  }
+  return history;
+}
+
+function formatGraphValue(kind: GraphKind, value: unknown): string {
+  return formatStat(value, GRAPH_DEFINITIONS[kind].approximate === true);
+}
+
+function graphAreaSize(): { width: number; height: number } {
+  const area = document.querySelector<HTMLElement>(".viewer-area");
+  return {
+    width: Math.max(1, area?.clientWidth ?? window.innerWidth),
+    height: Math.max(1, area?.clientHeight ?? window.innerHeight),
+  };
+}
+
+function clampGraphWindow(windowState: GraphWindow) {
+  const area = graphAreaSize();
+  const margin = 8;
+  windowState.width = Math.max(GRAPH_MIN_SIZE.width, Math.min(area.width - margin * 2, windowState.width));
+  windowState.height = Math.max(GRAPH_MIN_SIZE.height, Math.min(area.height - margin * 2, windowState.height));
+  const maxX = Math.max(margin, area.width - windowState.width - margin);
+  const maxY = Math.max(margin, area.height - windowState.height - margin);
+  windowState.x = Math.max(margin, Math.min(maxX, windowState.x));
+  windowState.y = Math.max(margin, Math.min(maxY, windowState.y));
+}
+
+function raiseGraphWindow(id: string) {
+  const windowState = graphWindows.find((candidate) => candidate.id === id);
+  if (!windowState) return;
+  windowState.z = ++graphZCounter;
+  const element = document.querySelector<HTMLElement>(`[data-graph-window-id="${id}"]`);
+  if (element) element.style.zIndex = String(windowState.z);
+}
+
+function visibleGraphKinds(): Set<GraphKind> {
+  return new Set(graphWindows.filter((windowState) => windowState.visible).map((windowState) => windowState.kind));
+}
+
+function showGraphWindow(kind: GraphKind) {
+  const windowState = graphWindows.find((candidate) => candidate.kind === kind);
+  if (!windowState) return;
+  windowState.visible = true;
+  clampGraphWindow(windowState);
+  raiseGraphWindow(windowState.id);
+  render();
+}
+
+function toggleGraphKind(kind: GraphKind) {
+  const windowState = graphWindows.find((candidate) => candidate.kind === kind);
+  if (!windowState) return;
+  if (windowState.visible) closeGraphWindow(windowState.id);
+  else showGraphWindow(kind);
+}
+
+function closeGraphWindow(id: string) {
+  const windowState = graphWindows.find((candidate) => candidate.id === id);
+  if (!windowState) return;
+  windowState.visible = false;
+  render();
+}
+
+function renderGraphPalette(): string {
+  const visible = visibleGraphKinds();
+  return `
+    <div class="graph-palette" aria-label="Graph windows">
+      <div class="graph-palette-handle" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+      <div class="graph-palette-buttons">
+      ${Object.values(GRAPH_DEFINITIONS)
+        .map(
+          (definition) => `
+            <button
+              type="button"
+              data-graph-toggle="${definition.kind}"
+              class="${visible.has(definition.kind) ? "active" : ""}"
+              aria-pressed="${visible.has(definition.kind) ? "true" : "false"}"
+            >${escapeHtml(definition.title)}</button>
+          `,
+        )
+        .join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderGraphWindows(sample: Sample | null): string {
+  return graphWindows
+    .filter((windowState) => windowState.visible)
+    .map((windowState) => {
+      clampGraphWindow(windowState);
+      const definition = GRAPH_DEFINITIONS[windowState.kind];
+      return `
+        <section
+          class="graph-window"
+          data-graph-window-id="${escapeHtml(windowState.id)}"
+          style="left:${windowState.x}px;top:${windowState.y}px;width:${windowState.width}px;height:${windowState.height}px;z-index:${windowState.z}"
+          aria-label="${escapeHtml(definition.title)} graph"
+        >
+          <header class="graph-titlebar" data-graph-drag="${escapeHtml(windowState.id)}">
+            <strong>${escapeHtml(definition.title)}</strong>
+            <div class="graph-actions">
+              <button class="graph-close" type="button" data-graph-close="${escapeHtml(windowState.id)}" aria-label="Close ${escapeHtml(definition.title)} graph"></button>
+            </div>
+          </header>
+          <div class="graph-body">
+            <canvas class="graph-canvas" data-graph-id="${escapeHtml(windowState.id)}"></canvas>
+          </div>
+          ${["n", "e", "s", "w", "ne", "nw", "se", "sw"]
+            .map((edge) => `<span class="graph-resize-handle ${edge}" data-graph-resize="${escapeHtml(windowState.id)}" data-edge="${edge}"></span>`)
+            .join("")}
+        </section>
+      `;
+    })
+    .join("");
+}
+
+function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWindow, sample: Sample | null) {
+  const width = Math.max(1, canvas.clientWidth);
+  const height = Math.max(1, canvas.clientHeight);
+  const scale = window.devicePixelRatio || 1;
+  const pixelWidth = Math.floor(width * scale);
+  const pixelHeight = Math.floor(height * scale);
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  disableImageSmoothing(ctx);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "rgba(3, 5, 6, 0.18)";
+  ctx.fillRect(0, 0, width, height);
+
+  if (!sample) return;
+
+  const teams = teamList().slice(0, 2);
+  const currentTick = Number(sample.tick);
+  if (!Number.isFinite(currentTick)) return;
+  const minTick = currentTick - GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS;
+  const series = teams.map((team, index) => ({
+    team,
+    color: team.color_hex ?? teamColor(index),
+    points: graphMetricHistory(windowState.kind, Number(team.index), sample),
+  }));
+  const values = series.flatMap((item) => item.points.map((point) => point.value));
+  const liveValues = teams.map((team, index) => ({
+    team,
+    color: team.color_hex ?? teamColor(index),
+    value: sample ? graphMetricValue(windowState.kind, sample, Number(team.index)) : null,
+  }));
+
+  if (values.length < 2) {
+    ctx.fillStyle = "rgba(238, 244, 245, 0.54)";
+    ctx.font = "800 12px Inter, Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Waiting for data", width / 2, height / 2);
+    drawGraphLiveValues(ctx, windowState.kind, liveValues, width, height);
+    return;
+  }
+
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const valueSpan = Math.max(1, maxValue - minValue);
+  const padLeft = 8;
+  const padRight = 92;
+  const padTop = 12;
+  const padBottom = 12;
+  const plotX = padLeft;
+  const plotY = padTop;
+  const plotWidth = Math.max(1, width - padLeft - padRight);
+  const plotHeight = Math.max(1, height - padTop - padBottom);
+  const pointToScreen = (point: { tick: number; value: number }) => ({
+    x: plotX + Math.max(0, Math.min(1, (point.tick - minTick) / (GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS))) * plotWidth,
+    y: plotY + (1 - (point.value - minValue) / valueSpan) * plotHeight,
+  });
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.1)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(plotX, plotY + plotHeight / 2);
+  ctx.lineTo(plotX + plotWidth, plotY + plotHeight / 2);
+  ctx.stroke();
+
+  for (const { color, points } of series) {
+    if (points.length < 2) continue;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const screen = pointToScreen(point);
+      if (index === 0) ctx.moveTo(screen.x, screen.y);
+      else ctx.lineTo(screen.x, screen.y);
+    });
+    ctx.stroke();
+  }
+
+  drawGraphLiveValues(ctx, windowState.kind, liveValues, width, height);
+}
+
+function drawGraphLiveValues(
+  ctx: CanvasRenderingContext2D,
+  kind: GraphKind,
+  values: Array<{ color: string; value: number | null }>,
+  width: number,
+  height: number,
+) {
+  const startY = Math.max(18, height / 2 - 17);
+  ctx.save();
+  ctx.font = "900 13px Inter, Segoe UI, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  values.slice(0, 2).forEach((item, index) => {
+    const y = startY + index * 28;
+    ctx.fillStyle = item.color;
+    ctx.beginPath();
+    ctx.arc(width - 78, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = item.color;
+    ctx.fillText(formatGraphValue(kind, item.value), width - 8, y);
+  });
+  ctx.restore();
+}
+
+function renderGraphCanvases(sample: Sample | null) {
+  document.querySelectorAll<HTMLCanvasElement>(".graph-canvas").forEach((canvas) => {
+    const id = canvas.dataset.graphId;
+    const windowState = graphWindows.find((candidate) => candidate.id === id);
+    if (windowState) drawMetricGraphCanvas(canvas, windowState, sample);
+  });
 }
 
 function previousRawTroop(troop: Troop, searchFrames = 4): Troop | null {
@@ -809,120 +1128,21 @@ function damageShakeOffset(troop: Troop, fit: number): { x: number; y: number } 
   };
 }
 
-function drawOutlinedText(
+function disableImageSmoothing(ctx: CanvasRenderingContext2D) {
+  ctx.imageSmoothingEnabled = false;
+  ctx.imageSmoothingQuality = "low";
+}
+
+function drawPixelImage(
   ctx: CanvasRenderingContext2D,
-  text: string,
-  x: number,
-  y: number,
-  color: string,
-  font: string,
-  align: CanvasTextAlign = "left",
-) {
-  ctx.save();
-  ctx.font = font;
-  ctx.textAlign = align;
-  ctx.textBaseline = "alphabetic";
-  ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
-  ctx.shadowBlur = 2;
-  ctx.shadowOffsetX = 1;
-  ctx.shadowOffsetY = 1;
-  ctx.fillStyle = color;
-  ctx.fillText(text, x, y);
-  ctx.restore();
-}
-
-function fitCanvasText(ctx: CanvasRenderingContext2D, text: string, font: string, maxWidth: number): string {
-  ctx.font = font;
-  if (ctx.measureText(text).width <= maxWidth) return text;
-  let output = text.trim();
-  while (output.length > 3 && ctx.measureText(`${output}...`).width > maxWidth) {
-    output = output.slice(0, -1).trimEnd();
-  }
-  return output.length > 3 ? `${output}...` : output;
-}
-
-function troopHistory(teamIndex: number, sample: Sample): Array<{ tick: number; value: number }> {
-  const currentTick = Number(sample.tick);
-  if (!activeStats || !Number.isFinite(currentTick)) return [];
-  const minTick = currentTick - GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS;
-  const history = activeStats.samples
-    .filter((candidate) => candidate.tick >= minTick && candidate.tick <= currentTick)
-    .map((candidate) => {
-      const value = troopMetricValue(candidate, teamIndex);
-      return value === null ? null : { tick: candidate.tick, value };
-    })
-    .filter((point): point is { tick: number; value: number } => point !== null);
-  const currentValue = troopMetricValue(sample, teamIndex);
-  if (currentValue !== null && (history.at(-1)?.tick ?? -1) < currentTick) {
-    history.push({ tick: currentTick, value: currentValue });
-  }
-  return history;
-}
-
-function drawTroopGraph(
-  ctx: CanvasRenderingContext2D,
+  image: CanvasImageSource,
   x: number,
   y: number,
   width: number,
   height: number,
-  sample: Sample,
-  teams: Team[],
 ) {
-  const currentTick = Number(sample.tick);
-  if (!Number.isFinite(currentTick) || width < 80 || height < 40) return;
-  const minTick = currentTick - GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS;
-  const series = teams.slice(0, 2).map((team) => ({
-    team,
-    points: troopHistory(Number(team.index), sample),
-  }));
-  const values = series.flatMap((item) => item.points.map((point) => point.value));
-  if (values.length < 2) return;
-
-  const minValue = Math.min(...values);
-  const maxValue = Math.max(...values);
-  const valueSpan = Math.max(1, maxValue - minValue);
-  const pad = 8;
-  const plotX = x + pad;
-  const plotY = y + pad;
-  const plotWidth = width - pad * 2;
-  const plotHeight = height - pad * 2;
-  const pointToScreen = (point: { tick: number; value: number }) => ({
-    x: plotX + Math.max(0, Math.min(1, (point.tick - minTick) / (GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS))) * plotWidth,
-    y: plotY + (1 - (point.value - minValue) / valueSpan) * plotHeight,
-  });
-
-  ctx.save();
-  ctx.fillStyle = "rgba(5, 8, 10, 0.46)";
-  ctx.fillRect(x, y, width, height);
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.45)";
-  ctx.lineWidth = 1;
-  ctx.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
-  ctx.beginPath();
-  ctx.moveTo(plotX, plotY + plotHeight / 2);
-  ctx.lineTo(plotX + plotWidth, plotY + plotHeight / 2);
-  ctx.stroke();
-  ctx.fillStyle = "rgba(238, 244, 245, 0.78)";
-  ctx.font = "800 10px Inter, Segoe UI, sans-serif";
-  ctx.textAlign = "right";
-  ctx.textBaseline = "top";
-  ctx.fillText(formatStat(maxValue, true), x + width - 6, y + 5);
-  ctx.textBaseline = "bottom";
-  ctx.fillText(formatStat(minValue, true), x + width - 6, y + height - 5);
-
-  series.forEach(({ team, points }, index) => {
-    if (points.length < 2) return;
-    ctx.strokeStyle = team.color_hex ?? teamColor(index);
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    points.forEach((point, pointIndex) => {
-      const screen = pointToScreen(point);
-      if (pointIndex === 0) ctx.moveTo(screen.x, screen.y);
-      else ctx.lineTo(screen.x, screen.y);
-    });
-    ctx.stroke();
-  });
-  ctx.restore();
+  disableImageSmoothing(ctx);
+  ctx.drawImage(image, Math.round(x), Math.round(y), Math.round(width), Math.round(height));
 }
 
 function validPoint(point: WorldPoint | null | undefined): point is WorldPoint {
@@ -1069,6 +1289,16 @@ function updateProjectionMemoryFromSample(sample: Sample, index: number) {
     const remaining = existing.lines.map((line) => remainingProjectionLine(line, position)).filter((line): line is WorldPoint[] => line !== null);
     if (!remaining.length) projectionPathMemory.delete(key);
   }
+  trimProjectionMemory();
+}
+
+function trimProjectionMemory() {
+  if (projectionPathMemory.size <= MAX_PROJECTION_MEMORY_UNITS) return;
+  const staleKeys = [...projectionPathMemory.entries()]
+    .sort((left, right) => left[1].frameIndex - right[1].frameIndex)
+    .slice(0, projectionPathMemory.size - MAX_PROJECTION_MEMORY_UNITS)
+    .map(([key]) => key);
+  for (const key of staleKeys) projectionPathMemory.delete(key);
 }
 
 function updateProjectionMemoryToFrame(targetFrame: number) {
@@ -1166,7 +1396,7 @@ function troopProjectionWeight(troop: Troop): number {
   const kind = unitKind(troop);
   const ratio = unitHealthRatio(troop, kind) ?? 1;
   const kindWeight = kind === "tank" ? 1.12 : kind === "ship" || kind === "heavy_ship" ? 1.08 : 1;
-  return kindWeight * (0.5 + ratio * 0.5);
+  return UNIT_PROJECTION_POWER_SCALE * kindWeight * (0.5 + ratio * 0.5);
 }
 
 function projectionSources(sample: Sample): ProjectionSource[] {
@@ -1492,7 +1722,7 @@ function drawCity(
   const capitalTexture = city.capital ? assetTexture("capital") : null;
 
   ctx.save();
-  ctx.imageSmoothingEnabled = false;
+  disableImageSmoothing(ctx);
   ctx.fillStyle = CITY_MARKER_COLOR;
   ctx.beginPath();
   ctx.arc(screen.x, screen.y, radius, 0, Math.PI * 2);
@@ -1502,7 +1732,7 @@ function drawCity(
     const imageHeight = capitalTexture.naturalHeight && capitalTexture.naturalWidth
       ? markerSize * (capitalTexture.naturalHeight / capitalTexture.naturalWidth)
       : markerSize;
-    ctx.drawImage(capitalTexture, screen.x - markerSize / 2, screen.y - imageHeight / 2, markerSize, imageHeight);
+    drawPixelImage(ctx, capitalTexture, screen.x - markerSize / 2, screen.y - imageHeight / 2, markerSize, imageHeight);
   }
   ctx.restore();
 }
@@ -1518,14 +1748,14 @@ function drawCityFlag(
   const flagTexture = flagTextureForOwner(city.owner);
   if (flagTexture) {
     ctx.save();
-    ctx.imageSmoothingEnabled = false;
+    disableImageSmoothing(ctx);
     const flagWidth = Math.max(5, markerSize * 0.72);
     const flagHeight = flagTexture.naturalHeight && flagTexture.naturalWidth
       ? flagWidth * (flagTexture.naturalHeight / flagTexture.naturalWidth)
       : flagWidth * 0.62;
     const flagX = screen.x - flagWidth * 0.12;
     const flagY = screen.y - radius - flagHeight * 0.78;
-    ctx.drawImage(flagTexture, flagX, flagY, flagWidth, flagHeight);
+    drawPixelImage(ctx, flagTexture, flagX, flagY, flagWidth, flagHeight);
     ctx.restore();
   }
 }
@@ -1558,46 +1788,6 @@ function drawCityFlags(
   }
 }
 
-function drawHud(ctx: CanvasRenderingContext2D, width: number, height: number, sample: Sample) {
-  const teams = teamList().slice(0, 4);
-  const topY = 76;
-  const bottomY = Math.max(160, height - 162);
-  const titleFont = "700 30px Inter, Segoe UI, sans-serif";
-  const valueFont = "700 31px Inter, Segoe UI, sans-serif";
-  const leftTextWidth = Math.max(126, width - 338);
-
-  teams.slice(0, 2).forEach((team, index) => {
-    const name = fitCanvasText(ctx, team.name || `Player ${index + 1}`, titleFont, leftTextWidth);
-    drawOutlinedText(ctx, name, 10, topY + index * 35, team.color_hex ?? teamColor(index), titleFont);
-  });
-
-  drawOutlinedText(ctx, "Funds:", width - 14, topY, "#6f7074", titleFont, "right");
-  teams.slice(0, 2).forEach((team, index) => {
-    const metric = metricForTeam(sample, Number(team.index));
-    const value = formatStat(metric.funds);
-    drawOutlinedText(ctx, value, width - 14, topY + 36 + index * 35, team.color_hex ?? teamColor(index), valueFont, "right");
-  });
-
-  drawOutlinedText(ctx, "Casualties:", 10, bottomY, "#6f7074", titleFont);
-  teams.slice(0, 2).forEach((team, index) => {
-    const metric = metricForTeam(sample, Number(team.index));
-    const value = metric.casualties_estimate ?? metric.casualties ?? metric.troop_casualties;
-    drawOutlinedText(ctx, formatStat(value, true), 10, bottomY + 36 + index * 35, team.color_hex ?? teamColor(index), valueFont);
-  });
-
-  drawOutlinedText(ctx, "Troops:", width - 14, bottomY, "#6f7074", titleFont, "right");
-  teams.slice(0, 2).forEach((team, index) => {
-    const metric = metricForTeam(sample, Number(team.index));
-    const value = metric.troops_estimate ?? metric.strength ?? metric.alive_units;
-    drawOutlinedText(ctx, formatStat(value, true), width - 14, bottomY + 36 + index * 35, team.color_hex ?? teamColor(index), valueFont, "right");
-  });
-  if (width >= 760) {
-    drawTroopGraph(ctx, width - 334, bottomY + 12, 160, 82, sample, teams.slice(0, 2));
-  }
-
-  drawOutlinedText(ctx, `Tick ${formatStat(sample.tick)}`, width / 2, topY, "#eef4f5", "800 18px Inter, Segoe UI, sans-serif", "center");
-}
-
 function drawTroop(
   ctx: CanvasRenderingContext2D,
   troop: Troop,
@@ -1615,10 +1805,10 @@ function drawTroop(
     ? spriteWidth * (texture.naturalHeight / texture.naturalWidth)
     : spriteWidth;
   ctx.save();
-  ctx.imageSmoothingEnabled = false;
+  disableImageSmoothing(ctx);
   ctx.globalAlpha = troop.alive ? 1 : 0.42;
   if (texture) {
-    ctx.drawImage(texture, latest.x - spriteWidth / 2, latest.y - spriteHeight / 2, spriteWidth, spriteHeight);
+    drawPixelImage(ctx, texture, latest.x - spriteWidth / 2, latest.y - spriteHeight / 2, spriteWidth, spriteHeight);
   } else {
     const radius = spriteWidth / 2;
     ctx.fillStyle = troop.alive ? color : "#707981";
@@ -1676,6 +1866,7 @@ function renderCanvas() {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  disableImageSmoothing(ctx);
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#0c1012";
   ctx.fillRect(0, 0, width, height);
@@ -1686,6 +1877,7 @@ function renderCanvas() {
     ctx.font = "800 72px Inter, sans-serif";
     ctx.textAlign = "center";
     ctx.fillText("WOD", width / 2, height / 2);
+    renderGraphCanvases(null);
     return;
   }
 
@@ -1702,8 +1894,7 @@ function renderCanvas() {
 
   const image = ensureMapImage();
   if (image) {
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(image, offsetX, offsetY, worldWidth * fit, worldHeight * fit);
+    drawPixelImage(ctx, image, offsetX, offsetY, worldWidth * fit, worldHeight * fit);
   } else {
     ctx.fillStyle = "#9fc246";
     ctx.fillRect(offsetX, offsetY, worldWidth * fit, worldHeight * fit);
@@ -1759,8 +1950,6 @@ function renderCanvas() {
   });
   drawCityFlags(ctx, sample, toScreen, fit);
 
-  drawHud(ctx, width, height, sample);
-
   if (showMessages) {
     const frameMessages = Object.entries(sample.events ?? {}).filter(([key, value]) => key.startsWith("message") && value);
     if (frameMessages.length) {
@@ -1772,6 +1961,7 @@ function renderCanvas() {
       ctx.fillText(String(frameMessages[0][1]).slice(0, 76), 34, height - 84);
     }
   }
+  renderGraphCanvases(sample);
 }
 
 function progressPercent(): string {
@@ -1820,67 +2010,18 @@ function renderOverlay(): string {
   return "";
 }
 
-function backendLine(): string {
-  if (phase === "booting") return "Starting local backend";
-  if (!statusPayload) return "Desktop backend unavailable in this preview";
-  if (statusPayload.runner.game_exe_exists && statusPayload.runner.game_python_capture_available) return "Hidden game capture ready";
-  if (statusPayload.runner.game_exe_exists) return "Game staged, capture probe unavailable";
-  if (statusPayload.steam_game_exists) return "Steam install found";
-  return "Game-backed capture required";
-}
-
-function backendTone(): string {
-  if (!statusPayload) return "offline";
-  if (statusPayload.runner.game_exe_exists) return "ready";
-  return "fallback";
-}
-
-function renderPlayers(): string {
-  const teams = teamList();
-  const sample = sampleAtFrame();
-  if (!teams.length) return `<p class="empty-state">Player metadata will appear after loading.</p>`;
-  return teams
-    .map((team, index) => {
-      const metric = sample ? metricForTeam(sample, Number(team.index)) : null;
-      const statsLine = metric
-        ? `troops ${formatStat(metric.troops_estimate ?? metric.alive_units, true)} - losses ${formatStat(metric.casualties_estimate ?? metric.casualties, true)}`
-        : `player ${index + 1}`;
-      return `
-        <div class="player-row">
-          <div class="player-top">
-            <span class="swatch" style="background:${escapeHtml(team.color_hex ?? PLAYER_COLORS[index % PLAYER_COLORS.length])}"></span>
-            <span class="player-name">${escapeHtml(team.name)}</span>
-          </div>
-          <span class="player-stats">${escapeHtml(statsLine)}</span>
-        </div>
-      `;
-    })
-    .join("");
-}
-
-function renderMessages(): string {
-  const items = messages();
-  if (!items.length) return `<p class="empty-state">Match messages will appear here.</p>`;
-  return items
-    .map(
-      (message) => `
-        <div class="message-row">
-          <span class="message-time">${formatTime(message.tick)} ${escapeHtml(message.player)}</span>
-          <p>${escapeHtml(message.text)}</p>
-        </div>
-      `,
-    )
-    .join("");
-}
-
 function renderTimeline(sample: Sample | null): string {
   const state = timelineState(activeStats, sample);
   return `
     <div class="timeline-dock" aria-label="Replay timeline controls">
-      <div class="timeline-meta">
-        <span id="currentTime">Tick ${formatStat(state.currentTick)}</span>
-        <span id="durationTime">${formatReplayClock(state.currentTick)} / ${formatReplayClock(state.endTick)}</span>
-      </div>
+      <button
+        id="playButton"
+        class="play-button transport-button ${playing ? "is-paused" : "is-playing"}"
+        type="button"
+        ${activeStats ? "" : "disabled"}
+        aria-label="${playing ? "Pause replay" : "Play replay"}"
+        title="${playing ? "Pause" : "Play"}"
+      ><span></span></button>
       <div
         id="seekBar"
         class="seek-bar"
@@ -1898,87 +2039,31 @@ function renderTimeline(sample: Sample | null): string {
           <div id="seekThumb" class="seek-thumb" style="left:${state.playedPercent.toFixed(3)}%"></div>
         </div>
       </div>
+      <div class="timeline-speed">
+        <strong id="speedValue">${speed.toFixed(1)}x</strong>
+        <input id="speedRange" type="range" min="0.5" max="16" step="0.5" value="${speed}" aria-label="Playback speed">
+      </div>
     </div>
   `;
 }
 
 function render() {
   const sample = sampleAtFrame();
-  const firstTick = firstCapturedTick();
-  const lastTick = lastCapturedTick();
-  const endTick = replayEndTick();
-  const reachedEnd = activeStats ? captureReachedReplayEnd(activeStats) : false;
-  const summary = activeStats?.summary ?? {};
 
   appRoot.innerHTML = `
     <main class="app-shell">
       <section class="viewer-area" aria-label="Replay viewer">
         <canvas id="replayCanvas" aria-label="Replay canvas"></canvas>
         <input id="fileInput" type="file" accept=".rep,application/gzip">
-        ${activeStats ? `<div class="topbar"><div class="file-controls"><label class="file-button" for="fileInput">Open another</label></div></div>` : ""}
+        ${
+          activeStats
+            ? `<div class="topbar"><div class="file-controls"><label class="file-button" for="fileInput">Open replay</label></div>${renderGraphPalette()}</div>`
+            : ""
+        }
         ${renderOverlay()}
         ${activeStats ? renderTimeline(sample) : ""}
+        ${activeStats ? renderGraphWindows(sample) : ""}
       </section>
-
-      <aside class="side-panel" aria-label="Replay details and playback controls">
-        <header class="replay-header">
-          <p class="eyebrow">War of Dots</p>
-          <h1 id="replayTitle">${escapeHtml(activeJob?.filename ?? (selectedFileName || "Replay Player"))}</h1>
-          <p id="replaySubtitle">${escapeHtml(replaySubtitle())}</p>
-        </header>
-
-        <section class="control-block transport" aria-label="Playback controls">
-          <div class="transport-row">
-            <button id="playButton" class="play-button" type="button" ${activeStats ? "" : "disabled"}>${playing ? "Pause" : "Play"}</button>
-            <button id="resetButton" type="button" ${activeStats ? "" : "disabled"}>Reset</button>
-          </div>
-          <div class="speed-control">
-            <div class="speed-label-row">
-              <label for="speedRange">Speed</label>
-              <strong id="speedValue">${speed.toFixed(1)}x</strong>
-            </div>
-            <input id="speedRange" type="range" min="0.5" max="16" step="0.5" value="${speed}" aria-label="Playback speed">
-          </div>
-        </section>
-
-        <section class="control-block toggles" aria-label="Drawing layers">
-          <label><input id="trailsToggle" type="checkbox" ${showTrails ? "checked" : ""}> Trails</label>
-          <label><input id="dotsToggle" type="checkbox" ${showDots ? "checked" : ""}> Dots</label>
-          <label><input id="zonesToggle" type="checkbox" ${showPower ? "checked" : ""}> Power</label>
-          <label><input id="messagesToggle" type="checkbox" ${showMessages ? "checked" : ""}> Messages</label>
-        </section>
-
-        <section class="info-grid" aria-label="Replay metadata">
-          <div><span>Map</span><strong>${escapeHtml(metadataValue("map"))}</strong></div>
-          <div><span>Version</span><strong>${escapeHtml(metadataValue("version"))}</strong></div>
-          <div><span>Result</span><strong>${escapeHtml(summary.result ?? metadataValue("result"))}</strong></div>
-          <div><span>Samples</span><strong>${escapeHtml(summary.sample_count ?? "-")}</strong></div>
-          <div><span>First tick</span><strong>${escapeHtml(formatStat(firstTick))}</strong></div>
-          <div><span>Last tick</span><strong>${escapeHtml(formatStat(lastTick))}</strong></div>
-          <div><span>End tick</span><strong>${escapeHtml(formatStat(endTick))}</strong></div>
-          <div><span>Capture</span><strong>${reachedEnd ? "Reached end" : "Partial"}</strong></div>
-          <div><span>Troop slots</span><strong>${escapeHtml(summary.troop_slots_seen ?? "-")}</strong></div>
-        </section>
-
-        <section class="players-block" aria-label="Players">
-          <h2>Players</h2>
-          <div class="players-list">${renderPlayers()}</div>
-        </section>
-
-        <section class="messages-block" aria-label="Replay messages">
-          <h2>Messages</h2>
-          <div class="message-list">${renderMessages()}</div>
-        </section>
-
-        <section class="players-block" aria-label="Downloads">
-          <h2>Outputs</h2>
-          <div class="download-list">
-            <button data-artifact="simulated-replay" type="button" ${activeJob?.status === "captured" ? "" : "disabled"}>Simulated replay</button>
-            <button data-artifact="stats" type="button" ${activeJob?.status === "captured" ? "" : "disabled"}>Stats JSON</button>
-            <button data-artifact="logs" type="button" ${activeJob ? "" : "disabled"}>Logs</button>
-          </div>
-        </section>
-      </aside>
     </main>
   `;
 
@@ -1994,44 +2079,208 @@ function bindEvents() {
     input.value = "";
     if (file) void loadReplayFile(file);
   });
-  document.querySelector<HTMLButtonElement>("#playButton")?.addEventListener("click", () => {
+  bindPointerActivation(document.querySelector<HTMLButtonElement>("#playButton"), () => {
     if (!activeStats) return;
     playing ? pausePlayback() : startPlayback();
-  });
-  document.querySelector<HTMLButtonElement>("#resetButton")?.addEventListener("click", () => {
-    frameIndex = 0;
-    syncPlaybackTickToFrame();
-    pausePlayback();
-    renderCanvas();
-    updatePlaybackUi();
   });
   bindSeekBar();
   document.querySelector<HTMLInputElement>("#speedRange")?.addEventListener("input", (event) => {
     speed = Number((event.target as HTMLInputElement).value);
     updatePlaybackUi();
   });
-  document.querySelector<HTMLInputElement>("#trailsToggle")?.addEventListener("change", (event) => {
-    showTrails = (event.target as HTMLInputElement).checked;
-    renderCanvas();
+  bindGraphEvents();
+}
+
+function bindPointerActivation(element: HTMLElement | null, handler: (event: PointerEvent | KeyboardEvent) => void) {
+  if (!element) return;
+  element.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    handler(event);
   });
-  document.querySelector<HTMLInputElement>("#dotsToggle")?.addEventListener("change", (event) => {
-    showDots = (event.target as HTMLInputElement).checked;
-    renderCanvas();
+  element.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    handler(event);
   });
-  document.querySelector<HTMLInputElement>("#zonesToggle")?.addEventListener("change", (event) => {
-    showPower = (event.target as HTMLInputElement).checked;
-    renderCanvas();
-  });
-  document.querySelector<HTMLInputElement>("#messagesToggle")?.addEventListener("change", (event) => {
-    showMessages = (event.target as HTMLInputElement).checked;
-    renderCanvas();
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-artifact]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const kind = button.dataset.artifact;
-      if (kind) void downloadArtifact(kind);
+}
+
+function bindGraphEvents() {
+  const palette = document.querySelector<HTMLElement>(".graph-palette");
+  if (palette) {
+    palette.addEventListener("pointerenter", () => openGraphPalette(palette));
+    palette.addEventListener("pointerleave", () => scheduleGraphPaletteClose(palette));
+    palette.addEventListener("focusin", () => openGraphPalette(palette));
+    palette.addEventListener("focusout", () => scheduleGraphPaletteClose(palette));
+  }
+
+  document.querySelectorAll<HTMLButtonElement>("[data-graph-toggle]").forEach((button) => {
+    bindPointerActivation(button, () => {
+      const kind = button.dataset.graphToggle as GraphKind | undefined;
+      if (kind && kind in GRAPH_DEFINITIONS) toggleGraphKind(kind);
     });
   });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-graph-close]").forEach((button) => {
+    bindPointerActivation(button, () => {
+      const id = button.dataset.graphClose;
+      if (id) closeGraphWindow(id);
+    });
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-graph-window-id]").forEach((element) => {
+    element.addEventListener("pointerdown", () => {
+      const id = element.dataset.graphWindowId;
+      if (id) raiseGraphWindow(id);
+    });
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-graph-drag]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      const id = handle.dataset.graphDrag;
+      const element = id ? document.querySelector<HTMLElement>(`[data-graph-window-id="${id}"]`) : null;
+      if (!id || !element || (event.target instanceof HTMLElement && event.target.closest("button"))) return;
+      const rect = element.getBoundingClientRect();
+      graphDrag = {
+        id,
+        pointerId: event.pointerId,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+      };
+      handle.setPointerCapture(event.pointerId);
+      raiseGraphWindow(id);
+      event.preventDefault();
+    });
+
+    handle.addEventListener("pointermove", (event) => {
+      if (!graphDrag || graphDrag.pointerId !== event.pointerId) return;
+      const windowState = graphWindows.find((candidate) => candidate.id === graphDrag?.id);
+      const element = document.querySelector<HTMLElement>(`[data-graph-window-id="${graphDrag.id}"]`);
+      const area = document.querySelector<HTMLElement>(".viewer-area");
+      if (!windowState || !element || !area) return;
+      const areaRect = area.getBoundingClientRect();
+      windowState.x = event.clientX - areaRect.left - graphDrag.offsetX;
+      windowState.y = event.clientY - areaRect.top - graphDrag.offsetY;
+      clampGraphWindow(windowState);
+      element.style.left = `${windowState.x}px`;
+      element.style.top = `${windowState.y}px`;
+      renderGraphCanvases(sampleAtFrame());
+    });
+
+    const stopDrag = (event: PointerEvent) => {
+      if (!graphDrag || graphDrag.pointerId !== event.pointerId) return;
+      try {
+        handle.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released by the browser.
+      }
+      graphDrag = null;
+    };
+    handle.addEventListener("pointerup", stopDrag);
+    handle.addEventListener("pointercancel", stopDrag);
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-graph-resize]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      const id = handle.dataset.graphResize;
+      const edge = handle.dataset.edge ?? "";
+      const windowState = graphWindows.find((candidate) => candidate.id === id);
+      if (!id || !windowState || !edge) return;
+      graphResize = {
+        id,
+        pointerId: event.pointerId,
+        edge,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startX: windowState.x,
+        startY: windowState.y,
+        startWidth: windowState.width,
+        startHeight: windowState.height,
+      };
+      handle.setPointerCapture(event.pointerId);
+      raiseGraphWindow(id);
+      event.preventDefault();
+      event.stopPropagation();
+    });
+
+    handle.addEventListener("pointermove", (event) => {
+      if (!graphResize || graphResize.pointerId !== event.pointerId) return;
+      resizeGraphWindow(event);
+    });
+
+    const stopResize = (event: PointerEvent) => {
+      if (!graphResize || graphResize.pointerId !== event.pointerId) return;
+      try {
+        handle.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released by the browser.
+      }
+      graphResize = null;
+    };
+    handle.addEventListener("pointerup", stopResize);
+    handle.addEventListener("pointercancel", stopResize);
+  });
+}
+
+function openGraphPalette(element: HTMLElement) {
+  window.clearTimeout(graphPaletteCloseTimer);
+  element.classList.add("open");
+}
+
+function scheduleGraphPaletteClose(element: HTMLElement) {
+  window.clearTimeout(graphPaletteCloseTimer);
+  graphPaletteCloseTimer = window.setTimeout(() => {
+    if (element.matches(":hover") || element.matches(":focus-within")) return;
+    element.classList.remove("open");
+  }, 260);
+}
+
+function resizeGraphWindow(event: PointerEvent) {
+  if (!graphResize) return;
+  const windowState = graphWindows.find((candidate) => candidate.id === graphResize?.id);
+  const element = document.querySelector<HTMLElement>(`[data-graph-window-id="${graphResize.id}"]`);
+  if (!windowState || !element) return;
+
+  const dx = event.clientX - graphResize.startClientX;
+  const dy = event.clientY - graphResize.startClientY;
+  const area = graphAreaSize();
+  const margin = 8;
+  const maxWidth = Math.max(GRAPH_MIN_SIZE.width, area.width - margin * 2);
+  const maxHeight = Math.max(GRAPH_MIN_SIZE.height, area.height - margin * 2);
+
+  let x = graphResize.startX;
+  let y = graphResize.startY;
+  let width = graphResize.startWidth;
+  let height = graphResize.startHeight;
+
+  if (graphResize.edge.includes("e")) width = graphResize.startWidth + dx;
+  if (graphResize.edge.includes("s")) height = graphResize.startHeight + dy;
+  if (graphResize.edge.includes("w")) {
+    width = graphResize.startWidth - dx;
+    x = graphResize.startX + dx;
+  }
+  if (graphResize.edge.includes("n")) {
+    height = graphResize.startHeight - dy;
+    y = graphResize.startY + dy;
+  }
+
+  width = Math.max(GRAPH_MIN_SIZE.width, Math.min(maxWidth, width));
+  height = Math.max(GRAPH_MIN_SIZE.height, Math.min(maxHeight, height));
+  if (graphResize.edge.includes("w")) x = graphResize.startX + graphResize.startWidth - width;
+  if (graphResize.edge.includes("n")) y = graphResize.startY + graphResize.startHeight - height;
+
+  windowState.x = x;
+  windowState.y = y;
+  windowState.width = width;
+  windowState.height = height;
+  clampGraphWindow(windowState);
+
+  element.style.left = `${windowState.x}px`;
+  element.style.top = `${windowState.y}px`;
+  element.style.width = `${windowState.width}px`;
+  element.style.height = `${windowState.height}px`;
+  renderGraphCanvases(sampleAtFrame());
 }
 
 function bindSeekBar() {
@@ -2091,12 +2340,13 @@ function updatePlaybackUi() {
   if (played) played.style.width = `${state.playedPercent}%`;
   const thumb = document.querySelector<HTMLElement>("#seekThumb");
   if (thumb) thumb.style.left = `${state.playedPercent}%`;
-  const currentTime = document.querySelector<HTMLElement>("#currentTime");
-  if (currentTime) currentTime.textContent = `Tick ${formatStat(state.currentTick)}`;
-  const durationTime = document.querySelector<HTMLElement>("#durationTime");
-  if (durationTime) durationTime.textContent = `${formatReplayClock(state.currentTick)} / ${formatReplayClock(state.endTick)}`;
   const playButton = document.querySelector<HTMLButtonElement>("#playButton");
-  if (playButton) playButton.textContent = playing ? "Pause" : "Play";
+  if (playButton) {
+    playButton.classList.toggle("is-paused", playing);
+    playButton.classList.toggle("is-playing", !playing);
+    playButton.setAttribute("aria-label", playing ? "Pause replay" : "Play replay");
+    playButton.setAttribute("title", playing ? "Pause" : "Play");
+  }
   const speedValue = document.querySelector<HTMLElement>("#speedValue");
   if (speedValue) speedValue.textContent = `${speed.toFixed(1)}x`;
 }
@@ -2157,31 +2407,20 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function base64ToBlob(payload: ArtifactPayload): Blob {
-  const bytes = base64ToBytes(payload.base64);
-  const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-  return new Blob([arrayBuffer], { type: payload.mime_type });
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  const raw = atob(value);
-  const bytes = new Uint8Array(raw.length);
-  for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
-  return bytes;
-}
-
 async function readStats(jobId: string): Promise<Stats> {
-  const payload = await invoke<ArtifactPayload>("read_artifact", { jobId, kind: "stats" });
-  const text = new TextDecoder().decode(base64ToBytes(payload.base64));
-  const parsed = JSON.parse(text) as Stats;
-  if (!parsed || !Array.isArray(parsed.samples)) {
-    throw new Error("Stats artifact did not contain playable samples.");
+  let offset = 0;
+  let samples: Sample[] = [];
+  let meta: CaptureSampleDeltaPayload["meta"] | CaptureSampleDeltaPayload["final_stats"] | null = null;
+  for (let index = 0; index < 24 && samples.length < MAX_BUFFERED_SAMPLES; index += 1) {
+    const payload = await invoke<CaptureSampleDeltaPayload>("capture_sample_delta", { jobId, offset });
+    offset = Number(payload.offset ?? offset);
+    sampleStreamOffset = offset;
+    meta = payload.final_stats ?? payload.meta ?? meta;
+    samples = appendDeltaSamples(samples, Array.isArray(payload.samples) ? payload.samples : []);
+    if (!payload.found || !payload.samples.length || offset >= Number(payload.stream_bytes ?? 0)) break;
   }
-  return parsed;
-}
-
-function hasPlayableSamples(value: unknown): value is Stats {
-  return Boolean(value && typeof value === "object" && Array.isArray((value as Stats).samples) && (value as Stats).samples.length);
+  if (!meta || !samples.length) throw new Error("Stats artifact did not contain playable streamed samples.");
+  return statsFromMeta(meta, samples, Boolean(meta && meta.summary?.partial === false));
 }
 
 function isPartialCapture(stats: Stats | null): boolean {
@@ -2218,11 +2457,37 @@ function setActiveStats(stats: Stats, job: Job | null, { firstPartial = false } 
   frameIndex = frameForTick(playbackTick);
 }
 
+function trimBufferedSamples(samples: Sample[]): Sample[] {
+  if (samples.length <= MAX_BUFFERED_SAMPLES) return samples;
+  return samples.slice(samples.length - MAX_BUFFERED_SAMPLES);
+}
+
 function appendDeltaSamples(existing: Sample[], incoming: Sample[]): Sample[] {
   if (!incoming.length) return existing;
   const lastIndex = Number(existing.at(-1)?.sample_index ?? -1);
   const filtered = incoming.filter((sample) => Number(sample.sample_index) > lastIndex);
-  return filtered.length ? [...existing, ...filtered] : existing;
+  return filtered.length ? trimBufferedSamples([...existing, ...filtered]) : existing;
+}
+
+function statsFromMeta(meta: CaptureSampleDeltaPayload["meta"] | CaptureSampleDeltaPayload["final_stats"], samples: Sample[], final = false): Stats {
+  const summary = meta?.summary ?? {};
+  const sampleCount = Number(summary.sample_count);
+  return {
+    source: String(meta?.source ?? ""),
+    replay_metadata: meta?.replay_metadata,
+    map: meta?.map,
+    teams: meta?.teams,
+    samples,
+    summary: {
+      ...summary,
+      sample_count: Number.isFinite(sampleCount) ? sampleCount : samples.length,
+      buffered_sample_count: samples.length,
+      first_tick: samples[0]?.tick ?? summary.first_tick,
+      last_tick: samples.at(-1)?.tick ?? summary.last_tick,
+      simulated_until_tick: samples.at(-1)?.tick ?? summary.simulated_until_tick,
+      partial: final ? summary.partial === true : true,
+    },
+  };
 }
 
 async function applySampleDelta(job: Job | undefined, token = captureProgressToken): Promise<boolean> {
@@ -2232,45 +2497,19 @@ async function applySampleDelta(job: Job | undefined, token = captureProgressTok
   if (token !== captureProgressToken) return false;
   sampleStreamOffset = Number(payload.offset ?? sampleStreamOffset);
 
-  if (hasPlayableSamples(payload.final_stats)) {
-    if (!AUTHORITATIVE_SOURCES.has(String(payload.final_stats.source))) return false;
-    const openingViewer = phase === "loading";
-    setActiveStats(payload.final_stats, job ?? activeJob, { firstPartial: openingViewer });
-    if (openingViewer) {
-      phase = "ready";
-      render();
-      startPlayback();
-    } else {
-      render();
-    }
-    return true;
-  }
-
-  const meta = payload.meta;
+  const meta = payload.final_stats ?? payload.meta;
   const incoming = Array.isArray(payload.samples) ? payload.samples : [];
   if (!meta || !AUTHORITATIVE_SOURCES.has(String(meta.source)) || (!incoming.length && !activeStats)) return false;
 
+  const previousLastIndex = Number(activeStats?.samples.at(-1)?.sample_index ?? -1);
   const samples = appendDeltaSamples(activeStats?.samples ?? [], incoming);
   if (!samples.length) return false;
-  const stats: Stats = {
-    source: String(meta.source),
-    replay_metadata: meta.replay_metadata,
-    map: meta.map,
-    teams: meta.teams,
-    samples,
-    summary: {
-      ...(meta.summary ?? {}),
-      sample_count: samples.length,
-      first_tick: samples[0]?.tick ?? meta.summary?.first_tick,
-      last_tick: samples.at(-1)?.tick ?? meta.summary?.last_tick,
-      simulated_until_tick: samples.at(-1)?.tick ?? meta.summary?.simulated_until_tick,
-      partial: true,
-    },
-  };
+  const stats = statsFromMeta(meta, samples, Boolean(payload.final_stats));
 
-  const hadNewSamples = samples.length > (activeStats?.samples.length ?? 0);
+  const hadNewSamples = Number(samples.at(-1)?.sample_index ?? -1) > previousLastIndex;
   const hasNewMap = Boolean(!activeStats?.map?.image_data_url && !activeStats?.map?.image_png && (stats.map?.image_data_url || stats.map?.image_png));
-  if (!hadNewSamples && !hasNewMap) return false;
+  const hasFinalMeta = Boolean(payload.final_stats);
+  if (!hadNewSamples && !hasNewMap && !hasFinalMeta) return false;
 
   const openingViewer = phase === "loading";
   setActiveStats(stats, job ?? activeJob, { firstPartial: openingViewer });
@@ -2279,7 +2518,8 @@ async function applySampleDelta(job: Job | undefined, token = captureProgressTok
     render();
     startPlayback();
   } else {
-    render();
+    renderCanvas();
+    updatePlaybackUi();
     if (playing && liveEdgePaused && lastCapturedTick(stats) > playbackTick) {
       liveEdgePaused = false;
       lastAnimationTime = 0;
@@ -2329,7 +2569,7 @@ function teamProgressFacts(event: CaptureProgressEvent, job: Job | undefined): s
   return teams.slice(0, 2).map((team, index) => {
     const label = names[index] || `Player ${index + 1}`;
     const troops = formatStat(team.troops_estimate ?? team.strength, true);
-    const losses = formatStat(team.casualties_estimate ?? team.casualties ?? team.troop_casualties, true);
+    const losses = formatStat(team.displayed_casualties ?? team.casualties_displayed ?? team.casualties_estimate ?? team.casualties ?? team.troop_casualties, true);
     const funds = formatStat(team.funds);
     return `${label}: troops ${troops}, losses ${losses}, funds ${funds}`;
   });
@@ -2413,27 +2653,51 @@ function applyCaptureProgress(payload: CaptureProgressPayload, filename: string)
 
 function stopCaptureProgressPolling() {
   window.clearInterval(captureProgressTimer);
+  window.clearInterval(sampleDeltaTimer);
   captureProgressTimer = 0;
+  sampleDeltaTimer = 0;
+  captureProgressInFlight = false;
+  sampleDeltaInFlight = false;
   captureProgressToken += 1;
 }
 
 function startCaptureProgressPolling(filename: string, startedAfterMs: number) {
   window.clearInterval(captureProgressTimer);
+  window.clearInterval(sampleDeltaTimer);
   const token = ++captureProgressToken;
-  const poll = async () => {
+  const progressPoll = async () => {
     if (token !== captureProgressToken || (phase !== "loading" && !(phase === "ready" && liveCaptureActive))) return;
+    if (captureProgressInFlight) return;
+    captureProgressInFlight = true;
     try {
       const payload = await invoke<CaptureProgressPayload>("capture_progress", { filename, startedAfterMs });
       if (token !== captureProgressToken || (phase !== "loading" && !(phase === "ready" && liveCaptureActive))) return;
       if (phase === "loading") applyCaptureProgress(payload, filename);
       else if (payload.job) activeJob = payload.job;
-      await applySampleDelta(payload.job, token);
     } catch {
       // Keep the current loading text; capture itself will report errors when it finishes.
+    } finally {
+      captureProgressInFlight = false;
     }
   };
-  void poll();
-  captureProgressTimer = window.setInterval(() => void poll(), 200);
+
+  const samplePoll = async () => {
+    if (token !== captureProgressToken || (phase !== "loading" && !(phase === "ready" && liveCaptureActive))) return;
+    if (sampleDeltaInFlight) return;
+    sampleDeltaInFlight = true;
+    try {
+      await applySampleDelta(activeJob ?? undefined, token);
+    } catch {
+      // Capture progress will surface terminal failures; sample hydration should keep trying.
+    } finally {
+      sampleDeltaInFlight = false;
+    }
+  };
+
+  void progressPoll();
+  void samplePoll();
+  captureProgressTimer = window.setInterval(() => void progressPoll(), 500);
+  sampleDeltaTimer = window.setInterval(() => void samplePoll(), 100);
 }
 
 async function refreshBackend({ quiet = false } = {}) {
@@ -2504,7 +2768,12 @@ async function loadReplayFile(file: File) {
     stopCaptureProgressPolling();
     if (job.status !== "captured") throw new Error(job.error ?? "Game-backed capture failed.");
 
-    const stats = getStats(job) ?? (await readStats(job.job_id));
+    const streamedStats = activeStats as Stats | null;
+    if (streamedStats?.samples.length) {
+      await applySampleDelta(job);
+    }
+    const refreshedStats = activeStats as Stats | null;
+    const stats = refreshedStats?.samples.length ? refreshedStats : getStats(job) ?? (await readStats(job.job_id));
     if (!stats?.samples.length) throw new Error("Game-backed capture completed without playable samples.");
     if (!isAuthoritativeCapture(job, stats)) {
       throw new Error(`Refusing non-authoritative capture source: ${captureSource(job, stats) || "unknown"}.`);
@@ -2542,23 +2811,6 @@ async function loadReplayFile(file: File) {
     }
     render();
   }
-}
-
-async function downloadArtifact(kind: string) {
-  if (!activeJob) return;
-  try {
-    const payload = await invoke<ArtifactPayload>("read_artifact", { jobId: activeJob.job_id, kind });
-    const url = URL.createObjectURL(base64ToBlob(payload));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = payload.filename;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    notice = { tone: "success", text: `Prepared ${payload.filename} (${formatBytes(payload.bytes)}).` };
-  } catch (error) {
-    notice = { tone: "error", text: error instanceof Error ? error.message : String(error) };
-  }
-  render();
 }
 
 function startPlayback() {
@@ -2638,7 +2890,10 @@ function installFileDrop() {
   });
 }
 
-window.addEventListener("resize", renderCanvas);
+window.addEventListener("resize", () => {
+  graphWindows.filter((windowState) => windowState.visible).forEach(clampGraphWindow);
+  renderCanvas();
+});
 installFileDrop();
 render();
 void loadUnitAssets();

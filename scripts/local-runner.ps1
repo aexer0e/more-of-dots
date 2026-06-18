@@ -1350,6 +1350,11 @@ RECENT_RENDER_PROJECTION_LINES = []
 PROGRESS_PATH = ARTIFACT_PATH + '.progress.jsonl'
 SAMPLE_STREAM_PATH = STATS_PATH + '.samples.jsonl' if STATS_PATH else None
 PARTIAL_META_PATH = STATS_PATH + '.partial.meta.json' if STATS_PATH else None
+try:
+    SAMPLE_BUFFER_LIMIT = max(20, int(os.environ.get('WOD_CAPTURE_IN_PROCESS_SAMPLE_LIMIT', '900')))
+except Exception:
+    SAMPLE_BUFFER_LIMIT = 900
+EMBED_FINAL_STATS_SAMPLES = os.environ.get('WOD_EMBED_FINAL_STATS_SAMPLES', '').strip().lower() in ('1', 'true', 'yes', 'on')
 VARIANT_FILTER = set(
     item.strip()
     for item in os.environ.get('WOD_LIVE_CAPTURE_VARIANTS', '').split(',')
@@ -1426,6 +1431,47 @@ def safe_repr(value, limit=180):
         text = '<repr failed: %s>' % exc
     return text[:limit] + '...' if len(text) > limit else text
 
+def safe_len(value):
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+def mapping_items(value, limit=None):
+    if not isinstance(value, Mapping):
+        return []
+    for _ in range(3):
+        try:
+            items = list(value.items())
+            return items[:limit] if limit is not None else items
+        except RuntimeError:
+            time.sleep(0)
+        except Exception:
+            return []
+    out = []
+    try:
+        keys = list(value.keys())
+    except Exception:
+        return []
+    for key in keys:
+        if limit is not None and len(out) >= limit:
+            break
+        try:
+            try:
+                child = value.get(key)
+            except Exception:
+                child = value[key]
+            out.append((key, child))
+        except Exception:
+            continue
+    return out
+
+def snapshot_mapping(value, limit=None):
+    try:
+        return dict(mapping_items(value, limit=limit))
+    except Exception:
+        return {}
+
 def jsonable(value, limit=8):
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -1434,20 +1480,17 @@ def jsonable(value, limit=8):
             return value
         return {'type': 'str', 'len': len(value), 'preview': value[:200] + '...'}
     if isinstance(value, Mapping):
+        snapshot = snapshot_mapping(value, limit=limit)
         items = {}
-        for key in list(value.keys())[:limit]:
-            try:
-                child = value.get(key)
-            except Exception:
-                continue
+        for key, child in snapshot.items():
             if child is None or isinstance(child, (bool, int, float, str, Mapping, list, tuple, set)):
                 items[str(key)] = jsonable(child, limit=4)
             else:
                 items[str(key)] = safe_repr(child, 100)
         return {
             'type': 'dict',
-            'len': len(value),
-            'keys': [safe_repr(key, 80) for key in list(value.keys())[:limit]],
+            'len': safe_len(value),
+            'keys': [safe_repr(key, 80) for key in snapshot.keys()],
             'items': items,
         }
     if isinstance(value, (list, tuple, set)):
@@ -1463,7 +1506,7 @@ def attrs_of(obj):
         attrs = vars(obj)
     except Exception:
         return {}
-    return attrs if isinstance(attrs, Mapping) else {}
+    return snapshot_mapping(attrs) if isinstance(attrs, Mapping) else {}
 
 def trace_value(value, limit=8):
     if value is None or isinstance(value, (bool, int, float, str, Mapping, list, tuple, set)):
@@ -1827,7 +1870,7 @@ def read_numeric_from_value(value, slot=None, unit_obj=None, depth=0):
             except Exception:
                 pass
             try:
-                for key, child in list(value.items())[:240]:
+                for key, child in mapping_items(value, limit=240):
                     if key is unit_obj:
                         candidates.append(('unit_key_identity', child))
                         break
@@ -1846,7 +1889,7 @@ def read_numeric_from_value(value, slot=None, unit_obj=None, depth=0):
             if child_number is not None:
                 return child_number, 'dict.%s.%s' % (label, child_source or 'value')
         try:
-            for key, child in list(value.items())[:160]:
+            for key, child in mapping_items(value, limit=160):
                 low = str(key).lower()
                 if 'morale' not in low and 'moral' not in low:
                     continue
@@ -2031,7 +2074,7 @@ def point_sequence(value, limit=16, depth=0):
                 points.extend(point_sequence(value.get(key), limit - len(points), depth + 1))
                 if len(points) >= limit:
                     return points[:limit]
-        for key, child in list(value.items())[:limit]:
+        for key, child in mapping_items(value, limit=limit):
             points.extend(point_sequence(child, limit - len(points), depth + 1))
             if len(points) >= limit:
                 break
@@ -2667,6 +2710,89 @@ def read_funds(economy, team_count):
             return values[:team_count], 'zrtyz'
     return [], None
 
+def valid_team_counter_values(value, team_count):
+    values = number_list(value, limit=max(team_count, 8))
+    if len(values) < team_count:
+        return []
+    output = values[:team_count]
+    if any(item is not None for item in output):
+        return output
+    return []
+
+def score_casualty_counter_key(key, values, nested=False):
+    low = str(key).lower()
+    if any(word in low for word in ('ratio', 'percent', 'percentage', 'rate', 'color', 'colour', 'sound', 'time', 'tick', 'position')):
+        return -100
+    score = 0
+    if 'casual' in low:
+        score += 64
+    if 'loss' in low or 'lost' in low:
+        score += 48
+    if 'dead' in low or 'death' in low or 'killed' in low:
+        score += 36
+    if 'troop' in low or 'unit' in low:
+        score += 8
+    if any(word in low for word in ('display', 'shown', 'score', 'scoreboard', 'stat', 'stats', 'hud', 'ui', 'text', 'label', 'counter')):
+        score += 24
+    if nested:
+        score += 6
+    finite = [abs(float(value)) for value in values if isinstance(value, (int, float))]
+    if finite and max(finite) >= 1000:
+        score += 10
+    if low in ('casualties', 'troop_casualties'):
+        score -= 12
+    return score
+
+def metric_container_attrs(container):
+    if container is None:
+        return {}
+    if isinstance(container, Mapping):
+        return snapshot_mapping(container)
+    return attrs_of(container)
+
+def casualty_metric_containers(game, attrs):
+    containers = [('game', game)]
+    for key in ('economy', 'scoreboard', 'score_board', 'stats', 'statistics', 'hud', 'ui', 'interface', 'overlay', 'gui'):
+        if key in attrs:
+            containers.append(('game.%s' % key, attrs.get(key)))
+    for key, value in list(attrs.items())[:180]:
+        low = str(key).lower()
+        if any(word in low for word in ('score', 'stat', 'casual', 'loss', 'dead', 'hud', 'ui', 'interface', 'overlay', 'label', 'text', 'counter')):
+            containers.append(('game.%s' % key, value))
+    return containers
+
+def read_displayed_casualties(games, team_count):
+    game = games[0] if games else None
+    attrs = attrs_of(game) if game is not None else {}
+    best = None
+    nested_queue = []
+    for prefix, container in casualty_metric_containers(game, attrs):
+        container_attrs = metric_container_attrs(container)
+        for key, value in list(container_attrs.items())[:180]:
+            values = valid_team_counter_values(value, team_count)
+            if not values:
+                continue
+            score = score_casualty_counter_key(key, values)
+            if score > 0 and (best is None or score > best['score']):
+                best = {'values': values, 'source': '%s.%s' % (prefix, key), 'score': score}
+            low = str(key).lower()
+            if any(word in low for word in ('score', 'stat', 'casual', 'loss', 'dead', 'hud', 'ui', 'text', 'label', 'counter')):
+                nested_queue.append(('%s.%s' % (prefix, key), value))
+
+    for prefix, container in nested_queue[:24]:
+        container_attrs = metric_container_attrs(container)
+        for key, value in list(container_attrs.items())[:100]:
+            values = valid_team_counter_values(value, team_count)
+            if not values:
+                continue
+            score = score_casualty_counter_key(key, values, nested=True)
+            if score > 0 and (best is None or score > best['score']):
+                best = {'values': values, 'source': '%s.%s' % (prefix, key), 'score': score}
+
+    if best is None:
+        return [], None
+    return best['values'][:team_count], '%s score=%s' % (best['source'], best['score'])
+
 def build_metrics(games, troops, teams):
     game = games[0] if games else None
     attrs = attrs_of(game) if game is not None else {}
@@ -2679,6 +2805,7 @@ def build_metrics(games, troops, teams):
     casualties = number_list(attrs.get('casualties'), limit=team_count)
     troop_casualties = number_list(attrs.get('troop_casualties'), limit=team_count)
     funds, funds_source = read_funds(attrs.get('economy'), team_count)
+    displayed_casualties, displayed_casualties_source = read_displayed_casualties(games, team_count)
     teams_out = []
     for index in range(team_count):
         owned = [troop for troop in troops if owner_to_index(troop.get('owner')) == index]
@@ -2688,6 +2815,10 @@ def build_metrics(games, troops, teams):
         raw_strength = strength[index] if index < len(strength) else None
         raw_casualties = casualties[index] if index < len(casualties) else None
         raw_troop_casualties = troop_casualties[index] if index < len(troop_casualties) else None
+        raw_displayed_casualties = displayed_casualties[index] if index < len(displayed_casualties) else None
+        estimated_casualties = int(raw_casualties * 100) if isinstance(raw_casualties, (int, float)) else (
+            int(raw_troop_casualties * 100) if isinstance(raw_troop_casualties, (int, float)) else 0
+        )
         teams_out.append({
             'index': index,
             'alive_units': len(alive),
@@ -2696,9 +2827,9 @@ def build_metrics(games, troops, teams):
             'strength': raw_strength,
             'troops_estimate': int(raw_strength * 100) if isinstance(raw_strength, (int, float)) else len(alive),
             'casualties': raw_casualties,
-            'casualties_estimate': int(raw_casualties * 100) if isinstance(raw_casualties, (int, float)) else (
-                int(raw_troop_casualties * 100) if isinstance(raw_troop_casualties, (int, float)) else 0
-            ),
+            'casualties_displayed': raw_displayed_casualties,
+            'displayed_casualties': raw_displayed_casualties,
+            'casualties_estimate': int(raw_displayed_casualties) if isinstance(raw_displayed_casualties, (int, float)) else estimated_casualties,
             'troop_casualties': raw_troop_casualties,
             'funds': funds[index] if index < len(funds) else None,
         })
@@ -2706,6 +2837,7 @@ def build_metrics(games, troops, teams):
         'teams': teams_out,
         'sources': {
             'strength': 'game.strength' if strength else None,
+            'displayed_casualties': displayed_casualties_source,
             'casualties': 'game.casualties' if casualties else None,
             'troop_casualties': 'game.troop_casualties' if troop_casualties else None,
             'funds': 'game.economy.%s' % funds_source if funds_source else None,
@@ -3599,7 +3731,7 @@ def collect_troops(candidates, limit=600):
 
     def iter_children(value):
         if isinstance(value, Mapping):
-            for child_slot, child in list(value.items())[:limit]:
+            for child_slot, child in mapping_items(value, limit=limit):
                 yield child_slot, child
             return
         try:
@@ -3878,7 +4010,7 @@ def scoreboard_stats_from_samples(samples):
         if final is None:
             strength = metric_number(last_team, 'strength')
             final = strength * 100 if strength is not None else None
-        casualties = metric_number(last_team, 'casualties_estimate')
+        casualties = metric_number(last_team, 'displayed_casualties', 'casualties_displayed', 'casualties_estimate')
         if casualties is None:
             raw_casualties = metric_number(last_team, 'troop_casualties', 'casualties')
             casualties = raw_casualties * 100 if raw_casualties is not None else 0
@@ -3997,7 +4129,26 @@ def validate_samples(samples, replay=None):
         'valid': valid,
     }
 
-def build_live_stats_payload(request, replay, map_payload, teams, samples, validation=None, partial=False):
+def build_live_stats_payload(
+    request,
+    replay,
+    map_payload,
+    teams,
+    samples,
+    validation=None,
+    partial=False,
+    sample_count_total=None,
+    first_tick=None,
+    last_tick=None,
+    troop_slots_seen=None,
+    embed_samples=True,
+):
+    effective_sample_count = sample_count_total if isinstance(sample_count_total, int) else len(samples)
+    effective_first_tick = first_tick if first_tick is not None else (samples[0].get('tick') if samples else None)
+    effective_last_tick = last_tick if last_tick is not None else (samples[-1].get('tick') if samples else None)
+    effective_troop_slots_seen = len(troop_slots_seen) if troop_slots_seen is not None else len({troop.get('unit_id') for sample in samples for troop in sample.get('troops', [])})
+    embedded_samples = samples if embed_samples else []
+    last_sample = samples[-1] if samples else {}
     return {
         'job_id': request.get('job_id'),
         'game_version': request.get('replay_metadata', {}).get('version'),
@@ -4007,19 +4158,23 @@ def build_live_stats_payload(request, replay, map_payload, teams, samples, valid
         'map': map_payload,
         'teams': teams,
         'sample_rate_hz': REPLAY_SAMPLE_HZ,
-        'samples': samples,
+        'samples': embedded_samples,
         'summary': {
-            'sample_count': len(samples),
-            'troop_slots_seen': len({troop.get('unit_id') for sample in samples for troop in sample.get('troops', [])}),
-            'city_count': len(samples[-1].get('cities', [])) if samples else 0,
-            'controlled_city_count': len([city for city in samples[-1].get('cities', []) if city.get('owner') is not None]) if samples else 0,
+            'sample_count': effective_sample_count,
+            'embedded_sample_count': len(embedded_samples),
+            'buffered_sample_count': len(samples),
+            'sample_stream_path': SAMPLE_STREAM_PATH,
+            'in_process_sample_limit': SAMPLE_BUFFER_LIMIT,
+            'troop_slots_seen': effective_troop_slots_seen,
+            'city_count': len(last_sample.get('cities', [])) if samples else 0,
+            'controlled_city_count': len([city for city in last_sample.get('cities', []) if city.get('owner') is not None]) if samples else 0,
             'result': request.get('replay_metadata', {}).get('result'),
             'end_tick': request.get('replay_metadata', {}).get('end'),
             'replay_sample_hz': REPLAY_SAMPLE_HZ,
             'replay_sample_tick_gap': REPLAY_SAMPLE_TICK_GAP,
-            'first_tick': samples[0].get('tick') if samples else None,
-            'last_tick': samples[-1].get('tick') if samples else None,
-            'simulated_until_tick': samples[-1].get('tick') if samples else None,
+            'first_tick': effective_first_tick,
+            'last_tick': effective_last_tick,
+            'simulated_until_tick': effective_last_tick,
             'partial': bool(partial),
             'capture_until_end': CAPTURE_UNTIL_END,
             'simulation_speed': TARGET_SIM_SPEED,
@@ -4035,8 +4190,22 @@ def build_live_stats_payload(request, replay, map_payload, teams, samples, valid
         },
     }
 
-def build_partial_meta_payload(request, replay, map_payload, teams, samples):
-    last_tick = samples[-1].get('tick') if samples else None
+def build_partial_meta_payload(
+    request,
+    replay,
+    map_payload,
+    teams,
+    samples,
+    sample_count_total=None,
+    first_tick=None,
+    last_tick=None,
+    troop_slots_seen=None,
+):
+    effective_sample_count = sample_count_total if isinstance(sample_count_total, int) else len(samples)
+    effective_first_tick = first_tick if first_tick is not None else (samples[0].get('tick') if samples else None)
+    effective_last_tick = last_tick if last_tick is not None else (samples[-1].get('tick') if samples else None)
+    effective_troop_slots_seen = len(troop_slots_seen) if troop_slots_seen is not None else len({troop.get('unit_id') for sample in samples[-250:] for troop in sample.get('troops', [])})
+    last_sample = samples[-1] if samples else {}
     return {
         'job_id': request.get('job_id'),
         'game_version': request.get('replay_metadata', {}).get('version'),
@@ -4047,17 +4216,20 @@ def build_partial_meta_payload(request, replay, map_payload, teams, samples):
         'teams': teams,
         'sample_rate_hz': REPLAY_SAMPLE_HZ,
         'summary': {
-            'sample_count': len(samples),
-            'troop_slots_seen': len({troop.get('unit_id') for sample in samples[-250:] for troop in sample.get('troops', [])}),
-            'city_count': len(samples[-1].get('cities', [])) if samples else 0,
-            'controlled_city_count': len([city for city in samples[-1].get('cities', []) if city.get('owner') is not None]) if samples else 0,
+            'sample_count': effective_sample_count,
+            'buffered_sample_count': len(samples),
+            'sample_stream_path': SAMPLE_STREAM_PATH,
+            'in_process_sample_limit': SAMPLE_BUFFER_LIMIT,
+            'troop_slots_seen': effective_troop_slots_seen,
+            'city_count': len(last_sample.get('cities', [])) if samples else 0,
+            'controlled_city_count': len([city for city in last_sample.get('cities', []) if city.get('owner') is not None]) if samples else 0,
             'result': request.get('replay_metadata', {}).get('result'),
             'end_tick': request.get('replay_metadata', {}).get('end'),
             'replay_sample_hz': REPLAY_SAMPLE_HZ,
             'replay_sample_tick_gap': REPLAY_SAMPLE_TICK_GAP,
-            'first_tick': samples[0].get('tick') if samples else None,
-            'last_tick': last_tick,
-            'simulated_until_tick': last_tick,
+            'first_tick': effective_first_tick,
+            'last_tick': effective_last_tick,
+            'simulated_until_tick': effective_last_tick,
             'partial': True,
             'capture_until_end': CAPTURE_UNTIL_END,
             'simulation_speed': TARGET_SIM_SPEED,
@@ -4081,30 +4253,55 @@ def append_sample_stream(sample):
     with open(SAMPLE_STREAM_PATH, 'a', encoding='utf-8') as handle:
         handle.write(json.dumps(sample, default=str, separators=(',', ':')) + '\n')
 
-def maybe_write_partial_stats(request, replay, map_payload, teams, samples, completion=None):
-    if MODE != 'capture-live-replay' or not STATS_PATH or not samples:
+def maybe_write_partial_stats(
+    request,
+    replay,
+    map_payload,
+    teams,
+    samples,
+    sample,
+    sample_count_total,
+    first_tick,
+    last_tick,
+    troop_slots_seen,
+    completion=None,
+):
+    if MODE != 'capture-live-replay' or not STATS_PATH or not sample:
         return
     try:
-        append_sample_stream(samples[-1])
+        append_sample_stream(sample)
     except Exception as exc:
         record_progress({
             'stage': 'partial-sample-stream',
             'status': 'write-skipped',
             'error': repr(exc),
-            'sample_count': len(samples),
-            'tick': samples[-1].get('tick') if samples else None,
+            'sample_count': sample_count_total,
+            'tick': sample.get('tick'),
         })
     write_interval = max(1, int(round(REPLAY_SAMPLE_HZ)))
-    if len(samples) == 1 or len(samples) % write_interval == 0 or (completion and completion.get('done')):
+    if sample_count_total == 1 or sample_count_total % write_interval == 0 or (completion and completion.get('done')):
         try:
-            write_json_atomic(PARTIAL_META_PATH, build_partial_meta_payload(request, replay, map_payload, teams, samples))
+            write_json_atomic(
+                PARTIAL_META_PATH,
+                build_partial_meta_payload(
+                    request,
+                    replay,
+                    map_payload,
+                    teams,
+                    samples,
+                    sample_count_total,
+                    first_tick,
+                    last_tick,
+                    troop_slots_seen,
+                ),
+            )
         except Exception as exc:
             record_progress({
                 'stage': 'partial-meta',
                 'status': 'write-skipped',
                 'error': repr(exc),
-                'sample_count': len(samples),
-                'tick': samples[-1].get('tick') if samples else None,
+                'sample_count': sample_count_total,
+                'tick': sample.get('tick'),
             })
 
 try:
@@ -4144,12 +4341,18 @@ try:
             'max_sample_tick_gap': MAX_SAMPLE_TICK_GAP,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
             'full_gc_discovery': FULL_GC_DISCOVERY,
+            'sample_buffer_limit': SAMPLE_BUFFER_LIMIT,
+            'embed_final_stats_samples': EMBED_FINAL_STATS_SAMPLES,
         },
         'trace_events': TRACE_EVENTS,
         'validation': {},
     }
 
     samples = []
+    sample_count_total = 0
+    first_sample_tick = None
+    last_sample_tick = None
+    troop_slots_seen = set()
     map_payload = None
     teams = build_teams(replay, [])
     end_tick = to_int(request.get('replay_metadata', {}).get('end'))
@@ -4250,6 +4453,18 @@ try:
             if completion.get('done'):
                 sample['completion'] = completion
             samples.append(sample)
+            sample_count_total += 1
+            if first_sample_tick is None:
+                first_sample_tick = sample_tick
+            last_sample_tick = sample_tick
+            for troop in troops:
+                unit_id = troop.get('unit_id')
+                if unit_id is not None:
+                    troop_slots_seen.add(unit_id)
+            if len(samples) > SAMPLE_BUFFER_LIMIT:
+                del samples[:len(samples) - SAMPLE_BUFFER_LIMIT]
+            if sample_count_total % 50 == 0:
+                gc.collect()
             previous_sample_tick = sample_tick
             tick_percent = None
             if end_tick is not None and sample.get('tick') is not None:
@@ -4260,7 +4475,8 @@ try:
             record_progress({
                 'stage': 'capture-sample',
                 'sample_index': index,
-                'sample_count': len(samples),
+                'sample_count': sample_count_total,
+                'buffered_sample_count': len(samples),
                 'max_samples': sample_total,
                 'tick': sample.get('tick'),
                 'tick_source': sample.get('tick_source'),
@@ -4281,7 +4497,19 @@ try:
                 'teams': metrics.get('teams', [])[:4] if isinstance(metrics, dict) else [],
                 'completion': completion if completion.get('done') else None,
             })
-            maybe_write_partial_stats(request, replay, map_payload, teams, samples, completion)
+            maybe_write_partial_stats(
+                request,
+                replay,
+                map_payload,
+                teams,
+                samples,
+                sample,
+                sample_count_total,
+                first_sample_tick,
+                last_sample_tick,
+                troop_slots_seen,
+                completion,
+            )
             if CAPTURE_UNTIL_END and completion.get('done') and len(samples) >= 2:
                 artifact['completion'] = completion
                 break
@@ -4297,17 +4525,32 @@ try:
                 artifact['economy_profile'] = {'error': repr(exc)}
 
     validation = validate_samples(samples, replay)
+    validation['total_sample_count'] = sample_count_total
+    validation['buffered_sample_count'] = len(samples)
     artifact['status'] = 'ok'
     artifact['validation'] = validation
     artifact['trace_events'] = TRACE_EVENTS
-    artifact['sample_preview'] = samples[:5]
+    artifact['sample_preview'] = samples[-5:]
     write_json_atomic(ARTIFACT_PATH, artifact)
 
     if MODE == 'capture-live-replay':
         if not validation['valid']:
             reasons = validation.get('blocking_reasons') or ['live game capture validation failed']
             raise RuntimeError('Live game capture validation failed: %s. See artifact: %s' % ('; '.join(reasons), ARTIFACT_PATH))
-        stats = build_live_stats_payload(request, replay, map_payload, teams, samples, validation, partial=False)
+        stats = build_live_stats_payload(
+            request,
+            replay,
+            map_payload,
+            teams,
+            samples,
+            validation,
+            partial=False,
+            sample_count_total=sample_count_total,
+            first_tick=first_sample_tick,
+            last_tick=last_sample_tick,
+            troop_slots_seen=troop_slots_seen,
+            embed_samples=EMBED_FINAL_STATS_SAMPLES,
+        )
         write_json_atomic(STATS_PATH, stats)
         try:
             os.remove(STATS_PATH + '.partial.json')

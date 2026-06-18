@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,10 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
 
 const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
+const DEFAULT_SAMPLE_DELTA_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SAMPLE_DELTA_RECORDS: usize = 600;
+const MAX_STATS_META_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct ArtifactPayload {
@@ -53,6 +57,48 @@ fn file_modified_millis(path: &Path) -> u64 {
 fn read_json_file(path: &Path) -> Option<Value> {
     let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+fn sample_delta_max_bytes() -> usize {
+    env::var("WOD_SAMPLE_DELTA_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SAMPLE_DELTA_MAX_BYTES)
+        .clamp(64 * 1024, 8 * 1024 * 1024)
+}
+
+fn sample_delta_max_record_bytes() -> usize {
+    env::var("WOD_SAMPLE_DELTA_MAX_RECORD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES)
+        .clamp(256 * 1024, 16 * 1024 * 1024)
+}
+
+fn read_stats_meta_file(path: &Path) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > MAX_STATS_META_BYTES {
+        return None;
+    }
+    let mut value = read_json_file(path)?;
+    if let Value::Object(object) = &mut value {
+        let embedded_sample_count = object
+            .get("samples")
+            .and_then(Value::as_array)
+            .map(|samples| samples.len());
+        object.insert("samples".to_string(), Value::Array(Vec::new()));
+        if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
+            if let Some(count) = embedded_sample_count {
+                summary
+                    .entry("embedded_sample_count".to_string())
+                    .or_insert_with(|| json!(count));
+                summary
+                    .entry("sample_count".to_string())
+                    .or_insert_with(|| json!(count));
+            }
+        }
+    }
+    Some(value)
 }
 
 fn latest_progress_event(path: &Path) -> (Option<Value>, usize) {
@@ -261,7 +307,7 @@ async fn capture_sample_delta(app: AppHandle, job_id: String, offset: u64) -> Re
     let meta_path = root.join("stats.json.partial.meta.json");
     let final_stats_path = root.join("stats.json");
     let meta = read_json_file(&meta_path);
-    let final_stats = read_json_file(&final_stats_path);
+    let final_stats = read_stats_meta_file(&final_stats_path);
 
     let Ok(metadata) = fs::metadata(&sample_path) else {
         return Ok(json!({
@@ -279,30 +325,50 @@ async fn capture_sample_delta(app: AppHandle, job_id: String, offset: u64) -> Re
     file.seek(SeekFrom::Start(start))
         .map_err(|error| format!("Could not seek {}: {error}", sample_path.display()))?;
 
-    let max_bytes = 2_000_000usize;
-    let mut buffer = vec![0u8; max_bytes];
-    let bytes_read = file
-        .read(&mut buffer)
-        .map_err(|error| format!("Could not read {}: {error}", sample_path.display()))?;
-    buffer.truncate(bytes_read);
+    let max_bytes = sample_delta_max_bytes();
+    let max_record_bytes = sample_delta_max_record_bytes();
+    let mut reader = BufReader::new(file);
+    let mut consumed = 0u64;
+    let mut samples = Vec::new();
+    let mut largest_record_bytes = 0usize;
 
-    let mut consumed = bytes_read as u64;
-    if bytes_read == max_bytes {
-        if let Some(position) = buffer.iter().rposition(|byte| *byte == b'\n') {
-            buffer.truncate(position + 1);
-            consumed = (position + 1) as u64;
-        } else {
-            buffer.clear();
-            consumed = 0;
+    loop {
+        if samples.len() >= MAX_SAMPLE_DELTA_RECORDS {
+            break;
+        }
+        if consumed as usize >= max_bytes && !samples.is_empty() {
+            break;
+        }
+
+        let mut line = String::new();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Could not read {}: {error}", sample_path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        if bytes_read > max_record_bytes {
+            return Err(format!(
+                "Sample stream record is too large: {} bytes at offset {} in {}. Increase WOD_SAMPLE_DELTA_MAX_RECORD_BYTES if this replay is expected.",
+                bytes_read,
+                start.saturating_add(consumed),
+                sample_path.display()
+            ));
+        }
+        if !line.ends_with('\n') && start.saturating_add(consumed).saturating_add(bytes_read as u64) >= len {
+            break;
+        }
+
+        consumed = consumed.saturating_add(bytes_read as u64);
+        largest_record_bytes = largest_record_bytes.max(bytes_read);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            samples.push(value);
         }
     }
-
-    let text = String::from_utf8_lossy(&buffer);
-    let samples = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect::<Vec<_>>();
     let next_offset = start.saturating_add(consumed).min(len);
 
     Ok(json!({
@@ -312,6 +378,9 @@ async fn capture_sample_delta(app: AppHandle, job_id: String, offset: u64) -> Re
         "meta": meta,
         "final_stats": final_stats,
         "stream_bytes": len,
+        "read_bytes": consumed,
+        "record_bytes": largest_record_bytes,
+        "records_read": samples.len(),
     }))
 }
 
@@ -425,33 +494,35 @@ async fn capture_progress(
     let partial_meta_path = root.join("stats.json.partial.meta.json");
     let (event, event_count) = latest_progress_event(&progress_path);
     let artifact = read_json_file(&artifact_path);
-    let stats = read_json_file(&stats_path);
+    let stats = read_stats_meta_file(&stats_path);
     let partial_stats = read_json_file(&partial_meta_path);
     let stats_summary = stats.as_ref().and_then(|value| {
-        let samples = value
-            .get("samples")
-            .and_then(Value::as_array)
-            .map(|items| items.len())
+        let summary = value.get("summary").cloned().unwrap_or(Value::Null);
+        let samples = summary
+            .get("sample_count")
+            .and_then(Value::as_u64)
+            .or_else(|| value.get("samples").and_then(Value::as_array).map(|items| items.len() as u64))
             .unwrap_or(0);
         Some(json!({
             "source": value.get("source"),
             "sample_rate_hz": value.get("sample_rate_hz"),
             "sample_count": samples,
-            "summary": value.get("summary").cloned().unwrap_or(Value::Null),
+            "summary": summary,
             "replay_metadata": value.get("replay_metadata").cloned().unwrap_or(Value::Null),
         }))
     });
     let partial_stats_summary = partial_stats.as_ref().and_then(|value| {
-        let samples = value
-            .get("samples")
-            .and_then(Value::as_array)
-            .map(|items| items.len())
+        let summary = value.get("summary").cloned().unwrap_or(Value::Null);
+        let samples = summary
+            .get("sample_count")
+            .and_then(Value::as_u64)
+            .or_else(|| value.get("samples").and_then(Value::as_array).map(|items| items.len() as u64))
             .unwrap_or(0);
         Some(json!({
             "source": value.get("source"),
             "sample_rate_hz": value.get("sample_rate_hz"),
             "sample_count": samples,
-            "summary": value.get("summary").cloned().unwrap_or(Value::Null),
+            "summary": summary,
             "replay_metadata": value.get("replay_metadata").cloned().unwrap_or(Value::Null),
         }))
     });

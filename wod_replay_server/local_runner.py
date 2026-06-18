@@ -9,6 +9,13 @@ from typing import Any
 from .config import AppSettings
 
 
+def _setting_int(settings: AppSettings, name: str, default: int) -> int:
+    try:
+        return int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _hidden_process_kwargs() -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -39,6 +46,41 @@ def _parse_json_result(stdout: str) -> dict[str, Any] | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+def _stats_summary(stats: dict[str, Any]) -> dict[str, Any]:
+    samples = stats.get("samples")
+    summary = stats.get("summary", {})
+    sample_count = summary.get("sample_count") if isinstance(summary, dict) else None
+    if not isinstance(sample_count, int):
+        sample_count = len(samples) if isinstance(samples, list) else 0
+    return {
+        "source": stats.get("source"),
+        "sample_rate_hz": stats.get("sample_rate_hz"),
+        "sample_count": sample_count,
+        "summary": summary if isinstance(summary, dict) else {},
+        "replay_metadata": stats.get("replay_metadata", {}),
+    }
+
+
+def _stats_summary_from_path(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        if path.stat().st_size > 16 * 1024 * 1024:
+            return {
+                "source": None,
+                "sample_rate_hz": None,
+                "sample_count": 0,
+                "summary": {"stats_omitted_for_memory": True, "bytes": path.stat().st_size},
+                "replay_metadata": {},
+            }
+        stats = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(stats, dict):
+        return None
+    return _stats_summary(stats)
 
 
 class LocalSessionRunner:
@@ -118,6 +160,16 @@ class LocalSessionRunner:
             *runner_args,
         ]
 
+    def _runner_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.setdefault(
+            "WOD_CAPTURE_IN_PROCESS_SAMPLE_LIMIT",
+            str(_setting_int(self.settings, "capture_in_process_sample_limit", 900)),
+        )
+        env.setdefault("WOD_UI_SAMPLE_WINDOW", str(_setting_int(self.settings, "ui_sample_window", 2400)))
+        env.setdefault("WOD_SAMPLE_DELTA_MAX_BYTES", str(_setting_int(self.settings, "sample_delta_max_bytes", 2 * 1024 * 1024)))
+        return env
+
     def smoke_check(self) -> dict[str, Any]:
         try:
             command = self._runner_command(["-Smoke"], timeout_ms=20_000)
@@ -150,6 +202,7 @@ class LocalSessionRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=self._runner_env(),
             **_hidden_process_kwargs(),
         )
         try:
@@ -204,8 +257,9 @@ class LocalSessionRunner:
         }
 
         stats_path = self.settings.jobs_dir / job_id / "stats.json"
-        if stats_path.exists():
-            capture["stats"] = json.loads(stats_path.read_text(encoding="utf-8"))
+        stats_summary = _stats_summary_from_path(stats_path)
+        if stats_summary:
+            capture["stats_summary"] = stats_summary
 
         return capture
 
@@ -244,8 +298,9 @@ class LocalSessionRunner:
         }
 
         stats_path = self.settings.jobs_dir / job_id / "stats.json"
-        if stats_path.exists():
-            capture["stats"] = json.loads(stats_path.read_text(encoding="utf-8"))
+        stats_summary = _stats_summary_from_path(stats_path)
+        if stats_summary:
+            capture["stats_summary"] = stats_summary
 
         return capture
 

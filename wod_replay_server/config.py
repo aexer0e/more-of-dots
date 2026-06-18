@@ -69,6 +69,9 @@ class AppSettings:
     max_replay_json_bytes: int
     capture_sample_hz: int
     capture_timeout_seconds: int
+    capture_in_process_sample_limit: int
+    ui_sample_window: int
+    sample_delta_max_bytes: int
 
     def ensure_runtime_dirs(self) -> None:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -111,4 +114,7 @@ def get_settings() -> AppSettings:
         max_replay_json_bytes=_int_env("WOD_MAX_REPLAY_JSON_BYTES", 100 * 1024 * 1024),
         capture_sample_hz=_int_env("WOD_CAPTURE_SAMPLE_HZ", 10),
         capture_timeout_seconds=_int_env("WOD_CAPTURE_TIMEOUT_SECONDS", 1800),
+        capture_in_process_sample_limit=_int_env("WOD_CAPTURE_IN_PROCESS_SAMPLE_LIMIT", 900),
+        ui_sample_window=_int_env("WOD_UI_SAMPLE_WINDOW", 2400),
+        sample_delta_max_bytes=_int_env("WOD_SAMPLE_DELTA_MAX_BYTES", 2 * 1024 * 1024),
     )

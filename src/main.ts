@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
 
 type RunnerState = {
@@ -164,6 +166,8 @@ type TeamMetric = {
   casualties_estimate?: number | null;
   troop_casualties?: number | null;
   funds?: number | null;
+  funds_displayed?: number | null;
+  funds_raw?: number | null;
 };
 
 type SampleMetrics = {
@@ -201,6 +205,7 @@ type Stats = {
 
 type Bounds = { minX: number; minY: number; maxX: number; maxY: number };
 type Phase = "booting" | "idle" | "loading" | "ready" | "error";
+type ReplayLaunchRequest = { fileName: string; filePath: string };
 type GraphKind = "troops" | "funds" | "units" | "morale" | "casualties";
 type GraphDefinition = {
   kind: GraphKind;
@@ -235,11 +240,69 @@ type GraphResizeState = {
   startHeight: number;
 };
 
+type ReplayBrowserPlayer = {
+  name: string;
+  teamIndex: number;
+  winner: boolean;
+};
+
+type ReplayBrowserItem = {
+  fileName: string;
+  filePath: string;
+  players: ReplayBrowserPlayer[];
+  length: string;
+  durationSeconds: number;
+  thumbnailDataUrl?: string | null;
+  modified: number;
+};
+
+type BrowserSuggestion = {
+  name: string;
+  normalizedName: string;
+  replayCount: number;
+  winCount: number;
+  lossCount: number;
+  opponents: string[];
+};
+
 const foundAppRoot = document.querySelector<HTMLDivElement>("#app");
 if (!foundAppRoot) {
   throw new Error("App root is missing.");
 }
 const appRoot: HTMLDivElement = foundAppRoot;
+
+function renderBootFatal(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "The replay window failed to start.");
+  appRoot.innerHTML = `
+    <main class="boot-fatal">
+      <section>
+        <h1>Replay window failed to start</h1>
+        <p>${escapeHtml(message)}</p>
+      </section>
+    </main>
+  `;
+}
+
+window.addEventListener("error", (event) => {
+  if (!appRoot.childElementCount) renderBootFatal(event.error ?? event.message);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  if (!appRoot.childElementCount) renderBootFatal(event.reason);
+});
+
+const currentWindowLabel = (() => {
+  try {
+    return getCurrentWindow().label;
+  } catch (error) {
+    renderBootFatal(error);
+    return "";
+  }
+})();
+const routeParams = new URLSearchParams(window.location.search);
+const isStaticReplayPlayer = currentWindowLabel === "replayPlayer";
+const labelLaunchId = currentWindowLabel.startsWith("replay-player-") ? currentWindowLabel.slice("replay-player-".length) : "";
+const appMode = routeParams.get("mode") === "player" || labelLaunchId || isStaticReplayPlayer ? "player" : "browser";
+const launchId = routeParams.get("launch") ?? labelLaunchId;
 
 const PLAYER_COLORS = ["#063bff", "#ff1616", "#1ebd5a", "#ffdd22", "#7d35ff", "#ff8a1f", "#19d8ff", "#ff5aa8"];
 const AUTHORITATIVE_SOURCES = new Set(["game-live-python", "memory", "local-session-memory-capture"]);
@@ -260,6 +323,17 @@ const UNIT_PROJECTION_POWER_SCALE = 0.78;
 const CITY_PROJECTION_GUARD_WEIGHT = 80;
 const GRAPH_COMPACT_SIZE = { width: 228, height: 122 };
 const GRAPH_MIN_SIZE = { width: 170, height: 96 };
+const DURATION_SLIDER_STEPS = 1000;
+const DURATION_SLIDER_MIDPOINT_SECONDS = 5 * 60;
+const SUGGESTION_LIMIT = 8;
+const FALLBACK_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">
+  <rect width="640" height="360" fill="#9fbd42"/>
+  <path d="M0 282c84-42 146-7 218-45 92-48 138-164 251-115 72 31 117 2 171-30v268H0z" fill="#2f7f35"/>
+  <path d="M38 50c58-38 107 28 163 8 83-29 129-77 213-38 58 27 121-10 226 16v66c-102-38-154 10-223-14-90-32-133 61-222 40-80-19-120-18-157 21z" fill="#2f9fe9"/>
+  <path d="M0 305c89-42 134 11 217-26 84-38 125-135 219-101 75 27 125 8 204-35v39c-82 37-133 60-207 33-86-31-132 63-216 100-83 37-129-17-217 24z" fill="#e9e3b4"/>
+  <path d="M46 254c75-63 147-72 229-48 105 30 194-9 303-83" fill="none" stroke="#1c241f" stroke-width="9" stroke-linecap="round" opacity=".42"/>
+</svg>`)}`;
 const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
   troops: { kind: "troops", title: "Troops", approximate: true },
   funds: { kind: "funds", title: "Funds" },
@@ -267,6 +341,13 @@ const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
   morale: { kind: "morale", title: "Morale" },
   casualties: { kind: "casualties", title: "Casualties", approximate: true },
 };
+const LOADING_STAGES = [
+  { value: 8, label: "Read" },
+  { value: 24, label: "Runtime" },
+  { value: 30, label: "Launch" },
+  { value: 60, label: "Sample" },
+  { value: 96, label: "Write" },
+];
 const DEFAULT_GRAPH_WINDOWS: GraphWindow[] = [
   { id: "graph-troops", kind: "troops", x: 18, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: true, z: 9 },
   { id: "graph-funds", kind: "funds", x: 258, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 10 },
@@ -318,6 +399,18 @@ let graphDrag: GraphDragState | null = null;
 let graphResize: GraphResizeState | null = null;
 let graphPaletteCloseTimer = 0;
 let graphZCounter = 20;
+let browserReplays: ReplayBrowserItem[] = [];
+let browserLoading = false;
+let browserError = "";
+let browserSearch = "";
+let browserHideUnmatched = true;
+let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
+let browserDurationBounds = { min: 0, max: 0 };
+let browserDurationRange = { min: 0, max: 0 };
+let browserSuggestionOpen = false;
+let browserSelectedSuggestion = -1;
+let browserOpeningPath = "";
+let currentLaunchSignature = "";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -346,6 +439,486 @@ function formatStat(value: unknown, approximate = false): string {
   if (!Number.isFinite(number)) return "-";
   const rounded = Math.round(number);
   return `${approximate ? "~" : ""}${rounded.toLocaleString()}`;
+}
+
+function normalizeSearchText(value: unknown): string {
+  return String(value ?? "").trim().toLocaleLowerCase();
+}
+
+function formatDurationSeconds(seconds: unknown): string {
+  const safeSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainder = safeSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function browserDurationCurvePower(): number {
+  const span = Math.max(0, browserDurationBounds.max - browserDurationBounds.min);
+  const midpointOffset = DURATION_SLIDER_MIDPOINT_SECONDS - browserDurationBounds.min;
+  if (span === 0 || midpointOffset <= 0 || midpointOffset >= span) return 1;
+  return Math.log(midpointOffset / span) / Math.log(0.5);
+}
+
+function durationPositionToSeconds(position: unknown): number {
+  const span = Math.max(0, browserDurationBounds.max - browserDurationBounds.min);
+  if (span === 0) return browserDurationBounds.min;
+  const progress = clamp(Number(position) / DURATION_SLIDER_STEPS, 0, 1);
+  return Math.round(browserDurationBounds.min + span * progress ** browserDurationCurvePower());
+}
+
+function secondsToDurationPosition(seconds: unknown): number {
+  const span = Math.max(0, browserDurationBounds.max - browserDurationBounds.min);
+  if (span === 0) return 0;
+  const offset = clamp(Number(seconds) - browserDurationBounds.min, 0, span);
+  const progress = (offset / span) ** (1 / browserDurationCurvePower());
+  return Math.round(progress * DURATION_SLIDER_STEPS);
+}
+
+function replayMatchType(replay: ReplayBrowserItem): string {
+  const playerCount = replay.players.length;
+  if (playerCount === 2) return "1v1";
+  if (playerCount === 3) return "3P FFA";
+  if (playerCount === 4) return "4P FFA";
+  return `${playerCount}P`;
+}
+
+function playerColorClass(player: ReplayBrowserPlayer, fallbackIndex: number): string {
+  const teamIndex = Number.isInteger(player.teamIndex) ? player.teamIndex : fallbackIndex;
+  return `player-${teamIndex + 1}`;
+}
+
+function replaySearchText(replay: ReplayBrowserItem): string {
+  return normalizeSearchText(replay.players.map((player) => player.name).join(" "));
+}
+
+function replayMatchesNonSearchFilters(replay: ReplayBrowserItem): boolean {
+  return (
+    browserSelectedTypes.has(replayMatchType(replay)) &&
+    Number(replay.durationSeconds) >= browserDurationRange.min &&
+    Number(replay.durationSeconds) <= browserDurationRange.max
+  );
+}
+
+function replayMatchesFilters(replay: ReplayBrowserItem): boolean {
+  const query = normalizeSearchText(browserSearch);
+  return replayMatchesNonSearchFilters(replay) && (!query || replaySearchText(replay).includes(query));
+}
+
+function highlightedHtml(text: string, query: string): string {
+  if (!query) return escapeHtml(text);
+  const normalized = normalizeSearchText(text);
+  let cursor = 0;
+  let matchStart = normalized.indexOf(query);
+  let output = "";
+  while (matchStart !== -1) {
+    if (matchStart > cursor) output += escapeHtml(text.slice(cursor, matchStart));
+    const matchEnd = matchStart + query.length;
+    output += `<mark>${escapeHtml(text.slice(matchStart, matchEnd))}</mark>`;
+    cursor = matchEnd;
+    matchStart = normalized.indexOf(query, cursor);
+  }
+  if (cursor < text.length) output += escapeHtml(text.slice(cursor));
+  return output;
+}
+
+function browserSuggestions(): BrowserSuggestion[] {
+  const query = normalizeSearchText(browserSearch);
+  const stats = new Map<string, BrowserSuggestion & { latestModified: number; rank: number; opponentCounts: Map<string, number> }>();
+
+  for (const replay of browserReplays) {
+    if (!replayMatchesNonSearchFilters(replay)) continue;
+    replay.players.forEach((player, index) => {
+      const key = normalizeSearchText(player.name);
+      const rank = !query ? 0 : key === query ? 0 : key.startsWith(query) ? 1 : key.includes(query) ? 2 : Number.POSITIVE_INFINITY;
+      if (!Number.isFinite(rank)) return;
+      const existing =
+        stats.get(key) ??
+        {
+          name: player.name,
+          normalizedName: key,
+          replayCount: 0,
+          winCount: 0,
+          lossCount: 0,
+          latestModified: 0,
+          rank,
+          opponents: [],
+          opponentCounts: new Map<string, number>(),
+        };
+      existing.rank = Math.min(existing.rank, rank);
+      existing.replayCount += 1;
+      existing.winCount += player.winner ? 1 : 0;
+      existing.lossCount += replay.players.some((candidate) => candidate.winner) && !player.winner ? 1 : 0;
+      existing.latestModified = Math.max(existing.latestModified, Number(replay.modified) || 0);
+      replay.players.forEach((opponent, opponentIndex) => {
+        if (opponentIndex === index) return;
+        existing.opponentCounts.set(opponent.name, (existing.opponentCounts.get(opponent.name) ?? 0) + 1);
+      });
+      stats.set(key, existing);
+    });
+  }
+
+  return [...stats.values()]
+    .map((item) => ({
+      ...item,
+      opponents: [...item.opponentCounts.entries()]
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], undefined, { sensitivity: "base" }))
+        .map(([name]) => name),
+    }))
+    .sort(
+      (left, right) =>
+        left.rank - right.rank ||
+        right.replayCount - left.replayCount ||
+        right.latestModified - left.latestModified ||
+        left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+    )
+    .slice(0, SUGGESTION_LIMIT);
+}
+
+function setupBrowserDuration(replays: ReplayBrowserItem[], preserveRange: boolean) {
+  if (!replays.length) {
+    browserDurationBounds = { min: 0, max: 0 };
+    browserDurationRange = { min: 0, max: 0 };
+    return;
+  }
+  const durations = replays.map((replay) => Number(replay.durationSeconds) || 0);
+  browserDurationBounds = { min: Math.min(...durations), max: Math.max(...durations) };
+  if (preserveRange) {
+    browserDurationRange = {
+      min: clamp(browserDurationRange.min, browserDurationBounds.min, browserDurationBounds.max),
+      max: clamp(browserDurationRange.max, browserDurationBounds.min, browserDurationBounds.max),
+    };
+    if (browserDurationRange.min > browserDurationRange.max) browserDurationRange.min = browserDurationRange.max;
+  } else {
+    browserDurationRange = { ...browserDurationBounds };
+  }
+}
+
+function renderBrowserSuggestions(): string {
+  const suggestions = browserSuggestions();
+  if (!browserSuggestionOpen || !suggestions.length) return "";
+  const query = normalizeSearchText(browserSearch);
+  return `
+    <div id="playerSuggestionPanel" class="player-suggestion-panel">
+      <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions">
+        ${suggestions
+          .map((item, index) => {
+            const opponents = item.opponents.slice(0, 3);
+            const remaining = item.opponents.length - opponents.length;
+            const detail = opponents.length ? `vs ${opponents.join(", ")}${remaining ? `, and ${remaining} more` : ""}` : "No opponents yet";
+            return `
+              <button
+                id="player-suggestion-${index}"
+                class="player-suggestion ${index === browserSelectedSuggestion ? "is-active" : ""}"
+                type="button"
+                data-suggestion-index="${index}"
+                role="option"
+                aria-selected="${index === browserSelectedSuggestion ? "true" : "false"}"
+              >
+                <span class="suggestion-primary">
+                  <span class="suggestion-name">${highlightedHtml(item.name, query)}</span>
+                  <span class="suggestion-meta">${item.replayCount} replay${item.replayCount === 1 ? "" : "s"} - ${item.winCount} win${item.winCount === 1 ? "" : "s"} - ${item.lossCount} loss${item.lossCount === 1 ? "" : "es"}</span>
+                </span>
+                <span class="suggestion-detail">${escapeHtml(detail)}</span>
+              </button>
+            `;
+          })
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number, dimmed: boolean): string {
+  const query = normalizeSearchText(browserSearch);
+  const winner = replay.players.find((player) => player.winner);
+  const names = replay.players
+    .map((player, index) => {
+      const separator = index > 0 ? `<span class="matchup-separator"> vs </span>` : "";
+      return `${separator}<span class="player-name ${playerColorClass(player, index)}">${highlightedHtml(player.name, query)}</span>`;
+    })
+    .join("");
+  const winnerLine = winner
+    ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, replay.players.indexOf(winner))}">${highlightedHtml(winner.name, query)}</span></div>`
+    : "";
+  const label = replay.players.map((player) => player.name).join(" versus ");
+  const isOpening = browserOpeningPath === replay.filePath;
+  return `
+    <article class="replay-card ${dimmed ? "is-dimmed" : ""}" aria-label="${escapeHtml(label)}">
+      <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
+      <div class="replay-shade"></div>
+      <div class="replay-labels">
+        <div class="replay-label match-type">${escapeHtml(replayMatchType(replay))}</div>
+        <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
+      </div>
+      <button class="replay-play-button" type="button" data-replay-index="${replayIndex}" ${isOpening ? "disabled" : ""} aria-label="Play ${escapeHtml(label)}">
+        <span class="play-glyph"></span>
+      </button>
+      <div class="replay-meta">
+        <div class="players">
+          <div class="matchup player-count-${replay.players.length}">${names}</div>
+          ${winnerLine}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function renderBrowserGrid(): string {
+  if (browserLoading && !browserReplays.length) {
+    return `<section id="replayGrid" class="replay-grid is-loading"><div class="state-message">Loading replays...</div></section>`;
+  }
+  if (browserError) {
+    return `<section id="replayGrid" class="replay-grid is-error"><div class="state-message">${escapeHtml(browserError)}</div></section>`;
+  }
+  if (!browserReplays.length) {
+    return `<section id="replayGrid" class="replay-grid is-empty"><div class="state-message">No replays found.</div></section>`;
+  }
+
+  const rows = browserReplays
+    .map((replay, index) => ({ replay, index, matches: replayMatchesFilters(replay) }))
+    .filter((item) => item.matches || !browserHideUnmatched);
+  return `
+    <section id="replayGrid" class="replay-grid" aria-live="polite">
+      ${rows.map((item) => renderReplayCard(item.replay, item.index, !item.matches)).join("")}
+    </section>
+    <div id="searchEmpty" class="state-message search-empty" ${rows.length || !browserHideUnmatched ? "hidden" : ""}>No matching replays.</div>
+  `;
+}
+
+function renderReplayBrowser() {
+  const minPosition = secondsToDurationPosition(browserDurationRange.min);
+  const maxPosition = secondsToDurationPosition(browserDurationRange.max);
+  const fillLeft = (minPosition / DURATION_SLIDER_STEPS) * 100;
+  const fillRight = ((DURATION_SLIDER_STEPS - maxPosition) / DURATION_SLIDER_STEPS) * 100;
+  const suggestionsOpen = browserSuggestionOpen && browserSuggestions().length > 0;
+  appRoot.innerHTML = `
+    <main class="replay-browser" aria-label="War of Dots replays">
+      <div class="search-row">
+        <div class="search-controls">
+          <div
+            id="playerSearchBox"
+            class="search-combobox"
+            role="combobox"
+            aria-expanded="${suggestionsOpen ? "true" : "false"}"
+            aria-haspopup="listbox"
+            aria-owns="playerSuggestionList"
+          >
+            <input
+              id="playerSearch"
+              class="player-search"
+              type="search"
+              placeholder="Search players"
+              aria-label="Search player usernames"
+              aria-autocomplete="list"
+              aria-controls="playerSuggestionList"
+              autocomplete="off"
+              spellcheck="false"
+              value="${escapeHtml(browserSearch)}"
+              ${browserLoading || browserError || !browserReplays.length ? "disabled" : ""}
+            >
+            <button id="clearPlayerSearch" class="search-clear" type="button" aria-label="Clear search" ${browserSearch ? "" : "hidden"}>x</button>
+            ${renderBrowserSuggestions()}
+          </div>
+          <label class="match-mode-toggle" title="Dim non-matching replays">
+            <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
+            <span class="match-mode-icon" aria-hidden="true">👻</span>
+          </label>
+        </div>
+        <div class="filter-controls">
+          <div class="type-filters" role="group" aria-label="Match type filters">
+            ${["1v1", "3P FFA", "4P FFA"]
+              .map(
+                (type) => `
+                  <label><input class="type-filter" type="checkbox" value="${escapeHtml(type)}" ${browserSelectedTypes.has(type) ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>${escapeHtml(type.replace(" FFA", ""))}</label>
+                `,
+              )
+              .join("")}
+          </div>
+          <div class="duration-filter" aria-label="Duration filter">
+            <span id="durationMinLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.min)}</span>
+            <div id="durationSlider" class="duration-slider">
+              <div class="duration-track"></div>
+              <div id="durationRangeFill" class="duration-range-fill" style="left:${fillLeft}%;right:${fillRight}%"></div>
+              <input id="durationMin" type="range" min="0" max="${DURATION_SLIDER_STEPS}" value="${minPosition}" step="1" aria-label="Minimum duration" ${browserReplays.length ? "" : "disabled"}>
+              <input id="durationMax" type="range" min="0" max="${DURATION_SLIDER_STEPS}" value="${maxPosition}" step="1" aria-label="Maximum duration" ${browserReplays.length ? "" : "disabled"}>
+            </div>
+            <span id="durationMaxLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.max)}</span>
+          </div>
+        </div>
+      </div>
+      ${renderBrowserGrid()}
+      <button id="refreshReplays" class="refresh-button ${browserLoading ? "is-loading" : ""}" type="button" aria-label="Refresh replays" title="Refresh replays" ${browserLoading ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24">
+          <path d="M20 12a8 8 0 0 1-13.7 5.7" />
+          <path d="M4 12A8 8 0 0 1 17.7 6.3" />
+          <path d="M17.7 2.7v3.6h-3.6" />
+          <path d="M6.3 21.3v-3.6h3.6" />
+        </svg>
+      </button>
+    </main>
+  `;
+  bindBrowserEvents();
+}
+
+function bindBrowserEvents() {
+  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("input", (event) => {
+    browserSearch = (event.target as HTMLInputElement).value;
+    browserSuggestionOpen = true;
+    browserSelectedSuggestion = -1;
+    renderReplayBrowser();
+    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
+  });
+  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("focus", () => {
+    browserSuggestionOpen = true;
+    renderReplayBrowser();
+    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
+  });
+  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("keydown", (event) => {
+    const suggestions = browserSuggestions();
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      browserSuggestionOpen = true;
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      browserSelectedSuggestion = suggestions.length
+        ? (browserSelectedSuggestion + delta + suggestions.length) % suggestions.length
+        : -1;
+      renderReplayBrowser();
+      document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
+    } else if (event.key === "Enter" && browserSelectedSuggestion >= 0) {
+      event.preventDefault();
+      const suggestion = suggestions[browserSelectedSuggestion];
+      if (suggestion) {
+        browserSearch = suggestion.name;
+        browserSuggestionOpen = false;
+        browserSelectedSuggestion = -1;
+        renderReplayBrowser();
+      }
+    } else if (event.key === "Escape") {
+      browserSuggestionOpen = false;
+      renderReplayBrowser();
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("click", () => {
+    browserSearch = "";
+    browserSuggestionOpen = true;
+    renderReplayBrowser();
+    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-suggestion-index]").forEach((button) => {
+    button.addEventListener("pointerdown", (event) => event.preventDefault());
+    button.addEventListener("click", () => {
+      const suggestion = browserSuggestions()[Number(button.dataset.suggestionIndex)];
+      if (!suggestion) return;
+      browserSearch = suggestion.name;
+      browserSuggestionOpen = false;
+      browserSelectedSuggestion = -1;
+      renderReplayBrowser();
+    });
+  });
+  document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("change", (event) => {
+    browserHideUnmatched = !(event.target as HTMLInputElement).checked;
+    renderReplayBrowser();
+  });
+  document.querySelectorAll<HTMLInputElement>(".type-filter").forEach((input) => {
+    input.addEventListener("change", () => {
+      if (input.checked) browserSelectedTypes.add(input.value);
+      else browserSelectedTypes.delete(input.value);
+      browserSuggestionOpen = document.activeElement?.id === "playerSearch";
+      renderReplayBrowser();
+    });
+  });
+  const durationMin = document.querySelector<HTMLInputElement>("#durationMin");
+  const durationMax = document.querySelector<HTMLInputElement>("#durationMax");
+  const updateDurationSliderUi = (minPosition: number, maxPosition: number) => {
+    const min = durationPositionToSeconds(minPosition);
+    const max = durationPositionToSeconds(maxPosition);
+    browserDurationRange = { min, max };
+    const fill = document.querySelector<HTMLElement>("#durationRangeFill");
+    if (fill) {
+      fill.style.left = `${(minPosition / DURATION_SLIDER_STEPS) * 100}%`;
+      fill.style.right = `${((DURATION_SLIDER_STEPS - maxPosition) / DURATION_SLIDER_STEPS) * 100}%`;
+    }
+    const minLabel = document.querySelector<HTMLElement>("#durationMinLabel");
+    if (minLabel) minLabel.textContent = formatDurationSeconds(min);
+    const maxLabel = document.querySelector<HTMLElement>("#durationMaxLabel");
+    if (maxLabel) maxLabel.textContent = formatDurationSeconds(max);
+  };
+  const handleDurationInput = (activeThumb: HTMLInputElement | null) => {
+    let minPosition = clamp(Number(durationMin?.value ?? 0), 0, DURATION_SLIDER_STEPS);
+    let maxPosition = clamp(Number(durationMax?.value ?? DURATION_SLIDER_STEPS), 0, DURATION_SLIDER_STEPS);
+    if (minPosition > maxPosition) {
+      if (activeThumb === durationMin) {
+        maxPosition = minPosition;
+        if (durationMax) durationMax.value = String(maxPosition);
+      } else {
+        minPosition = maxPosition;
+        if (durationMin) durationMin.value = String(minPosition);
+      }
+    }
+    updateDurationSliderUi(minPosition, maxPosition);
+  };
+  const commitDurationInput = () => {
+    browserSuggestionOpen = document.activeElement?.id === "playerSearch";
+    renderReplayBrowser();
+  };
+  durationMin?.addEventListener("input", () => handleDurationInput(durationMin));
+  durationMax?.addEventListener("input", () => handleDurationInput(durationMax));
+  durationMin?.addEventListener("change", commitDurationInput);
+  durationMax?.addEventListener("change", commitDurationInput);
+  document.querySelector<HTMLButtonElement>("#refreshReplays")?.addEventListener("click", () => {
+    void loadBrowserReplays(true);
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-replay-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const replay = browserReplays[Number(button.dataset.replayIndex)];
+      if (replay) void openReplayFromBrowser(replay);
+    });
+  });
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (event.target instanceof Node && document.querySelector("#playerSearchBox")?.contains(event.target)) return;
+      if (browserSuggestionOpen) {
+        browserSuggestionOpen = false;
+        renderReplayBrowser();
+      }
+    },
+    { once: true },
+  );
+}
+
+async function openReplayFromBrowser(replay: ReplayBrowserItem) {
+  if (browserOpeningPath) return;
+  browserOpeningPath = replay.filePath;
+  renderReplayBrowser();
+  try {
+    await invoke<string>("open_replay_window", { fileName: replay.fileName, filePath: replay.filePath });
+  } catch (error) {
+    browserError = error instanceof Error ? error.message : String(error);
+  } finally {
+    browserOpeningPath = "";
+    renderReplayBrowser();
+  }
+}
+
+async function loadBrowserReplays(preserveControls = false) {
+  browserLoading = true;
+  browserError = "";
+  renderReplayBrowser();
+  try {
+    const replays = await invoke<ReplayBrowserItem[]>("list_replays");
+    browserReplays = replays;
+    setupBrowserDuration(replays, preserveControls);
+  } catch (error) {
+    browserError = error instanceof Error ? error.message : String(error || "Could not load replays.");
+  } finally {
+    browserLoading = false;
+    renderReplayBrowser();
+  }
 }
 
 function resetMapImage() {
@@ -510,6 +1083,8 @@ function interpolateTeamMetrics(current: TeamMetric[] = [], next: TeamMetric[] =
       casualties_estimate: lerpOptional(team.casualties_estimate, target?.casualties_estimate, amount),
       troop_casualties: lerpOptional(team.troop_casualties, target?.troop_casualties, amount),
       funds: lerpOptional(team.funds, target?.funds, amount),
+      funds_displayed: lerpOptional(team.funds_displayed, target?.funds_displayed, amount),
+      funds_raw: lerpOptional(team.funds_raw, target?.funds_raw, amount),
     };
   });
 }
@@ -811,6 +1386,40 @@ function metricForTeam(sample: Sample, index: number): TeamMetric {
   return sample.metrics?.teams?.find((metric) => Number(metric.index) === index) ?? { index };
 }
 
+function metricSource(sample: Sample, key: string): string {
+  return String(sample.metrics?.sources?.[key] ?? "").toLowerCase();
+}
+
+function fundsMetricValue(sample: Sample, metric: TeamMetric): number | null {
+  const displayed = numeric(metric.funds_displayed);
+  if (displayed !== null) return displayed;
+
+  const raw = numeric(metric.funds);
+  if (raw === null) return null;
+
+  const source = metricSource(sample, "funds");
+  if (source.includes("zrtyz") && Math.abs(raw) >= 1000) return raw / 1000;
+  return raw;
+}
+
+function casualtiesMetricValue(sample: Sample, metric: TeamMetric): number | null {
+  const displayed = numeric(metric.displayed_casualties ?? metric.casualties_displayed);
+  if (displayed !== null) {
+    const source = metricSource(sample, "displayed_casualties");
+    if (source.includes("troop_casualties") && Math.abs(displayed) < 10000) return displayed * 100;
+    return displayed;
+  }
+
+  const estimate = numeric(metric.casualties_estimate);
+  if (estimate !== null) return estimate;
+
+  const troopCasualties = numeric(metric.troop_casualties);
+  if (troopCasualties !== null) return troopCasualties * 100;
+
+  const rawCasualties = numeric(metric.casualties);
+  return rawCasualties !== null ? rawCasualties * 100 : null;
+}
+
 function teamAliveUnitCount(sample: Sample, teamIndex: number): number {
   return (sample.troops ?? []).filter((troop) => troop.alive && ownerIndex(troop.owner) === teamIndex).length;
 }
@@ -846,12 +1455,12 @@ function graphMetricValue(kind: GraphKind, sample: Sample, teamIndex: number): n
     kind === "troops"
       ? metric.troops_estimate ?? metric.strength ?? metric.alive_units
       : kind === "funds"
-        ? metric.funds
+        ? fundsMetricValue(sample, metric)
         : kind === "units"
           ? metric.alive_units ?? teamAliveUnitCount(sample, teamIndex)
           : kind === "morale"
             ? teamMoraleTotal(sample, teamIndex)
-            : metric.displayed_casualties ?? metric.casualties_displayed ?? metric.casualties_estimate ?? metric.casualties ?? metric.troop_casualties;
+            : casualtiesMetricValue(sample, metric);
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -2015,24 +2624,46 @@ function progressPercent(): string {
   return `${Math.max(0, Math.min(100, progress.value)).toFixed(0)}%`;
 }
 
+function loadingStageIndex(): number {
+  let index = 0;
+  LOADING_STAGES.forEach((stage, stageIndex) => {
+    if (progress.value >= stage.value) index = stageIndex;
+  });
+  return index;
+}
+
+function renderLoadingFacts(): string {
+  const facts = progress.facts.slice(0, 8);
+  return Array.from({ length: 8 }, (_, index) => {
+    const fact = facts[index] ?? "";
+    return `<span class="${fact ? "" : "empty"}">${fact ? escapeHtml(fact) : "&nbsp;"}</span>`;
+  }).join("");
+}
+
 function renderOverlay(): string {
   if (phase === "loading") {
+    const activeStage = loadingStageIndex();
     return `
       <div class="loading-screen">
         <div class="loading-card">
-          <h2>${escapeHtml(progress.label)}</h2>
-          <p>${escapeHtml(progress.detail)}</p>
+          <div class="loading-header">
+            <div class="loading-copy">
+              <span class="loading-kicker">Live game capture</span>
+              <h2>${escapeHtml(progress.label)}</h2>
+              <p>${escapeHtml(progress.detail)}</p>
+            </div>
+            <div class="loading-percent" aria-label="Progress ${progressPercent()}">${progressPercent()}</div>
+          </div>
+          <div class="loading-stages" aria-hidden="true">
+            ${LOADING_STAGES.map((stage, index) => {
+              const state = index < activeStage ? "complete" : index === activeStage ? "active" : "pending";
+              return `<span class="loading-step ${state}" data-loading-stage="${index}"><i></i><b>${escapeHtml(stage.label)}</b></span>`;
+            }).join("")}
+          </div>
           <div class="progress-track" aria-label="Replay loading progress">
             <div class="progress-fill" style="width:${progressPercent()}"></div>
           </div>
-          <div class="progress-meta">
-            <strong>${progressPercent()}</strong>
-          </div>
-          ${
-            progress.facts.length
-              ? `<div class="progress-facts">${progress.facts.map((fact) => `<span>${escapeHtml(fact)}</span>`).join("")}</div>`
-              : ""
-          }
+          <div class="progress-facts">${renderLoadingFacts()}</div>
         </div>
       </div>
     `;
@@ -2403,22 +3034,22 @@ function updatePlaybackUi() {
 function updateProgressUi() {
   const fill = document.querySelector<HTMLElement>(".progress-fill");
   if (fill) fill.style.width = progressPercent();
-  const percent = document.querySelector<HTMLElement>(".progress-meta strong");
+  const percent = document.querySelector<HTMLElement>(".loading-percent");
   if (percent) percent.textContent = progressPercent();
   const title = document.querySelector<HTMLElement>(".loading-card h2");
   if (title) title.textContent = progress.label;
   const detail = document.querySelector<HTMLElement>(".loading-card p");
   if (detail) detail.textContent = progress.detail;
-  let facts = document.querySelector<HTMLElement>(".progress-facts");
-  if (!facts && progress.facts.length) {
-    const card = document.querySelector<HTMLElement>(".loading-card");
-    facts = document.createElement("div");
-    facts.className = "progress-facts";
-    card?.appendChild(facts);
-  }
+  const activeStage = loadingStageIndex();
+  document.querySelectorAll<HTMLElement>(".loading-step").forEach((step) => {
+    const index = Number(step.dataset.loadingStage);
+    step.classList.toggle("complete", index < activeStage);
+    step.classList.toggle("active", index === activeStage);
+    step.classList.toggle("pending", index > activeStage);
+  });
+  const facts = document.querySelector<HTMLElement>(".progress-facts");
   if (facts) {
-    if (progress.facts.length) facts.innerHTML = progress.facts.map((fact) => `<span>${escapeHtml(fact)}</span>`).join("");
-    else facts.remove();
+    facts.innerHTML = renderLoadingFacts();
   }
 }
 
@@ -2881,6 +3512,86 @@ async function loadReplayFile(file: File) {
   }
 }
 
+async function loadReplayPath(filePath: string, fileName: string) {
+  pausePlayback();
+  phase = "loading";
+  selectedFileName = fileName;
+  activeJob = null;
+  activeStats = null;
+  boundsCache = null;
+  resetProjectionMemory();
+  sampleStreamOffset = 0;
+  liveCaptureActive = false;
+  liveEdgePaused = false;
+  resetMapImage();
+  frameIndex = 0;
+  playbackTick = 0;
+  notice = null;
+  setProgress(8, "Replay selected", `${fileName} is ready for hidden game capture.`);
+  render();
+  await nextPaint();
+
+  try {
+    await ensureGameRuntime();
+
+    setProgress(28, "Launching hidden game", "Starting War of Dots on the automation desktop.");
+    await nextPaint();
+
+    stopProgressDrift();
+    setProgress(30, "Capturing gamestate", "Injecting the live sampler and waiting for authoritative game-state samples.");
+    const captureStartedAt = Date.now();
+    liveCaptureActive = true;
+    startCaptureProgressPolling(fileName, captureStartedAt);
+    const job = await invoke<Job>("capture_replay_path", { filename: fileName, path: filePath });
+    liveCaptureActive = false;
+    stopCaptureProgressPolling();
+    if (job.status !== "captured") throw new Error(job.error ?? "Game-backed capture failed.");
+
+    const streamedStats = activeStats as Stats | null;
+    if (streamedStats?.samples.length) {
+      await applySampleDelta(job);
+    }
+    const refreshedStats = activeStats as Stats | null;
+    const stats = refreshedStats?.samples.length ? refreshedStats : getStats(job) ?? (await readStats(job.job_id));
+    if (!stats?.samples.length) throw new Error("Game-backed capture completed without playable samples.");
+    if (!isAuthoritativeCapture(job, stats)) {
+      throw new Error(`Refusing non-authoritative capture source: ${captureSource(job, stats) || "unknown"}.`);
+    }
+
+    setActiveStats(stats, job, { firstPartial: !activeStats });
+    frameIndex = Math.min(frameIndex, Math.max(0, stats.samples.length - 1));
+    syncPlaybackTickToFrame();
+    jobs = [job, ...jobs.filter((candidate) => candidate.job_id !== job.job_id)];
+    setProgress(100, "Capture ready", "Opening authoritative playback.");
+    stopProgressDrift();
+    await nextPaint();
+    phase = "ready";
+    notice = captureReachedReplayEnd(stats)
+      ? { tone: "success", text: "Game-backed capture loaded. Playback started." }
+      : {
+          tone: "info",
+          text: `Game-backed capture is partial through tick ${formatStat(lastCapturedTick(stats))}; seeking is capped to captured samples.`,
+        };
+    render();
+    startPlayback();
+    void refreshBackend({ quiet: true });
+  } catch (error) {
+    liveCaptureActive = false;
+    stopCaptureProgressPolling();
+    stopProgressDrift();
+    const message = error instanceof Error ? error.message : String(error);
+    const capturedStats = activeStats as Stats | null;
+    if (capturedStats?.samples.length && isAuthoritativeCapture(activeJob, capturedStats)) {
+      phase = "ready";
+      notice = { tone: "error", text: `${message} Keeping the real samples captured so far.` };
+    } else {
+      phase = "error";
+      notice = { tone: "error", text: message };
+    }
+    render();
+  }
+}
+
 function startPlayback() {
   if (!activeStats?.samples.length) return;
   if (frameIndex >= activeStats.samples.length - 1) {
@@ -2958,11 +3669,72 @@ function installFileDrop() {
   });
 }
 
-window.addEventListener("resize", () => {
-  graphWindows.filter((windowState) => windowState.visible).forEach(clampGraphWindow);
-  renderCanvas();
-});
-installFileDrop();
-render();
-void loadUnitAssets();
-void refreshBackend();
+function launchRequestSignature(request: ReplayLaunchRequest): string {
+  return `${request.filePath}\n${request.fileName}`;
+}
+
+async function loadReplayLaunchRequest(request: ReplayLaunchRequest, options: { force?: boolean } = {}) {
+  const signature = launchRequestSignature(request);
+  if (!options.force && currentLaunchSignature === signature && (phase === "loading" || phase === "ready")) return;
+  currentLaunchSignature = signature;
+  await loadReplayPath(request.filePath, request.fileName);
+}
+
+async function loadLaunchRequest() {
+  if (!launchId) return;
+  try {
+    const request = await invoke<ReplayLaunchRequest>("replay_launch_request", { launchId });
+    await loadReplayLaunchRequest(request, { force: true });
+  } catch (error) {
+    phase = "error";
+    notice = { tone: "error", text: error instanceof Error ? error.message : String(error) };
+    render();
+  }
+}
+
+async function loadCurrentLaunchRequest() {
+  if (!isStaticReplayPlayer || phase === "loading") return;
+  try {
+    const request = await invoke<ReplayLaunchRequest>("current_replay_launch_request");
+    await loadReplayLaunchRequest(request);
+  } catch {
+    if (phase === "booting") {
+      phase = "idle";
+      render();
+    }
+  }
+}
+
+if (appMode === "browser") {
+  renderReplayBrowser();
+  void loadBrowserReplays();
+  window.addEventListener("keydown", (event) => {
+    const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";
+    if (!wantsSearch) return;
+    event.preventDefault();
+    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
+    document.querySelector<HTMLInputElement>("#playerSearch")?.select();
+  });
+} else {
+  window.addEventListener("resize", () => {
+    graphWindows.filter((windowState) => windowState.visible).forEach(clampGraphWindow);
+    renderCanvas();
+  });
+  if (isStaticReplayPlayer) {
+    void listen<ReplayLaunchRequest>("replay-launch", (event) => {
+      void loadReplayLaunchRequest(event.payload, { force: true });
+    }).catch((error) => {
+      phase = "error";
+      notice = { tone: "error", text: `Replay launch listener failed: ${error instanceof Error ? error.message : String(error)}` };
+      render();
+    });
+    window.addEventListener("focus", () => {
+      void loadCurrentLaunchRequest();
+    });
+  }
+  installFileDrop();
+  render();
+  void loadUnitAssets();
+  void refreshBackend();
+  if (launchId) void loadLaunchRequest();
+}

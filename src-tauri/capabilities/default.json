@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Main window permissions",
-  "windows": ["main"],
+  "windows": ["main", "replayPlayer"],
   "permissions": [
     "core:default",
     {

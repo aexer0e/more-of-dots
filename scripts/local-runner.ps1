@@ -3021,6 +3021,22 @@ def read_displayed_casualties(games, team_count):
     }
     return best['values'][:team_count], '%s score=%s' % (best['source'], best['score'])
 
+def normalize_display_fund(value, source):
+    if not isinstance(value, (int, float)):
+        return value
+    source_text = str(source or '').lower()
+    if 'zrtyz' in source_text and abs(float(value)) >= 1000:
+        return int(round(float(value) / 1000.0))
+    return value
+
+def normalize_display_casualties(value, source):
+    if not isinstance(value, (int, float)):
+        return value
+    source_text = str(source or '').lower()
+    if 'troop_casualties' in source_text and abs(float(value)) < 10000:
+        return int(round(float(value) * 100.0))
+    return value
+
 def build_metrics(games, troops, teams):
     metric_timing = {}
     step_start = timing_start()
@@ -3067,6 +3083,9 @@ def build_metrics(games, troops, teams):
         raw_casualties = casualties[index] if index < len(casualties) else None
         raw_troop_casualties = troop_casualties[index] if index < len(troop_casualties) else None
         raw_displayed_casualties = displayed_casualties[index] if index < len(displayed_casualties) else None
+        display_casualties = normalize_display_casualties(raw_displayed_casualties, displayed_casualties_source)
+        raw_funds = funds[index] if index < len(funds) else None
+        display_funds = normalize_display_fund(raw_funds, funds_source)
         estimated_casualties = int(raw_casualties * 100) if isinstance(raw_casualties, (int, float)) else (
             int(raw_troop_casualties * 100) if isinstance(raw_troop_casualties, (int, float)) else 0
         )
@@ -3078,11 +3097,13 @@ def build_metrics(games, troops, teams):
             'strength': raw_strength,
             'troops_estimate': int(raw_strength * 100) if isinstance(raw_strength, (int, float)) else rollup['alive_units'],
             'casualties': raw_casualties,
-            'casualties_displayed': raw_displayed_casualties,
-            'displayed_casualties': raw_displayed_casualties,
-            'casualties_estimate': int(raw_displayed_casualties) if isinstance(raw_displayed_casualties, (int, float)) else estimated_casualties,
+            'casualties_displayed': display_casualties,
+            'displayed_casualties': display_casualties,
+            'casualties_estimate': int(display_casualties) if isinstance(display_casualties, (int, float)) else estimated_casualties,
             'troop_casualties': raw_troop_casualties,
-            'funds': funds[index] if index < len(funds) else None,
+            'funds': display_funds,
+            'funds_displayed': display_funds,
+            'funds_raw': raw_funds,
         })
     return {
         'teams': teams_out,

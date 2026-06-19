@@ -12,12 +12,24 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "War of Dots Replay",
         "width": 980,
         "height": 720,
         "minWidth": 720,
         "minHeight": 520,
         "resizable": true
+      },
+      {
+        "label": "replayPlayer",
+        "title": "War of Dots Replay",
+        "width": 980,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

@@ -1,8 +1,8 @@
 # War of Dots Replay
 
-Local Windows replay simulator for War of Dots. The installed Tauri app validates `.rep` files, launches the staged game on a private Windows desktop, injects the local Python probe, captures live gamestate from the game's replay scene, and returns stats plus a synthesized replay artifact. Normal capture fails closed if it cannot produce game-backed samples.
+Local Windows replay desktop app for War of Dots. The installed Tauri app validates `.rep` files, launches the staged game on a private Windows desktop, injects the local Python probe, captures live gamestate from the game's replay scene, and returns stats plus a synthesized replay artifact. Normal capture fails closed if it cannot produce game-backed samples.
 
-The desktop target is a single Tauri app with a bundled backend command executable. The UI talks to Tauri commands, not a localhost web API, so normal app use does not start a persistent server or bind a port. The packaged sidecar is command-mode only; install the optional API/dev dependencies before using `scripts\run-server.ps1`.
+The desktop target is a single Tauri app with a bundled backend command executable. The UI talks to Tauri commands, not a localhost web API, so normal app use does not start a persistent server or bind a port. The packaged sidecar is command-mode only.
 
 ## Quick Start
 
@@ -50,7 +50,6 @@ Supported values:
 - `auto`: prefer live hidden-game Python capture, then verified memory capture, otherwise fail.
 - `game-live-python`: launch the staged game on the private automation desktop, inject the local CPython probe, enter the real replay scene, and sample the live game core.
 - `memory`: require a matching enabled address profile and use the local game runner.
-- `replay-file-dev`: explicit development-only replay-file-derived simulation. Normal app flow does not use this fallback.
 
 The game runner runs inside the current logged-in Windows session. This is intentional: the game client needs a real desktop/GPU context even when the app is trying to keep it out of sight.
 
@@ -67,7 +66,7 @@ Window strategy is still applied after a window handle is found. Supported value
 
 For the current War of Dots build, `game-live-python` is the practical hidden-game path. It does not open a visible game window and it does not need a VM, but it still requires a logged-in Windows session because the game client expects a desktop/GPU context.
 
-Normal live capture runs until the replay end tick is reached. `WOD_LIVE_CAPTURE_SECONDS` is only honored for diagnostic windowed captures when `WOD_LIVE_CAPTURE_MODE` is set to `window`, `sample`, `samples`, or `fixed`; otherwise the app refuses partial playback. Hidden game capture defaults to a 120x internal pump via `WOD_LIVE_SIM_SPEED`, bypassing the visible replay UI's 10x keyboard cap. Replay packets are scheduled through `ReplayConnection.download_data(...)`, then each frame uses the real game-core `update()` path via `WOD_LIVE_FAST_FORWARD_STEP_METHOD=game-update`. Capture quality is controlled separately with `WOD_LIVE_REPLAY_SAMPLE_HZ`, which defaults to `2` samples per replay second. At War of Dots' 30 tick/sec clock this captures about every 15 ticks while still running with `WOD_LIVE_CAPTURE_THROTTLE_SECONDS=0`; speed comes from removing wall-clock waits, not from skipping 8-10 seconds of gameplay between samples.
+Normal live capture runs until the replay end tick is reached. `WOD_LIVE_CAPTURE_SECONDS` is only honored for diagnostic windowed captures when `WOD_LIVE_CAPTURE_MODE` is set to `window`, `sample`, `samples`, or `fixed`; otherwise the app refuses partial playback. Hidden game capture targets `WOD_LIVE_TARGET_GAME_SECONDS_PER_SECOND=8`, bypassing the visible replay UI's 10x keyboard cap. Full capture defaults to direct game-core component stepping with `WOD_LIVE_FAST_FORWARD_STEP_METHOD=components` and `WOD_LIVE_FAST_FORWARD_CONTROLLER=false`; this still applies replay payloads to the live game object, but avoids the slower per-frame scene/controller path. `WOD_LIVE_REPLAY_SAMPLE_HZ=4` keeps polling at four samples per capture second, while `WOD_LIVE_MAX_FAST_FORWARD_FRAMES_PER_SAMPLE=60` keeps each poll to about two in-game seconds at the default target pace. Per-unit projection-field scraping and scene projection-line scraping are off by default because the app already has replay path payloads and generated power projection, and those introspection passes are expensive. Capture artifacts include timing buckets under `timing_summary` so slow stages can be targeted directly.
 
 ## Capture R&D Commands
 
@@ -90,9 +89,10 @@ The Tauri frontend invokes backend commands directly:
 - `stage_game`
 - `capture_replay`
 - `list_jobs`
-- `read_artifact`
-
-The old FastAPI server entrypoint remains available for development diagnostics, but the app no longer depends on it for normal use.
+- `get_job`
+- `capture_sample_delta`
+- `capture_progress`
+- `unit_assets`
 
 ## Memory Calibration
 
@@ -116,6 +116,5 @@ Copy `.env.example` to `.env` for local overrides. Important values:
 - `WOD_GAME_WINDOW_TITLE`
 - `WOD_GAME_DESKTOP_STRATEGY`
 - `WOD_GAME_WINDOW_STRATEGY`
-- `WOD_RUNNER_SMOKE_REQUIRED`
 
 Do not commit `runtime/`, `.env`, `secrets/`, staged game files, replay uploads, or build outputs.

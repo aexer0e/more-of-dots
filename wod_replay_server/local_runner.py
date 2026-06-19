@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,41 @@ def _parse_json_result(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+class OwnerProcessGone(RuntimeError):
+    pass
+
+
+def _process_exists(process_id: int | None) -> bool:
+    if not process_id or process_id <= 0:
+        return True
+    if os.name != "nt":
+        try:
+            os.kill(process_id, 0)
+        except OSError:
+            return False
+        return True
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(process_query_limited_information, False, process_id)
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _stats_summary(stats: dict[str, Any]) -> dict[str, Any]:
     samples = stats.get("samples")
     summary = stats.get("summary", {})
@@ -84,8 +121,9 @@ def _stats_summary_from_path(path: Path) -> dict[str, Any] | None:
 
 
 class LocalSessionRunner:
-    def __init__(self, settings: AppSettings):
+    def __init__(self, settings: AppSettings, owner_pid: int | None = None):
         self.settings = settings
+        self.owner_pid = owner_pid if owner_pid and owner_pid > 0 else None
 
     @property
     def game_exe(self) -> Path:
@@ -142,7 +180,7 @@ class LocalSessionRunner:
         if not script.exists():
             raise FileNotFoundError(f"Local runner script does not exist: {script}")
 
-        return [
+        command = [
             "powershell.exe",
             "-NoProfile",
             "-ExecutionPolicy",
@@ -157,8 +195,11 @@ class LocalSessionRunner:
             self.settings.game_desktop_strategy,
             "-WindowStrategy",
             self.settings.game_window_strategy,
-            *runner_args,
         ]
+        if self.owner_pid:
+            command.extend(["-OwnerProcessId", str(self.owner_pid)])
+        command.extend(runner_args)
+        return command
 
     def _runner_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -169,23 +210,6 @@ class LocalSessionRunner:
         env.setdefault("WOD_UI_SAMPLE_WINDOW", str(_setting_int(self.settings, "ui_sample_window", 2400)))
         env.setdefault("WOD_SAMPLE_DELTA_MAX_BYTES", str(_setting_int(self.settings, "sample_delta_max_bytes", 2 * 1024 * 1024)))
         return env
-
-    def smoke_check(self) -> dict[str, Any]:
-        try:
-            command = self._runner_command(["-Smoke"], timeout_ms=20_000)
-        except OSError as exc:
-            return {"status": "failed", "message": str(exc)}
-
-        result = _run(command, timeout=30)
-        parsed = _parse_json_result(result.stdout)
-        status = "succeeded" if result.returncode == 0 else "failed"
-        return {
-            "status": status,
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            **(parsed or {}),
-        }
 
     def _run_owned_runner_command(
         self,
@@ -206,8 +230,22 @@ class LocalSessionRunner:
             **_hidden_process_kwargs(),
         )
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            stdout, stderr = self._communicate_until_done_or_orphaned(process, timeout_seconds)
             return subprocess.CompletedProcess(command, process.returncode, stdout, stderr), cleanup_events
+        except OwnerProcessGone:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            owner_cleanup = self.cleanup_game_processes(job_id)
+            cleanup_events.append({"phase": "owner_process_gone", **owner_cleanup})
+            message = f"Desktop owner process {self.owner_pid} is gone; staged game cleanup was requested."
+            stderr = "\n".join(part for part in [stderr.strip(), message] if part)
+            return subprocess.CompletedProcess(command, 130, stdout, stderr), cleanup_events
         except subprocess.TimeoutExpired:
             try:
                 process.kill()
@@ -224,6 +262,25 @@ class LocalSessionRunner:
             return subprocess.CompletedProcess(command, 124, stdout, stderr), cleanup_events
         finally:
             cleanup_events.append({"phase": "after_finish", **self.cleanup_game_processes(job_id)})
+
+    def _communicate_until_done_or_orphaned(
+        self,
+        process: subprocess.Popen[str],
+        timeout_seconds: int,
+    ) -> tuple[str, str]:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self.owner_pid and not _process_exists(self.owner_pid):
+                raise OwnerProcessGone()
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+
+            try:
+                return process.communicate(timeout=min(0.5, remaining))
+            except subprocess.TimeoutExpired:
+                continue
 
     def capture_replay(self, job_id: str, *, timeout_seconds: int) -> dict[str, Any]:
         try:
@@ -262,9 +319,6 @@ class LocalSessionRunner:
             capture["stats_summary"] = stats_summary
 
         return capture
-
-    def capture_replay_with_game_python(self, job_id: str, *, timeout_seconds: int) -> dict[str, Any]:
-        return self.capture_live_replay(job_id, timeout_seconds=timeout_seconds)
 
     def capture_live_replay(self, job_id: str, *, timeout_seconds: int) -> dict[str, Any]:
         try:
@@ -352,22 +406,4 @@ class LocalSessionRunner:
             "stderr": result.stderr.strip(),
             "runner_result": parsed,
             "process_cleanup": cleanup_events,
-        }
-
-    def calibrate_memory(self, *, timeout_seconds: int = 120) -> dict[str, Any]:
-        try:
-            command = self._runner_command(["-Calibrate"], timeout_ms=timeout_seconds * 1000)
-        except (OSError, ValueError) as exc:
-            return {"status": "failed", "phase": "local_runner", "message": str(exc)}
-
-        result = _run(command, timeout=timeout_seconds + 30)
-        parsed = _parse_json_result(result.stdout) or {}
-        status = "succeeded" if result.returncode == 0 else "failed"
-        return {
-            "status": status,
-            "phase": "calibration",
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "runner_result": parsed,
         }

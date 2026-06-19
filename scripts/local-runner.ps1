@@ -1,8 +1,5 @@
 [CmdletBinding(DefaultParameterSetName = 'Default')]
 param(
-    [switch]$Smoke,
-    [switch]$LaunchSmoke,
-    [switch]$OpenReplaySmoke,
     [switch]$CaptureReplay,
     [switch]$GamePythonCapture,
     [switch]$CaptureLiveReplay,
@@ -20,7 +17,8 @@ param(
     [ValidateSet('automation-desktop', 'current-desktop')]
     [string]$DesktopStrategy = 'automation-desktop',
     [ValidateSet('offscreen', 'minimize', 'hide', 'none')]
-    [string]$WindowStrategy = 'offscreen'
+    [string]$WindowStrategy = 'offscreen',
+    [int]$OwnerProcessId = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -221,6 +219,115 @@ function Test-StagedGameProcessId([int]$ProcessId) {
     return (Get-NormalizedPath ([string]$process.ExecutablePath)) -eq $expected
 }
 
+function Test-OwnerProcessAlive {
+    if ($OwnerProcessId -le 0) {
+        return $true
+    }
+    return $null -ne (Get-Process -Id $OwnerProcessId -ErrorAction SilentlyContinue)
+}
+
+function Assert-OwnerProcessAlive {
+    if (-not (Test-OwnerProcessAlive)) {
+        throw "Desktop owner process $OwnerProcessId is not running."
+    }
+}
+
+function Test-ProcessIdAlive([int]$ProcessId) {
+    if ($ProcessId -le 0) {
+        return $false
+    }
+    return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Stop-StaleLocalRunnerProcesses([string]$CurrentJobId = '') {
+    if ($OwnerProcessId -le 0) {
+        return @()
+    }
+
+    $stopped = @()
+    try {
+        $processes = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop)
+    } catch {
+        return @()
+    }
+
+    foreach ($processInfo in $processes) {
+        $processId = [int]$processInfo.ProcessId
+        if ($processId -eq $PID) {
+            continue
+        }
+
+        $commandLine = [string]$processInfo.CommandLine
+        if (-not $commandLine) {
+            continue
+        }
+        if ($commandLine -notmatch '(?i)-File\s+.*local-runner\.ps1') {
+            continue
+        }
+        if ($commandLine -notlike "*$ShareRoot*") {
+            continue
+        }
+        if ($CurrentJobId -and $commandLine -like "*$CurrentJobId*") {
+            continue
+        }
+
+        $shouldStop = $false
+        $ownerMatch = [regex]::Match($commandLine, '(?i)(?:^|\s)-OwnerProcessId\s+"?(\d+)"?')
+        if ($ownerMatch.Success) {
+            $runnerOwnerPid = [int]$ownerMatch.Groups[1].Value
+            $shouldStop = -not (Test-ProcessIdAlive -ProcessId $runnerOwnerPid)
+        } else {
+            # Old packaged runners did not have owner tracking and can hold the global
+            # capture mutex forever after the app exits. A new owner-tracked capture may
+            # safely retire them before starting its own game process.
+            $shouldStop = $true
+        }
+
+        if ($shouldStop) {
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+            $stopped += $processId
+        }
+    }
+
+    return @($stopped)
+}
+
+function Wait-CaptureMutex([System.Threading.Mutex]$Mutex, [string]$CurrentJobId = '') {
+    $timeoutSeconds = 120
+    if ($env:WOD_CAPTURE_MUTEX_TIMEOUT_SECONDS) {
+        try {
+            $timeoutSeconds = [Math]::Max(10, [int]$env:WOD_CAPTURE_MUTEX_TIMEOUT_SECONDS)
+        } catch {
+            $timeoutSeconds = 120
+        }
+    }
+
+    [void](Stop-StaleLocalRunnerProcesses -CurrentJobId $CurrentJobId)
+    $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+    $nextCleanup = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        Assert-OwnerProcessAlive
+        try {
+            if ($Mutex.WaitOne([TimeSpan]::FromSeconds(1))) {
+                return
+            }
+        } catch {
+            $inner = $_.Exception.InnerException
+            if (($_.Exception -is [System.Threading.AbandonedMutexException]) -or ($inner -is [System.Threading.AbandonedMutexException])) {
+                return
+            }
+            throw
+        }
+
+        if ([DateTime]::UtcNow -ge $nextCleanup) {
+            [void](Stop-StaleLocalRunnerProcesses -CurrentJobId $CurrentJobId)
+            $nextCleanup = [DateTime]::UtcNow.AddSeconds(5)
+        }
+    }
+
+    throw "Timed out waiting for capture lock after $timeoutSeconds seconds. Stale runner cleanup was attempted."
+}
+
 function Write-CaptureProcessManifest([string]$Id, $Process, [string]$DesktopName = '') {
     if (-not $Id -or -not $Process) {
         return
@@ -240,6 +347,7 @@ function Write-CaptureProcessManifest([string]$Id, $Process, [string]$DesktopNam
         expected_executable_path = Get-GameExe
         command_line = if ($processInfo) { [string]$processInfo.CommandLine } else { $null }
         runner_pid = $PID
+        owner_pid = $OwnerProcessId
         desktop_strategy = $DesktopStrategy
         desktop_name = $DesktopName
         started_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -321,6 +429,102 @@ function Stop-NewGameProcesses($ExistingProcessIds) {
             [void](Stop-StagedGameProcessId -ProcessId $processId)
         }
     }
+}
+
+function Get-OwnerWatchdogPath([string]$Id, [int]$GameProcessId) {
+    $root = if ($Id) { Get-JobRoot -Id $Id } else { Join-Path $ShareRoot 'probes' }
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    return Join-Path $root "owner-watchdog-$GameProcessId.ps1"
+}
+
+function Start-OwnerProcessWatchdog([string]$Id, $Process) {
+    if ($OwnerProcessId -le 0 -or -not $Process) {
+        return
+    }
+    $gameProcessId = [int]$Process.Id
+    $watchdogPath = Get-OwnerWatchdogPath -Id $Id -GameProcessId $gameProcessId
+    $watchdogScript = @'
+param(
+    [int]$OwnerProcessId,
+    [int]$GameProcessId,
+    [int]$RunnerProcessId,
+    [string]$ExpectedGameExe
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+function Normalize-Path([string]$Path) {
+    if (-not $Path) {
+        return ''
+    }
+    try {
+        return [System.IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    } catch {
+        return $Path.TrimEnd('\').ToLowerInvariant()
+    }
+}
+
+function Test-ExpectedGameProcess {
+    $expected = Normalize-Path $ExpectedGameExe
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $GameProcessId" -ErrorAction SilentlyContinue
+    if (-not $process -or -not $process.ExecutablePath) {
+        return $false
+    }
+    return (Normalize-Path ([string]$process.ExecutablePath)) -eq $expected
+}
+
+$misses = 0
+while ($true) {
+    $game = Get-Process -Id $GameProcessId -ErrorAction SilentlyContinue
+    if (-not $game) {
+        break
+    }
+
+    $owner = Get-Process -Id $OwnerProcessId -ErrorAction SilentlyContinue
+    $runner = Get-Process -Id $RunnerProcessId -ErrorAction SilentlyContinue
+    if ($owner -and $runner) {
+        $misses = 0
+    } else {
+        $misses += 1
+    }
+
+    if ($misses -ge 3) {
+        if (Test-ExpectedGameProcess) {
+            Stop-Process -Id $GameProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if ($RunnerProcessId -gt 0 -and $RunnerProcessId -ne $PID) {
+            Stop-Process -Id $RunnerProcessId -Force -ErrorAction SilentlyContinue
+        }
+        break
+    }
+
+    Start-Sleep -Milliseconds 750
+}
+'@
+    Set-Content -LiteralPath $watchdogPath -Value $watchdogScript -Encoding UTF8
+
+    $powershellPath = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $arguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $watchdogPath,
+        '-OwnerProcessId',
+        [string]$OwnerProcessId,
+        '-GameProcessId',
+        [string]$gameProcessId,
+        '-RunnerProcessId',
+        [string]$PID,
+        '-ExpectedGameExe',
+        (Get-GameExe)
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powershellPath
+    $startInfo.Arguments = (@($arguments) | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' '
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    [void][System.Diagnostics.Process]::Start($startInfo)
 }
 
 function Get-JobRoot([string]$Id) {
@@ -508,6 +712,7 @@ function Assert-ReplayOpeningAllowed {
 }
 
 function Start-GameProcess([string]$OwnerJobId = '') {
+    Assert-OwnerProcessAlive
     $gameExe = Get-GameExe
     if (-not (Test-Path -LiteralPath $gameExe)) {
         throw "Staged game.exe not found: $gameExe"
@@ -518,6 +723,7 @@ function Start-GameProcess([string]$OwnerJobId = '') {
     if ($DesktopStrategy -eq 'current-desktop') {
         $process = Start-Process -FilePath $gameExe -WorkingDirectory $gameDir -WindowStyle Minimized -PassThru
         Write-CaptureProcessManifest -Id $OwnerJobId -Process $process -DesktopName 'current-desktop'
+        Start-OwnerProcessWatchdog -Id $OwnerJobId -Process $process
         return $process
     }
 
@@ -555,6 +761,7 @@ function Start-GameProcess([string]$OwnerJobId = '') {
     $script:AutomationDesktopHandle = $desktop
     $process = [System.Diagnostics.Process]::GetProcessById([int]$processInfo.dwProcessId)
     Write-CaptureProcessManifest -Id $OwnerJobId -Process $process -DesktopName $desktopName
+    Start-OwnerProcessWatchdog -Id $OwnerJobId -Process $process
     return $process
 }
 
@@ -562,52 +769,6 @@ function Close-AutomationDesktop {
     if ($script:AutomationDesktopHandle -ne [IntPtr]::Zero) {
         [void][Win32.Native]::CloseDesktop($script:AutomationDesktopHandle)
         $script:AutomationDesktopHandle = [IntPtr]::Zero
-    }
-}
-
-function Test-GameLaunch {
-    $process = $null
-    try {
-        $process = Start-GameProcess -OwnerJobId $Id
-        $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
-        if ($hWnd -eq [IntPtr]::Zero) {
-            throw 'War of Dots window was not found.'
-        }
-        Apply-WindowStrategy -WindowHandle $hWnd
-        Write-JsonResult @{
-            ok = $true
-            status = 'launched'
-            pid = $process.Id
-            window_found = $true
-            window_strategy = $WindowStrategy
-        }
-        exit 0
-    } finally {
-        Stop-CaptureGameProcess -Process $process
-        Close-AutomationDesktop
-    }
-}
-
-function Test-OpenReplay([string]$Id) {
-    Assert-ReplayOpeningAllowed
-    $slotState = $null
-    $process = $null
-    try {
-        $slotState = Prepare-ReplaySlot -Id $Id
-        $process = Start-GameProcess -OwnerJobId $Id
-        Open-ReplayWithMouse -Process $process
-        Write-JsonResult @{
-            ok = $true
-            status = 'opened_replay'
-            pid = $process.Id
-            staged_replay = $slotState.staged_replay
-            config = $slotState.config
-        }
-        exit 0
-    } finally {
-        Stop-CaptureGameProcess -Process $process -OwnerJobId $Id
-        Close-AutomationDesktop
-        Restore-ReplaySlot $slotState
     }
 }
 
@@ -790,9 +951,7 @@ function Capture-Replay([string]$Id) {
     }
 
     $mutex = New-Object System.Threading.Mutex($false, 'Global\WodReplayCapture')
-    if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(60))) {
-        throw 'Timed out waiting for capture lock.'
-    }
+    Wait-CaptureMutex -Mutex $mutex -CurrentJobId $Id
 
     $process = $null
     $handle = [IntPtr]::Zero
@@ -1142,7 +1301,7 @@ function Invoke-PythonRuntimeProbe {
         if ($JobId) {
             $slotState = Prepare-ReplaySlot -Id $JobId
         }
-        $process = Start-GameProcess -OwnerJobId $Id
+        $process = Start-GameProcess -OwnerJobId $JobId
         $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
         if ($hWnd -eq [IntPtr]::Zero) {
             throw 'War of Dots window was not found.'
@@ -1183,7 +1342,7 @@ function Invoke-PythonRuntimeProbe {
             inject_result = $injectResult
         }
     } finally {
-        Stop-CaptureGameProcess -Process $process -OwnerJobId $Id
+        Stop-CaptureGameProcess -Process $process -OwnerJobId $JobId
         Close-AutomationDesktop
         Restore-ReplaySlot $slotState
     }
@@ -1366,10 +1525,10 @@ FULL_GC_DISCOVERY = os.environ.get('WOD_LIVE_CAPTURE_FULL_GC', '').strip().lower
 CAPTURE_UNTIL_END = MODE == 'capture-live-replay' and os.environ.get('WOD_LIVE_CAPTURE_MODE', 'full').strip().lower() not in ('window', 'sample', 'samples', 'fixed')
 REPLAY_TICKS_PER_SECOND = 30.0
 try:
-    default_replay_sample_hz = '5' if CAPTURE_UNTIL_END else str(max(1, int(SAMPLE_HZ)))
+    default_replay_sample_hz = '4' if CAPTURE_UNTIL_END else str(max(1, int(SAMPLE_HZ)))
     REPLAY_SAMPLE_HZ = max(0.25, min(30.0, float(os.environ.get('WOD_LIVE_REPLAY_SAMPLE_HZ', default_replay_sample_hz))))
 except Exception:
-    REPLAY_SAMPLE_HZ = 5.0 if CAPTURE_UNTIL_END else float(max(1, int(SAMPLE_HZ)))
+    REPLAY_SAMPLE_HZ = 4.0 if CAPTURE_UNTIL_END else float(max(1, int(SAMPLE_HZ)))
 REPLAY_SAMPLE_TICK_GAP = max(1, int(round(REPLAY_TICKS_PER_SECOND / max(0.25, REPLAY_SAMPLE_HZ))))
 try:
     default_sim_speed = '120' if CAPTURE_UNTIL_END else '20'
@@ -1377,27 +1536,38 @@ try:
 except Exception:
     TARGET_SIM_SPEED = 120.0 if CAPTURE_UNTIL_END else 20.0
 try:
+    default_target_game_seconds = '8' if CAPTURE_UNTIL_END else '2'
+    TARGET_GAME_SECONDS_PER_WALL_SECOND = max(0.25, min(60.0, float(os.environ.get('WOD_LIVE_TARGET_GAME_SECONDS_PER_SECOND', default_target_game_seconds))))
+except Exception:
+    TARGET_GAME_SECONDS_PER_WALL_SECOND = 8.0 if CAPTURE_UNTIL_END else 2.0
+TARGET_TICKS_PER_WALL_SECOND = TARGET_GAME_SECONDS_PER_WALL_SECOND * REPLAY_TICKS_PER_SECOND
+TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE = max(1, int(round(TARGET_TICKS_PER_WALL_SECOND / max(0.25, REPLAY_SAMPLE_HZ))))
+try:
     SIM_UPDATE_BURST = int(os.environ.get('WOD_LIVE_SIM_UPDATE_BURST', ''))
 except Exception:
     SIM_UPDATE_BURST = max(0, min(2000, int(((TARGET_SIM_SPEED - 1.0) * 30.0) / max(1, int(SAMPLE_HZ)))))
 FAST_FORWARD_CORE = os.environ.get('WOD_LIVE_FAST_FORWARD_CORE', '1').strip().lower() not in ('0', 'false', 'no', 'off')
-FAST_FORWARD_CONTROLLER = os.environ.get('WOD_LIVE_FAST_FORWARD_CONTROLLER', '1').strip().lower() not in ('0', 'false', 'no', 'off')
-FAST_FORWARD_STEP_METHOD = os.environ.get('WOD_LIVE_FAST_FORWARD_STEP_METHOD', 'game-update').strip().lower()
-MAX_SAMPLE_TICK_GAP = None
+default_fast_forward_step_method = 'components' if CAPTURE_UNTIL_END else 'game-update'
+FAST_FORWARD_STEP_METHOD = os.environ.get('WOD_LIVE_FAST_FORWARD_STEP_METHOD', default_fast_forward_step_method).strip().lower()
+default_fast_forward_controller = '0' if CAPTURE_UNTIL_END and FAST_FORWARD_STEP_METHOD in ('manual', 'component', 'components') else '1'
+FAST_FORWARD_CONTROLLER = os.environ.get('WOD_LIVE_FAST_FORWARD_CONTROLLER', default_fast_forward_controller).strip().lower() not in ('0', 'false', 'no', 'off')
 manual_fast_forward_frames = os.environ.get('WOD_LIVE_FAST_FORWARD_FRAMES', '').strip()
 try:
     if not manual_fast_forward_frames:
         raise ValueError('no manual frame count')
     derived_fast_forward_frames = int(manual_fast_forward_frames)
 except Exception:
-    derived_fast_forward_frames = int((TARGET_SIM_SPEED * 30.0) / max(1, int(SAMPLE_HZ)))
+    if CAPTURE_UNTIL_END:
+        derived_fast_forward_frames = TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE
+    else:
+        derived_fast_forward_frames = int((TARGET_SIM_SPEED * 30.0) / max(1, int(SAMPLE_HZ)))
+try:
+    default_max_fast_forward_frames = str(TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE) if CAPTURE_UNTIL_END else '5000'
+    MAX_FAST_FORWARD_FRAMES_PER_SAMPLE = max(1, min(5000, int(os.environ.get('WOD_LIVE_MAX_FAST_FORWARD_FRAMES_PER_SAMPLE', default_max_fast_forward_frames))))
+except Exception:
+    MAX_FAST_FORWARD_FRAMES_PER_SAMPLE = TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE if CAPTURE_UNTIL_END else 5000
 if CAPTURE_UNTIL_END:
-    try:
-        requested_max_sample_tick_gap = max(1, int(os.environ.get('WOD_LIVE_MAX_SAMPLE_TICK_GAP', str(REPLAY_SAMPLE_TICK_GAP))))
-    except Exception:
-        requested_max_sample_tick_gap = REPLAY_SAMPLE_TICK_GAP
-    MAX_SAMPLE_TICK_GAP = min(requested_max_sample_tick_gap, REPLAY_SAMPLE_TICK_GAP)
-    derived_fast_forward_frames = min(derived_fast_forward_frames, MAX_SAMPLE_TICK_GAP)
+    derived_fast_forward_frames = min(derived_fast_forward_frames, MAX_FAST_FORWARD_FRAMES_PER_SAMPLE)
 FAST_FORWARD_FRAMES_PER_SAMPLE = max(0, min(5000, derived_fast_forward_frames))
 try:
     CAPTURE_THROTTLE_SECONDS = max(0.0, min(5.0, float(os.environ.get('WOD_LIVE_CAPTURE_THROTTLE_SECONDS', ''))))
@@ -1405,6 +1575,16 @@ except Exception:
     CAPTURE_THROTTLE_SECONDS = 0.0 if CAPTURE_UNTIL_END else (1.0 / max(1, int(SAMPLE_HZ)))
 REPLAY_PAYLOAD_CACHE = None
 REPLAY_PAYLOAD_CURSOR = 0
+TROOP_SOURCE_CACHE = []
+FUND_SOURCE_CACHE = {}
+DISPLAYED_CASUALTY_SOURCE_CACHE = {}
+TIMING_TOTALS = {}
+try:
+    TROOP_CACHE_REFRESH_SAMPLES = max(1, int(os.environ.get('WOD_LIVE_TROOP_CACHE_REFRESH_SAMPLES', '12')))
+except Exception:
+    TROOP_CACHE_REFRESH_SAMPLES = 12
+READ_UNIT_PROJECTION_FIELDS = os.environ.get('WOD_LIVE_READ_UNIT_PROJECTION_FIELDS', '0' if CAPTURE_UNTIL_END else '1').strip().lower() in ('1', 'true', 'yes', 'on')
+READ_SCENE_PROJECTION_LINES = os.environ.get('WOD_LIVE_READ_SCENE_PROJECTION_LINES', '0' if CAPTURE_UNTIL_END else '1').strip().lower() in ('1', 'true', 'yes', 'on')
 
 KEYWORDS = (
     'battle', 'replay', 'dot', 'dots', 'city', 'cities', 'health', 'morale',
@@ -1430,6 +1610,32 @@ def safe_repr(value, limit=180):
     except Exception as exc:
         text = '<repr failed: %s>' % exc
     return text[:limit] + '...' if len(text) > limit else text
+
+def timing_start():
+    return time.perf_counter()
+
+def timing_end(timing, label, start):
+    elapsed_ms = max(0.0, (time.perf_counter() - start) * 1000.0)
+    timing[label] = round(elapsed_ms, 3)
+    total = TIMING_TOTALS.setdefault(label, {'ms': 0.0, 'count': 0, 'max_ms': 0.0})
+    total['ms'] += elapsed_ms
+    total['count'] += 1
+    if elapsed_ms > total.get('max_ms', 0.0):
+        total['max_ms'] = elapsed_ms
+    return elapsed_ms
+
+def timing_summary():
+    output = {}
+    for label, total in TIMING_TOTALS.items():
+        count = max(1, int(total.get('count', 0)))
+        total_ms = float(total.get('ms', 0.0))
+        output[label] = {
+            'count': count,
+            'total_ms': round(total_ms, 3),
+            'avg_ms': round(total_ms / count, 3),
+            'max_ms': round(float(total.get('max_ms', 0.0)), 3),
+        }
+    return output
 
 def safe_len(value):
     try:
@@ -2692,21 +2898,30 @@ def economy_profile(economy, team_count):
 
 def read_funds(economy, team_count):
     attrs = attrs_of(economy)
+    cache_key = (id(economy), int(team_count))
+    cached_key = FUND_SOURCE_CACHE.get(cache_key)
+    if cached_key in attrs:
+        values = number_list(attrs.get(cached_key), limit=team_count)
+        if len(values) >= team_count and any(value is not None for value in values):
+            return values[:team_count], cached_key
     preferred = ('funds', 'fund', 'money', 'cash', 'balance', 'balances', 'resources', 'resource', 'gold', 'coins')
     for key in preferred:
         if key in attrs:
             values = number_list(attrs.get(key), limit=team_count)
             if len(values) >= team_count and any(value is not None for value in values):
+                FUND_SOURCE_CACHE[cache_key] = key
                 return values[:team_count], key
     for key, value in list(attrs.items())[:120]:
         low = str(key).lower()
         if any(word in low for word in preferred):
             values = number_list(value, limit=team_count)
             if len(values) >= team_count and any(item is not None for item in values):
+                FUND_SOURCE_CACHE[cache_key] = str(key)
                 return values[:team_count], str(key)
     if 'zrtyz' in attrs:
         values = number_list(attrs.get('zrtyz'), limit=team_count)
         if len(values) >= team_count and any(item is not None for item in values):
+            FUND_SOURCE_CACHE[cache_key] = 'zrtyz'
             return values[:team_count], 'zrtyz'
     return [], None
 
@@ -2764,6 +2979,14 @@ def casualty_metric_containers(game, attrs):
 def read_displayed_casualties(games, team_count):
     game = games[0] if games else None
     attrs = attrs_of(game) if game is not None else {}
+    cache_key = (id(game), int(team_count))
+    cached = DISPLAYED_CASUALTY_SOURCE_CACHE.get(cache_key)
+    if cached:
+        container_attrs = metric_container_attrs(cached.get('container'))
+        values = valid_team_counter_values(container_attrs.get(cached.get('key')), team_count)
+        if values:
+            return values[:team_count], cached.get('source')
+        DISPLAYED_CASUALTY_SOURCE_CACHE.pop(cache_key, None)
     best = None
     nested_queue = []
     for prefix, container in casualty_metric_containers(game, attrs):
@@ -2774,7 +2997,7 @@ def read_displayed_casualties(games, team_count):
                 continue
             score = score_casualty_counter_key(key, values)
             if score > 0 and (best is None or score > best['score']):
-                best = {'values': values, 'source': '%s.%s' % (prefix, key), 'score': score}
+                best = {'values': values, 'source': '%s.%s' % (prefix, key), 'score': score, 'container': container, 'key': key}
             low = str(key).lower()
             if any(word in low for word in ('score', 'stat', 'casual', 'loss', 'dead', 'hud', 'ui', 'text', 'label', 'counter')):
                 nested_queue.append(('%s.%s' % (prefix, key), value))
@@ -2787,13 +3010,20 @@ def read_displayed_casualties(games, team_count):
                 continue
             score = score_casualty_counter_key(key, values, nested=True)
             if score > 0 and (best is None or score > best['score']):
-                best = {'values': values, 'source': '%s.%s' % (prefix, key), 'score': score}
+                best = {'values': values, 'source': '%s.%s' % (prefix, key), 'score': score, 'container': container, 'key': key}
 
     if best is None:
         return [], None
+    DISPLAYED_CASUALTY_SOURCE_CACHE[cache_key] = {
+        'container': best.get('container'),
+        'key': best.get('key'),
+        'source': best.get('source'),
+    }
     return best['values'][:team_count], '%s score=%s' % (best['source'], best['score'])
 
 def build_metrics(games, troops, teams):
+    metric_timing = {}
+    step_start = timing_start()
     game = games[0] if games else None
     attrs = attrs_of(game) if game is not None else {}
     team_count = max(len(teams), 2)
@@ -2801,17 +3031,38 @@ def build_metrics(games, troops, teams):
         owner = owner_to_index(troop.get('owner'))
         if owner is not None:
             team_count = max(team_count, owner + 1)
+    timing_end(metric_timing, 'metrics_prepare', step_start)
+    step_start = timing_start()
     strength = number_list(attrs.get('strength'), limit=team_count)
     casualties = number_list(attrs.get('casualties'), limit=team_count)
     troop_casualties = number_list(attrs.get('troop_casualties'), limit=team_count)
+    timing_end(metric_timing, 'metrics_direct_counters', step_start)
+    step_start = timing_start()
     funds, funds_source = read_funds(attrs.get('economy'), team_count)
+    timing_end(metric_timing, 'metrics_read_funds', step_start)
+    step_start = timing_start()
     displayed_casualties, displayed_casualties_source = read_displayed_casualties(games, team_count)
+    timing_end(metric_timing, 'metrics_read_displayed_casualties', step_start)
+    step_start = timing_start()
+    team_rollups = [
+        {'alive_units': 0, 'total_units': 0, 'health_total': 0.0}
+        for _ in range(team_count)
+    ]
+    for troop in troops:
+        owner = owner_to_index(troop.get('owner'))
+        if owner is None or owner < 0 or owner >= team_count:
+            continue
+        rollup = team_rollups[owner]
+        rollup['total_units'] += 1
+        if troop.get('alive', True):
+            rollup['alive_units'] += 1
+            health = to_float(troop.get('health'))
+            if health is not None:
+                rollup['health_total'] += health
+    timing_end(metric_timing, 'metrics_team_rollup', step_start)
     teams_out = []
     for index in range(team_count):
-        owned = [troop for troop in troops if owner_to_index(troop.get('owner')) == index]
-        alive = [troop for troop in owned if troop.get('alive', True)]
-        health_values = [to_float(troop.get('health')) for troop in alive]
-        health_total = sum(value for value in health_values if value is not None)
+        rollup = team_rollups[index]
         raw_strength = strength[index] if index < len(strength) else None
         raw_casualties = casualties[index] if index < len(casualties) else None
         raw_troop_casualties = troop_casualties[index] if index < len(troop_casualties) else None
@@ -2821,11 +3072,11 @@ def build_metrics(games, troops, teams):
         )
         teams_out.append({
             'index': index,
-            'alive_units': len(alive),
-            'total_units': len(owned),
-            'health_total': round(health_total, 2),
+            'alive_units': rollup['alive_units'],
+            'total_units': rollup['total_units'],
+            'health_total': round(rollup['health_total'], 2),
             'strength': raw_strength,
-            'troops_estimate': int(raw_strength * 100) if isinstance(raw_strength, (int, float)) else len(alive),
+            'troops_estimate': int(raw_strength * 100) if isinstance(raw_strength, (int, float)) else rollup['alive_units'],
             'casualties': raw_casualties,
             'casualties_displayed': raw_displayed_casualties,
             'displayed_casualties': raw_displayed_casualties,
@@ -2860,7 +3111,7 @@ def troop_from_obj(obj, slot, context_attrs=None):
     ship_state = read_ship_state(attrs)
     health = read_first_attr(attrs, ('health', 'hp'))
     morale, morale_state = read_unit_morale(obj, attrs, slot, context_attrs=context_attrs)
-    projection_lines = read_projection_lines(obj, point)
+    projection_lines = read_projection_lines(obj, point) if READ_UNIT_PROJECTION_FIELDS else []
     return {
         'slot': slot,
         'unit_id': hex(id(obj)),
@@ -3581,7 +3832,33 @@ def step_game_frame(game, method_counts, errors):
     if FAST_FORWARD_STEP_METHOD in ('game-update', 'update', 'core-update'):
         preferred_methods = ('update', 'tick_frame')
     elif FAST_FORWARD_STEP_METHOD in ('manual', 'component', 'components'):
-        preferred_methods = ('update_alive_dots', 'move_dots', 'update_strength', 'extract_dot_positions')
+        component_methods = (
+            'tick_frame',
+            'update_alive_dots',
+            'move_dots',
+            'pay_turn',
+            'dot_production_new',
+            'victory_check',
+            'update_strength',
+            'extract_dot_positions',
+        )
+        called = 0
+        for method_name in component_methods:
+            if not hasattr(game, method_name):
+                continue
+            method = getattr(game, method_name)
+            if not callable_no_args(method):
+                continue
+            try:
+                method()
+                method_counts[method_name] = method_counts.get(method_name, 0) + 1
+                called += 1
+            except Exception as exc:
+                errors.append({'method': method_name, 'error': repr(exc)})
+        if called > 0:
+            return True
+        errors.append({'method': 'component-step', 'error': 'no callable component methods'})
+        return False
     else:
         preferred_methods = ('tick_frame', 'update')
 
@@ -3601,9 +3878,18 @@ def step_game_frame(game, method_counts, errors):
     errors.append({'method': 'core-step', 'error': 'no callable core step method for %s' % FAST_FORWARD_STEP_METHOD})
     return False
 
-def fast_forward_game_core(game, replay, end_tick):
+def resolve_fast_forward_frame_budget(frame_budget=None):
+    if frame_budget is None:
+        frame_budget = FAST_FORWARD_FRAMES_PER_SAMPLE
+    try:
+        return max(0, min(MAX_FAST_FORWARD_FRAMES_PER_SAMPLE, int(frame_budget)))
+    except Exception:
+        return FAST_FORWARD_FRAMES_PER_SAMPLE
+
+def fast_forward_game_core(game, replay, end_tick, frame_budget=None):
     global REPLAY_PAYLOAD_CURSOR
-    if not FAST_FORWARD_CORE or FAST_FORWARD_FRAMES_PER_SAMPLE <= 0 or game is None:
+    frames_per_sample = resolve_fast_forward_frame_budget(frame_budget)
+    if not FAST_FORWARD_CORE or frames_per_sample <= 0 or game is None:
         return None
     payloads = get_replay_payload_cache(replay)
     method_counts = {}
@@ -3611,7 +3897,7 @@ def fast_forward_game_core(game, replay, end_tick):
     errors = []
     start_tick = read_tick([game])
     frame_count = 0
-    for _ in range(FAST_FORWARD_FRAMES_PER_SAMPLE):
+    for _ in range(frames_per_sample):
         current_tick = read_tick([game])
         while REPLAY_PAYLOAD_CURSOR < len(payloads):
             payload_tick, payload_data = payloads[REPLAY_PAYLOAD_CURSOR]
@@ -3629,7 +3915,7 @@ def fast_forward_game_core(game, replay, end_tick):
             break
     return {
         'method': 'core-fast-forward',
-        'requested_frames': FAST_FORWARD_FRAMES_PER_SAMPLE,
+        'requested_frames': frames_per_sample,
         'stepped_frames': frame_count,
         'start_tick': start_tick,
         'end_tick': read_tick([game]),
@@ -3640,8 +3926,9 @@ def fast_forward_game_core(game, replay, end_tick):
         'errors': errors[:6],
     }
 
-def fast_forward_scene_controller(scene, end_tick):
-    if not FAST_FORWARD_CONTROLLER or FAST_FORWARD_FRAMES_PER_SAMPLE <= 0 or scene is None:
+def fast_forward_scene_controller(scene, end_tick, frame_budget=None):
+    frames_per_sample = resolve_fast_forward_frame_budget(frame_budget)
+    if not FAST_FORWARD_CONTROLLER or frames_per_sample <= 0 or scene is None:
         return None
     attrs = attrs_of(scene)
     controller = attrs.get('controller')
@@ -3656,7 +3943,7 @@ def fast_forward_scene_controller(scene, end_tick):
     errors = []
     start_tick = read_tick([game])
     frame_count = 0
-    for _ in range(FAST_FORWARD_FRAMES_PER_SAMPLE):
+    for _ in range(frames_per_sample):
         try:
             download_data(game, interface)
             method_counts['ReplayConnection.download_data'] = method_counts.get('ReplayConnection.download_data', 0) + 1
@@ -3671,7 +3958,7 @@ def fast_forward_scene_controller(scene, end_tick):
             break
     return {
         'method': 'scene-controller-fast-forward',
-        'requested_frames': FAST_FORWARD_FRAMES_PER_SAMPLE,
+        'requested_frames': frames_per_sample,
         'stepped_frames': frame_count,
         'start_tick': start_tick,
         'end_tick': read_tick([game]),
@@ -3711,23 +3998,54 @@ def advance_candidates(candidates):
                 calls.append({'method': method_name, 'object_id': hex(id(obj)), 'status': 'failed', 'error': repr(exc)})
     return calls
 
-def collect_troops(candidates, limit=600):
+def normalize_troop_slot(slot, fallback_index=0):
+    if slot is None:
+        return fallback_index
+    if isinstance(slot, bool):
+        return int(slot)
+    if isinstance(slot, (int, float, str)):
+        number = to_int(slot)
+        text = str(slot).strip()
+        if number is not None and (isinstance(slot, (int, float)) or text.lstrip('-').isdigit()):
+            return number
+        return text
+    return safe_repr(slot, 80)
+
+def collect_troops_from_cache(limit=600):
+    global TROOP_SOURCE_CACHE
+    if not TROOP_SOURCE_CACHE:
+        return []
     seen = set()
     troops = []
-    source_objects = []
+    live_entries = []
+    for entry in list(TROOP_SOURCE_CACHE)[:limit]:
+        obj = entry.get('obj') if isinstance(entry, Mapping) else None
+        if obj is None or id(obj) in seen:
+            continue
+        parent = entry.get('parent') if isinstance(entry, Mapping) else None
+        context_attrs = attrs_of(parent) if parent is not None else None
+        troop = troop_from_obj(obj, normalize_troop_slot(entry.get('slot'), len(troops)), context_attrs=context_attrs)
+        if troop is None:
+            continue
+        seen.add(id(obj))
+        troops.append(troop)
+        live_entries.append(entry)
+        if len(troops) >= limit:
+            break
+    if live_entries:
+        TROOP_SOURCE_CACHE[:] = live_entries
+    return troops
 
-    def normalize_slot(slot):
-        if slot is None:
-            return len(troops)
-        if isinstance(slot, bool):
-            return int(slot)
-        if isinstance(slot, (int, float, str)):
-            number = to_int(slot)
-            text = str(slot).strip()
-            if number is not None and (isinstance(slot, (int, float)) or text.lstrip('-').isdigit()):
-                return number
-            return text
-        return safe_repr(slot, 80)
+def collect_troops(candidates, limit=600, refresh=False):
+    global TROOP_SOURCE_CACHE
+    if not refresh:
+        cached = collect_troops_from_cache(limit=limit)
+        if cached:
+            return cached
+
+    seen = set()
+    troops = []
+    source_entries = []
 
     def iter_children(value):
         if isinstance(value, Mapping):
@@ -3741,14 +4059,15 @@ def collect_troops(candidates, limit=600):
         for child_slot, child in enumerate(values):
             yield child_slot, child
 
-    def consider(obj, slot=None, context_attrs=None):
+    def consider(obj, slot=None, context_attrs=None, parent=None):
         if id(obj) in seen:
             return
-        troop = troop_from_obj(obj, normalize_slot(slot), context_attrs=context_attrs)
+        normalized_slot = normalize_troop_slot(slot, len(troops))
+        troop = troop_from_obj(obj, normalized_slot, context_attrs=context_attrs)
         if troop is not None:
             seen.add(id(obj))
             troops.append(troop)
-            source_objects.append(obj)
+            source_entries.append({'obj': obj, 'slot': normalized_slot, 'parent': parent})
 
     for obj in candidates:
         consider(obj)
@@ -3761,7 +4080,7 @@ def collect_troops(candidates, limit=600):
                 continue
             try:
                 for child_slot, child in iter_children(value):
-                    consider(child, child_slot, attrs)
+                    consider(child, child_slot, attrs, obj)
                     if len(troops) >= limit:
                         break
             except Exception:
@@ -3774,6 +4093,8 @@ def collect_troops(candidates, limit=600):
             consider(obj)
             if len(troops) >= limit:
                 break
+    if troops:
+        TROOP_SOURCE_CACHE[:] = source_entries
     return troops
 
 def read_tick(candidates):
@@ -3816,8 +4137,9 @@ def set_simulation_speed(game_scenes):
             })
     return changes
 
-def pump_live_scene_updates(game_scenes, replay, end_tick):
-    if SIM_UPDATE_BURST <= 0 and ((not FAST_FORWARD_CORE and not FAST_FORWARD_CONTROLLER) or FAST_FORWARD_FRAMES_PER_SAMPLE <= 0):
+def pump_live_scene_updates(game_scenes, replay, end_tick, frame_budget=None):
+    frames_per_sample = resolve_fast_forward_frame_budget(frame_budget)
+    if SIM_UPDATE_BURST <= 0 and ((not FAST_FORWARD_CORE and not FAST_FORWARD_CONTROLLER) or frames_per_sample <= 0):
         return []
     out = []
     for scene in game_scenes[:2]:
@@ -3825,12 +4147,12 @@ def pump_live_scene_updates(game_scenes, replay, end_tick):
         controller = attrs.get('controller')
         game = attrs.get('core') or attrs.get('game')
         interface = attrs.get('interface')
-        controller_fast_forward = fast_forward_scene_controller(scene, end_tick)
+        controller_fast_forward = fast_forward_scene_controller(scene, end_tick, frames_per_sample)
         if controller_fast_forward is not None:
             controller_fast_forward['scene_id'] = hex(id(scene))
             out.append(controller_fast_forward)
             continue
-        fast_forward = fast_forward_game_core(game, replay, end_tick)
+        fast_forward = fast_forward_game_core(game, replay, end_tick, frames_per_sample)
         if fast_forward is not None:
             fast_forward['scene_id'] = hex(id(scene))
             out.append(fast_forward)
@@ -3881,6 +4203,24 @@ def pump_live_scene_updates(game_scenes, replay, end_tick):
             item['error'] = error
         out.append(item)
     return out
+
+def adjust_fast_forward_frame_budget(current_budget, actual_game_seconds_per_wall_second):
+    budget = resolve_fast_forward_frame_budget(current_budget)
+    if not CAPTURE_UNTIL_END or actual_game_seconds_per_wall_second is None:
+        return budget
+    try:
+        actual = float(actual_game_seconds_per_wall_second)
+    except Exception:
+        return budget
+    if actual <= 0:
+        return min(MAX_FAST_FORWARD_FRAMES_PER_SAMPLE, max(budget + 1, budget * 2))
+    target = TARGET_GAME_SECONDS_PER_WALL_SECOND
+    if actual < target * 0.85:
+        scale = min(2.5, max(1.15, target / max(0.1, actual)))
+        return min(MAX_FAST_FORWARD_FRAMES_PER_SAMPLE, max(budget + 1, int(round(budget * scale))))
+    if actual > target * 1.35 and budget > TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE:
+        return max(TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE, int(round(budget * 0.85)))
+    return budget
 
 def completion_status(games, game_scenes, tick, end_tick):
     has_live_state = bool(games or game_scenes)
@@ -4178,10 +4518,14 @@ def build_live_stats_payload(
             'partial': bool(partial),
             'capture_until_end': CAPTURE_UNTIL_END,
             'simulation_speed': TARGET_SIM_SPEED,
+            'target_game_seconds_per_wall_second': TARGET_GAME_SECONDS_PER_WALL_SECOND,
+            'target_ticks_per_wall_second': TARGET_TICKS_PER_WALL_SECOND,
+            'target_ticks_per_poll': TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'fast_forward_core': FAST_FORWARD_CORE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
+            'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
             'map_source': map_payload.get('source') if map_payload else None,
             'validation': validation,
@@ -4233,10 +4577,14 @@ def build_partial_meta_payload(
             'partial': True,
             'capture_until_end': CAPTURE_UNTIL_END,
             'simulation_speed': TARGET_SIM_SPEED,
+            'target_game_seconds_per_wall_second': TARGET_GAME_SECONDS_PER_WALL_SECOND,
+            'target_ticks_per_wall_second': TARGET_TICKS_PER_WALL_SECOND,
+            'target_ticks_per_poll': TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'fast_forward_core': FAST_FORWARD_CORE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
+            'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
             'map_source': map_payload.get('source') if map_payload else None,
             'artifact': ARTIFACT_PATH,
@@ -4333,16 +4681,22 @@ try:
             'max_samples': MAX_SAMPLES,
             'capture_until_end': CAPTURE_UNTIL_END,
             'target_sim_speed': TARGET_SIM_SPEED,
+            'target_game_seconds_per_wall_second': TARGET_GAME_SECONDS_PER_WALL_SECOND,
+            'target_ticks_per_wall_second': TARGET_TICKS_PER_WALL_SECOND,
+            'target_ticks_per_poll': TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'sim_update_burst': SIM_UPDATE_BURST,
             'fast_forward_core': FAST_FORWARD_CORE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
-            'max_sample_tick_gap': MAX_SAMPLE_TICK_GAP,
+            'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
             'full_gc_discovery': FULL_GC_DISCOVERY,
             'sample_buffer_limit': SAMPLE_BUFFER_LIMIT,
             'embed_final_stats_samples': EMBED_FINAL_STATS_SAMPLES,
+            'troop_cache_refresh_samples': TROOP_CACHE_REFRESH_SAMPLES,
+            'read_unit_projection_fields': READ_UNIT_PROJECTION_FIELDS,
+            'read_scene_projection_lines': READ_SCENE_PROJECTION_LINES,
         },
         'trace_events': TRACE_EVENTS,
         'validation': {},
@@ -4376,19 +4730,38 @@ try:
             'end_tick': end_tick,
             'capture_until_end': CAPTURE_UNTIL_END,
             'target_sim_speed': TARGET_SIM_SPEED,
+            'target_game_seconds_per_wall_second': TARGET_GAME_SECONDS_PER_WALL_SECOND,
+            'target_ticks_per_wall_second': TARGET_TICKS_PER_WALL_SECOND,
+            'target_ticks_per_poll': TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
+            'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
+            'troop_cache_refresh_samples': TROOP_CACHE_REFRESH_SAMPLES,
+            'read_unit_projection_fields': READ_UNIT_PROJECTION_FIELDS,
+            'read_scene_projection_lines': READ_SCENE_PROJECTION_LINES,
         })
         previous_sample_tick = None
+        previous_rate_tick = None
+        previous_rate_ms = None
+        active_fast_forward_frames = FAST_FORWARD_FRAMES_PER_SAMPLE
+        last_pump_frame_budget = None
+        last_pump_timing_ms = None
         for index in range(sample_total):
+            sample_timing = {}
+            sample_wall_start = timing_start()
             calls = []
+            step_start = timing_start()
             games = get_game_objects()
             game_scenes = get_game_scene_objects()
+            timing_end(sample_timing, 'discover_objects', step_start)
+            step_start = timing_start()
             speed_changes = set_simulation_speed(game_scenes)
+            timing_end(sample_timing, 'set_speed', step_start)
             if index < 5:
                 artifact['speed_changes'].extend(speed_changes)
+            step_start = timing_start()
             if games and DRIVE_REPLAY_DATA:
                 for game in games[:3]:
                     tick_from_replay, game_calls = drive_game_with_replay(game, replay, index)
@@ -4397,19 +4770,29 @@ try:
                 tick_from_replay = None
             if not games or ADVANCE_CANDIDATES_WITH_GAME:
                 calls.extend(advance_candidates(candidates))
+            timing_end(sample_timing, 'advance_candidates', step_start)
             if index < 5:
                 artifact['advance_calls'].extend(calls[:30])
             preferred_tick_sources = list(games[:3]) + list(game_scenes[:3])
             troop_sources = preferred_tick_sources + candidates
+            step_start = timing_start()
             live_tick = read_tick(preferred_tick_sources)
             candidate_tick = None
             if live_tick is None:
                 candidate_tick = read_tick(candidates)
             tick = live_tick if live_tick is not None else candidate_tick
             sample_tick = tick if tick is not None else (tick_from_replay if tick_from_replay is not None else index)
-            troops = collect_troops(troop_sources)
+            timing_end(sample_timing, 'read_tick', step_start)
+            refresh_troop_cache = index == 0 or (index % TROOP_CACHE_REFRESH_SAMPLES == 0)
+            step_start = timing_start()
+            troops = collect_troops(troop_sources, refresh=refresh_troop_cache)
+            timing_end(sample_timing, 'collect_troops', step_start)
+            step_start = timing_start()
             projection_attach = attach_replay_projection_lines(troops, replay, previous_sample_tick, sample_tick)
-            sample_projection_lines = read_sample_projection_lines(games, game_scenes)
+            timing_end(sample_timing, 'attach_replay_paths', step_start)
+            step_start = timing_start()
+            sample_projection_lines = read_sample_projection_lines(games, game_scenes) if READ_SCENE_PROJECTION_LINES else []
+            timing_end(sample_timing, 'read_scene_projection_lines', step_start)
             if index < 12:
                 artifact.setdefault('projection_line_attach', []).append(projection_attach)
                 artifact.setdefault('sample_projection_line_counts', []).append({
@@ -4418,10 +4801,14 @@ try:
                     'count': len(sample_projection_lines),
                 })
             if map_payload is None and (games or game_scenes):
+                step_start = timing_start()
                 map_payload = capture_map_image(replay, games, game_scenes)
+                timing_end(sample_timing, 'capture_map_image', step_start)
                 artifact['map_capture'] = summarize_map_payload(map_payload)
+            step_start = timing_start()
             teams = build_teams(replay, games)
             cities = collect_cities(games, teams)
+            timing_end(sample_timing, 'collect_cities', step_start)
             if index < 12:
                 artifact.setdefault('city_counts', []).append({
                     'sample_index': index,
@@ -4431,9 +4818,22 @@ try:
                 })
             if index == 0 and games:
                 artifact['city_profile'] = city_profile(games[0])
+            step_start = timing_start()
             metrics = build_metrics(games, troops, teams)
+            timing_end(sample_timing, 'build_metrics', step_start)
             now_ms = int(time.time() * 1000)
+            actual_game_seconds_per_wall_second = None
+            tick_delta = None
+            wall_delta_ms = None
+            sample_tick_number = to_float(sample_tick)
+            if previous_rate_tick is not None and sample_tick_number is not None and previous_rate_ms is not None:
+                wall_delta_ms = max(1, now_ms - previous_rate_ms)
+                tick_delta = max(0.0, sample_tick_number - previous_rate_tick)
+                actual_game_seconds_per_wall_second = (tick_delta / REPLAY_TICKS_PER_SECOND) / (wall_delta_ms / 1000.0)
+            step_start = timing_start()
             completion = completion_status(games, game_scenes, live_tick, end_tick)
+            next_fast_forward_frames = adjust_fast_forward_frame_budget(active_fast_forward_frames, actual_game_seconds_per_wall_second)
+            timing_end(sample_timing, 'completion_and_budget', step_start)
             sample = {
                 'sample_index': index,
                 'timestamp_ms': now_ms - capture_start_ms,
@@ -4448,7 +4848,11 @@ try:
                 'cities': cities,
                 'projection_lines': sample_projection_lines,
                 'metrics': metrics,
-                'events': {},
+                'events': {
+                    'timing_ms': sample_timing,
+                    'previous_pump_ms': round(last_pump_timing_ms, 3) if last_pump_timing_ms is not None else None,
+                    'troop_cache_refresh': refresh_troop_cache,
+                },
             }
             if completion.get('done'):
                 sample['completion'] = completion
@@ -4490,13 +4894,28 @@ try:
                 'controlled_city_count': len([city for city in cities if city.get('owner') is not None]),
                 'projection_line_count': len(sample_projection_lines),
                 'target_sim_speed': TARGET_SIM_SPEED,
+                'target_game_seconds_per_wall_second': TARGET_GAME_SECONDS_PER_WALL_SECOND,
+                'target_ticks_per_wall_second': TARGET_TICKS_PER_WALL_SECOND,
+                'target_ticks_per_poll': TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE,
+                'actual_game_seconds_per_wall_second': round(actual_game_seconds_per_wall_second, 3) if actual_game_seconds_per_wall_second is not None else None,
+                'tick_delta': round(tick_delta, 3) if tick_delta is not None else None,
+                'wall_delta_ms': wall_delta_ms,
                 'replay_sample_hz': REPLAY_SAMPLE_HZ,
                 'replay_sample_tick_gap': REPLAY_SAMPLE_TICK_GAP,
-                'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
+                'fast_forward_frames_per_sample': last_pump_frame_budget if last_pump_frame_budget is not None else active_fast_forward_frames,
+                'next_fast_forward_frames_per_sample': next_fast_forward_frames,
+                'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
                 'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
+                'timing_ms': sample_timing,
+                'previous_pump_ms': round(last_pump_timing_ms, 3) if last_pump_timing_ms is not None else None,
+                'troop_cache_refresh': refresh_troop_cache,
                 'teams': metrics.get('teams', [])[:4] if isinstance(metrics, dict) else [],
                 'completion': completion if completion.get('done') else None,
             })
+            if sample_tick_number is not None:
+                previous_rate_tick = sample_tick_number
+                previous_rate_ms = now_ms
+            step_start = timing_start()
             maybe_write_partial_stats(
                 request,
                 replay,
@@ -4510,10 +4929,16 @@ try:
                 troop_slots_seen,
                 completion,
             )
+            timing_end(sample_timing, 'write_partial', step_start)
+            timing_end(sample_timing, 'sample_total_before_pump', sample_wall_start)
             if CAPTURE_UNTIL_END and completion.get('done') and len(samples) >= 2:
                 artifact['completion'] = completion
                 break
-            pump_calls = pump_live_scene_updates(game_scenes, replay, end_tick)
+            active_fast_forward_frames = next_fast_forward_frames
+            step_start = timing_start()
+            pump_calls = pump_live_scene_updates(game_scenes, replay, end_tick, active_fast_forward_frames)
+            last_pump_timing_ms = timing_end({}, 'pump_game', step_start)
+            last_pump_frame_budget = active_fast_forward_frames
             if index < 5 and pump_calls:
                 artifact['scene_update_pumps'].extend(pump_calls)
             if CAPTURE_THROTTLE_SECONDS > 0:
@@ -4530,6 +4955,7 @@ try:
     artifact['status'] = 'ok'
     artifact['validation'] = validation
     artifact['trace_events'] = TRACE_EVENTS
+    artifact['timing_summary'] = timing_summary()
     artifact['sample_preview'] = samples[-5:]
     write_json_atomic(ARTIFACT_PATH, artifact)
 
@@ -4605,16 +5031,14 @@ function Invoke-GamePythonCapture([string]$Id) {
     Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath $statsPath -ArtifactPath $artifactPath -Mode 'capture-live-replay' -SampleHz $SampleHz -MaxSamples $maxSamples) -Encoding UTF8
 
     $mutex = New-Object System.Threading.Mutex($false, 'Global\WodReplayCapture')
-    if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(60))) {
-        throw 'Timed out waiting for capture lock.'
-    }
+    Wait-CaptureMutex -Mutex $mutex -CurrentJobId $Id
 
     $process = $null
     $slotState = $null
     $existingGamePids = Get-GameProcessIds
     try {
         $slotState = Prepare-ReplaySlot -Id $Id
-        $process = Start-GameProcess
+        $process = Start-GameProcess -OwnerJobId $Id
         $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
         if ($hWnd -eq [IntPtr]::Zero) {
             throw 'War of Dots window was not found.'
@@ -4694,9 +5118,7 @@ function Invoke-LiveStateExperiment([string]$Id, [string]$Mode) {
     Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath $statsPath -ArtifactPath $artifactPath -Mode $Mode -SampleHz $SampleHz -MaxSamples $sampleCount) -Encoding UTF8
 
     $mutex = New-Object System.Threading.Mutex($false, 'Global\WodReplayCapture')
-    if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(60))) {
-        throw 'Timed out waiting for capture lock.'
-    }
+    Wait-CaptureMutex -Mutex $mutex -CurrentJobId $Id
 
     $process = $null
     $slotState = $null
@@ -4755,35 +5177,6 @@ function Invoke-LiveStateExperiment([string]$Id, [string]$Mode) {
     }
 }
 
-if ($Smoke) {
-    $gameExe = Get-GameExe
-    $jobsDir = Join-Path $ShareRoot 'jobs'
-    $result = @{
-        ok = (Test-Path $gameExe)
-        mode = 'local-session'
-        share_root = $ShareRoot
-        game_exe_exists = (Test-Path $gameExe)
-        jobs_dir_exists = (Test-Path $jobsDir)
-        interactive_user = [Environment]::UserInteractive
-        machine = $env:COMPUTERNAME
-        user = $env:USERNAME
-        window_strategy = $WindowStrategy
-    }
-    Write-JsonResult $result
-    if (-not $result.ok) { exit 2 }
-    exit 0
-}
-
-if ($LaunchSmoke) {
-    Test-GameLaunch
-    exit 0
-}
-
-if ($OpenReplaySmoke) {
-    Test-OpenReplay -Id $JobId
-    exit 0
-}
-
 if ($Calibrate) {
     Run-Calibration
     exit 0
@@ -4827,6 +5220,6 @@ if ($GamePythonCapture -or $CaptureLiveReplay) {
 
 Write-JsonResult @{
     ok = $false
-    message = 'Specify -Smoke, -Calibrate, -CleanupJob, -PythonProbe, -ProbeReplayState, -SampleLiveState, -CaptureLiveReplay, -GamePythonCapture, or -CaptureReplay.'
+    message = 'Specify -Calibrate, -CleanupJob, -PythonProbe, -ProbeReplayState, -SampleLiveState, -CaptureLiveReplay, -GamePythonCapture, or -CaptureReplay.'
 }
 exit 3

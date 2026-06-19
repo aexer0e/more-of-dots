@@ -41,7 +41,6 @@ input {
 }
 
 button,
-.file-button,
 .primary-file-button {
   align-items: center;
   background: rgba(255, 255, 255, 0.06);
@@ -57,7 +56,6 @@ button,
 }
 
 button:hover:not(:disabled),
-.file-button:hover,
 .primary-file-button:hover {
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.3);
@@ -116,7 +114,6 @@ img {
   z-index: 5;
 }
 
-.file-controls,
 .graph-palette,
 .timeline-dock {
   align-items: center;
@@ -130,12 +127,10 @@ img {
   pointer-events: auto;
 }
 
-.file-controls,
 .graph-palette {
   padding: 8px;
 }
 
-.file-button,
 .primary-file-button,
 .play-button {
   background: var(--accent);
@@ -144,7 +139,6 @@ img {
   font-weight: 900;
 }
 
-.file-button:hover,
 .primary-file-button:hover,
 .play-button:hover:not(:disabled) {
   background: #ffd66a;
@@ -175,6 +169,44 @@ img {
   transform: translateX(-50%);
   width: min(860px, calc(100vw - 32px));
   z-index: 8;
+}
+
+.viewer-area .topbar,
+.viewer-area .timeline-dock,
+.viewer-area .graph-window {
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease;
+}
+
+.viewer-area .topbar {
+  transform: translateY(-8px);
+}
+
+.viewer-area .timeline-dock {
+  transform: translate(-50%, 8px);
+}
+
+.viewer-area .graph-window {
+  transform: translateY(-4px);
+}
+
+.viewer-area:hover .topbar,
+.viewer-area:hover .timeline-dock,
+.viewer-area:hover .graph-window,
+.viewer-area:focus-within .topbar,
+.viewer-area:focus-within .timeline-dock,
+.viewer-area:focus-within .graph-window {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.viewer-area:hover .timeline-dock,
+.viewer-area:focus-within .timeline-dock {
+  transform: translate(-50%, 0);
 }
 
 .transport-button {
@@ -215,11 +247,11 @@ img {
 }
 
 .transport-button.is-paused span {
-  left: 14px;
+  left: 13px;
 }
 
 .transport-button.is-paused span::after {
-  left: 10px;
+  left: 9px;
   top: 0;
 }
 
@@ -295,16 +327,27 @@ img {
   height: 8px;
 }
 
+.graph-palette-zone {
+  align-items: flex-start;
+  display: flex;
+  height: 64px;
+  justify-content: center;
+  left: 50%;
+  padding-top: 10px;
+  pointer-events: auto;
+  position: absolute;
+  top: -10px;
+  transform: translateX(-50%);
+  width: min(720px, calc(100vw - 200px));
+}
+
 .graph-palette {
   height: 42px;
   justify-content: center;
-  left: 50%;
   max-width: min(640px, calc(100vw - 220px));
   overflow: hidden;
   padding: 7px;
-  position: absolute;
-  top: 0;
-  transform: translateX(-50%);
+  position: relative;
   transition:
     width 180ms ease,
     background 180ms ease,
@@ -313,6 +356,7 @@ img {
 }
 
 .graph-palette.open,
+.graph-palette-zone:hover .graph-palette,
 .graph-palette:focus-within {
   background: rgba(14, 18, 21, 0.9);
   border-color: rgba(255, 255, 255, 0.18);
@@ -339,6 +383,7 @@ img {
 }
 
 .graph-palette.open .graph-palette-handle,
+.graph-palette-zone:hover .graph-palette-handle,
 .graph-palette:focus-within .graph-palette-handle {
   opacity: 0;
 }
@@ -358,6 +403,7 @@ img {
 }
 
 .graph-palette.open .graph-palette-buttons,
+.graph-palette-zone:hover .graph-palette-buttons,
 .graph-palette:focus-within .graph-palette-buttons {
   opacity: 1;
   pointer-events: auto;
@@ -378,12 +424,15 @@ img {
 }
 
 .graph-window {
-  background: rgba(14, 18, 21, 0.9);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
+  -webkit-backdrop-filter: blur(6px) saturate(1.12);
+  backdrop-filter: blur(6px) saturate(1.12);
+  background: rgba(247, 250, 248, 0.62);
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 7px;
+  box-shadow: 0 10px 28px rgba(8, 14, 16, 0.2);
+  color: #172126;
   display: grid;
-  grid-template-rows: 36px minmax(0, 1fr);
+  grid-template-rows: 26px minmax(0, 1fr);
   overflow: hidden;
   position: absolute;
   z-index: 7;
@@ -391,13 +440,13 @@ img {
 
 .graph-titlebar {
   align-items: center;
-  background: rgba(255, 255, 255, 0.055);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.46), rgba(230, 238, 235, 0.18));
   cursor: grab;
   display: flex;
   gap: 8px;
   justify-content: space-between;
   min-width: 0;
-  padding: 5px 6px 5px 10px;
+  padding: 3px 4px 3px 8px;
   user-select: none;
 }
 
@@ -406,12 +455,14 @@ img {
 }
 
 .graph-titlebar strong {
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 900;
+  letter-spacing: 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-transform: uppercase;
 }
 
 .graph-actions {
@@ -422,26 +473,26 @@ img {
 
 .graph-actions button {
   border-radius: 50%;
-  min-height: 24px;
+  min-height: 18px;
   padding: 0;
 }
 
 .graph-close {
-  background: rgba(255, 255, 255, 0.08);
-  height: 24px;
+  background: rgba(18, 28, 34, 0.1);
+  height: 18px;
   position: relative;
-  width: 24px;
+  width: 18px;
 }
 
 .graph-close::before,
 .graph-close::after {
-  background: rgba(238, 244, 245, 0.9);
+  background: rgba(20, 29, 34, 0.86);
   border-radius: 2px;
   content: "";
-  height: 12px;
-  left: 11px;
+  height: 9px;
+  left: 8px;
   position: absolute;
-  top: 5px;
+  top: 4px;
   width: 2px;
 }
 
@@ -457,12 +508,13 @@ img {
   display: grid;
   grid-template-rows: minmax(0, 1fr);
   min-height: 0;
-  padding: 7px;
+  padding: 3px;
 }
 
 .graph-canvas {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  border-radius: 5px;
   display: block;
   height: 100%;
   min-height: 0;
@@ -694,8 +746,13 @@ p {
     align-items: flex-start;
   }
 
+  .graph-palette-zone {
+    width: min(560px, calc(100vw - 32px));
+  }
+
   .graph-palette,
   .graph-palette.open,
+  .graph-palette-zone:hover .graph-palette,
   .graph-palette:focus-within {
     max-width: min(520px, calc(100vw - 32px));
   }
@@ -725,29 +782,38 @@ p {
     width: auto;
   }
 
-  .file-controls {
-    transform: scale(0.9);
-    transform-origin: top left;
+  .graph-palette-zone {
+    width: calc(100vw - 20px);
   }
 
   .graph-palette,
   .graph-palette.open,
+  .graph-palette-zone:hover .graph-palette,
   .graph-palette:focus-within {
     max-width: calc(100vw - 20px);
   }
 
   .graph-palette {
-    transform: translateX(-50%) scale(0.92);
     width: 42px;
   }
 
   .graph-palette.open,
+  .graph-palette-zone:hover .graph-palette,
   .graph-palette:focus-within {
     width: calc(100vw - 20px);
   }
 
   .timeline-dock {
     grid-template-columns: 42px minmax(0, 1fr);
+  }
+
+  .viewer-area .timeline-dock {
+    transform: translateY(8px);
+  }
+
+  .viewer-area:hover .timeline-dock,
+  .viewer-area:focus-within .timeline-dock {
+    transform: translateY(0);
   }
 
   .timeline-speed {

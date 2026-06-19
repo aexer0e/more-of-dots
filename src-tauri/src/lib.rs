@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -17,14 +18,6 @@ const DEFAULT_SAMPLE_DELTA_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAMPLE_DELTA_RECORDS: usize = 600;
 const MAX_STATS_META_BYTES: u64 = 8 * 1024 * 1024;
-
-#[derive(Serialize)]
-struct ArtifactPayload {
-    filename: String,
-    mime_type: String,
-    base64: String,
-    bytes: u64,
-}
 
 #[derive(Serialize)]
 struct UnitAssetsPayload {
@@ -138,6 +131,8 @@ async fn run_backend(
         command.to_string(),
         "--runtime-dir".to_string(),
         runtime_dir.to_string_lossy().to_string(),
+        "--owner-pid".to_string(),
+        process::id().to_string(),
     ];
     args.extend(extra_args);
 
@@ -233,67 +228,6 @@ async fn capture_replay(
 
     let _ = fs::remove_file(&upload_path);
     result
-}
-
-fn artifact_path(
-    runtime_dir: &Path,
-    job_id: &str,
-    kind: &str,
-) -> Result<(PathBuf, String, String), String> {
-    if job_id.is_empty() || !job_id.chars().all(|char| char.is_ascii_hexdigit()) {
-        return Err("Invalid job id.".to_string());
-    }
-
-    let (file_name, download_name, mime_type) = match kind {
-        "simulated-replay" => (
-            "simulated.rep",
-            format!("{job_id}-simulated.rep"),
-            "application/gzip",
-        ),
-        "stats" => (
-            "stats.json",
-            format!("{job_id}-stats.json"),
-            "application/json",
-        ),
-        "logs" => ("logs.txt", format!("{job_id}-logs.txt"), "text/plain"),
-        _ => return Err(format!("Unknown artifact kind: {kind}")),
-    };
-    Ok((
-        runtime_dir.join("jobs").join(job_id).join(file_name),
-        download_name,
-        mime_type.to_string(),
-    ))
-}
-
-#[tauri::command]
-async fn read_artifact(
-    app: AppHandle,
-    job_id: String,
-    kind: String,
-) -> Result<ArtifactPayload, String> {
-    let runtime_dir = app_runtime_dir(&app)?;
-    let (path, filename, mime_type) = artifact_path(&runtime_dir, &job_id, &kind)?;
-    let bytes =
-        fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-    Ok(ArtifactPayload {
-        filename,
-        mime_type,
-        bytes: bytes.len() as u64,
-        base64: BASE64.encode(bytes),
-    })
-}
-
-#[tauri::command]
-async fn capture_partial_stats(app: AppHandle, job_id: String) -> Result<Option<Value>, String> {
-    if job_id.is_empty() || !job_id.chars().all(|char| char.is_ascii_hexdigit()) {
-        return Err("Invalid job id.".to_string());
-    }
-    let runtime_dir = app_runtime_dir(&app)?;
-    let path = runtime_dir
-        .join("jobs")
-        .join(job_id)
-        .join("stats.json.partial.json");
-    Ok(read_json_file(&path))
 }
 
 #[tauri::command]
@@ -556,8 +490,6 @@ pub fn run() {
             list_jobs,
             get_job,
             capture_replay,
-            read_artifact,
-            capture_partial_stats,
             capture_sample_delta,
             unit_assets,
             capture_progress

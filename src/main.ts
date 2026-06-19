@@ -59,12 +59,23 @@ type CaptureProgressEvent = {
   city_count?: number;
   controlled_city_count?: number;
   target_sim_speed?: number;
+  target_game_seconds_per_wall_second?: number;
+  target_ticks_per_wall_second?: number;
+  target_ticks_per_poll?: number;
+  actual_game_seconds_per_wall_second?: number | null;
+  tick_delta?: number | null;
+  wall_delta_ms?: number | null;
   replay_sample_hz?: number;
   replay_sample_tick_gap?: number;
   fast_forward_controller?: boolean;
   fast_forward_step_method?: string;
   fast_forward_frames_per_sample?: number;
+  next_fast_forward_frames_per_sample?: number;
+  max_fast_forward_frames_per_sample?: number;
   capture_throttle_seconds?: number;
+  timing_ms?: Record<string, number>;
+  previous_pump_ms?: number | null;
+  troop_cache_refresh?: boolean;
   teams?: TeamMetric[];
   completion?: Record<string, unknown> | null;
 };
@@ -245,10 +256,10 @@ const UNIT_PROJECTION_LOCAL_RADIUS = 50;
 const UNIT_PROJECTION_LOCAL_WEIGHT = 4.375;
 const UNIT_PROJECTION_GUARD_RADIUS = 20;
 const UNIT_PROJECTION_GUARD_WEIGHT = 35;
-const UNIT_PROJECTION_POWER_SCALE = 0.6;
+const UNIT_PROJECTION_POWER_SCALE = 0.78;
 const CITY_PROJECTION_GUARD_WEIGHT = 80;
-const GRAPH_COMPACT_SIZE = { width: 272, height: 166 };
-const GRAPH_MIN_SIZE = { width: 220, height: 132 };
+const GRAPH_COMPACT_SIZE = { width: 228, height: 122 };
+const GRAPH_MIN_SIZE = { width: 170, height: 96 };
 const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
   troops: { kind: "troops", title: "Troops", approximate: true },
   funds: { kind: "funds", title: "Funds" },
@@ -257,11 +268,11 @@ const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
   casualties: { kind: "casualties", title: "Casualties", approximate: true },
 };
 const DEFAULT_GRAPH_WINDOWS: GraphWindow[] = [
-  { id: "graph-troops", kind: "troops", x: 18, y: 78, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: true, z: 9 },
-  { id: "graph-funds", kind: "funds", x: 306, y: 78, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 10 },
-  { id: "graph-units", kind: "units", x: 594, y: 78, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 11 },
-  { id: "graph-morale", kind: "morale", x: 18, y: 260, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 12 },
-  { id: "graph-casualties", kind: "casualties", x: 306, y: 260, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 13 },
+  { id: "graph-troops", kind: "troops", x: 18, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: true, z: 9 },
+  { id: "graph-funds", kind: "funds", x: 258, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 10 },
+  { id: "graph-units", kind: "units", x: 498, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 11 },
+  { id: "graph-morale", kind: "morale", x: 18, y: 206, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 12 },
+  { id: "graph-casualties", kind: "casualties", x: 258, y: 206, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 13 },
 ];
 
 let statusPayload: BackendStatus | null = null;
@@ -924,25 +935,27 @@ function closeGraphWindow(id: string) {
 function renderGraphPalette(): string {
   const visible = visibleGraphKinds();
   return `
-    <div class="graph-palette" aria-label="Graph windows">
-      <div class="graph-palette-handle" aria-hidden="true">
-        <span></span>
-        <span></span>
-        <span></span>
-      </div>
-      <div class="graph-palette-buttons">
-      ${Object.values(GRAPH_DEFINITIONS)
-        .map(
-          (definition) => `
-            <button
-              type="button"
-              data-graph-toggle="${definition.kind}"
-              class="${visible.has(definition.kind) ? "active" : ""}"
-              aria-pressed="${visible.has(definition.kind) ? "true" : "false"}"
-            >${escapeHtml(definition.title)}</button>
-          `,
-        )
-        .join("")}
+    <div class="graph-palette-zone" aria-label="Graph windows">
+      <div class="graph-palette">
+        <div class="graph-palette-handle" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <div class="graph-palette-buttons">
+        ${Object.values(GRAPH_DEFINITIONS)
+          .map(
+            (definition) => `
+              <button
+                type="button"
+                data-graph-toggle="${definition.kind}"
+                class="${visible.has(definition.kind) ? "active" : ""}"
+                aria-pressed="${visible.has(definition.kind) ? "true" : "false"}"
+              >${escapeHtml(definition.title)}</button>
+            `,
+          )
+          .join("")}
+        </div>
       </div>
     </div>
   `;
@@ -993,7 +1006,7 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   disableImageSmoothing(ctx);
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "rgba(3, 5, 6, 0.18)";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
   ctx.fillRect(0, 0, width, height);
 
   if (!sample) return;
@@ -1015,22 +1028,22 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
   }));
 
   if (values.length < 2) {
-    ctx.fillStyle = "rgba(238, 244, 245, 0.54)";
-    ctx.font = "800 12px Inter, Segoe UI, sans-serif";
+    drawGraphLiveValues(ctx, windowState.kind, liveValues, width);
+    ctx.fillStyle = "rgba(22, 31, 35, 0.56)";
+    ctx.font = "800 11px Inter, Segoe UI, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("Waiting for data", width / 2, height / 2);
-    drawGraphLiveValues(ctx, windowState.kind, liveValues, width, height);
+    ctx.fillText("Waiting for data", width / 2, height / 2 + 8);
     return;
   }
 
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
   const valueSpan = Math.max(1, maxValue - minValue);
-  const padLeft = 8;
-  const padRight = 92;
-  const padTop = 12;
-  const padBottom = 12;
+  const padLeft = 6;
+  const padRight = 6;
+  const padTop = 23;
+  const padBottom = 6;
   const plotX = padLeft;
   const plotY = padTop;
   const plotWidth = Math.max(1, width - padLeft - padRight);
@@ -1040,7 +1053,7 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
     y: plotY + (1 - (point.value - minValue) / valueSpan) * plotHeight,
   });
 
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.1)";
+  ctx.strokeStyle = "rgba(30, 43, 50, 0.16)";
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(plotX, plotY + plotHeight / 2);
@@ -1049,8 +1062,18 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
 
   for (const { color, points } of series) {
     if (points.length < 2) continue;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.28)";
+    ctx.lineWidth = 3.4;
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const screen = pointToScreen(point);
+      if (index === 0) ctx.moveTo(screen.x, screen.y);
+      else ctx.lineTo(screen.x, screen.y);
+    });
+    ctx.stroke();
+
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 1.7;
     ctx.beginPath();
     points.forEach((point, index) => {
       const screen = pointToScreen(point);
@@ -1060,7 +1083,7 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
     ctx.stroke();
   }
 
-  drawGraphLiveValues(ctx, windowState.kind, liveValues, width, height);
+  drawGraphLiveValues(ctx, windowState.kind, liveValues, width);
 }
 
 function drawGraphLiveValues(
@@ -1068,23 +1091,47 @@ function drawGraphLiveValues(
   kind: GraphKind,
   values: Array<{ color: string; value: number | null }>,
   width: number,
-  height: number,
 ) {
-  const startY = Math.max(18, height / 2 - 17);
+  let cursorX = width - 5;
   ctx.save();
-  ctx.font = "900 13px Inter, Segoe UI, sans-serif";
+  ctx.font = "900 11px Inter, Segoe UI, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  values.slice(0, 2).forEach((item, index) => {
-    const y = startY + index * 28;
+  values.slice(0, 2).reverse().forEach((item) => {
+    const text = formatGraphValue(kind, item.value);
+    const textWidth = Math.ceil(ctx.measureText(text).width);
+    const chipWidth = textWidth + 17;
+    const chipX = Math.max(4, cursorX - chipWidth);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.32)";
+    roundedRect(ctx, chipX, 3, chipWidth, 17, 5);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(20, 31, 36, 0.08)";
+    ctx.stroke();
+
     ctx.fillStyle = item.color;
     ctx.beginPath();
-    ctx.arc(width - 78, y, 5, 0, Math.PI * 2);
+    ctx.arc(chipX + 6, 11.5, 3.2, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = item.color;
-    ctx.fillText(formatGraphValue(kind, item.value), width - 8, y);
+    ctx.fillText(text, cursorX - 5, 11.5);
+    cursorX = chipX - 4;
   });
   ctx.restore();
+}
+
+function roundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number) {
+  const r = Math.max(0, Math.min(radius, width / 2, height / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
 }
 
 function renderGraphCanvases(sample: Sample | null) {
@@ -2057,7 +2104,7 @@ function render() {
         <input id="fileInput" type="file" accept=".rep,application/gzip">
         ${
           activeStats
-            ? `<div class="topbar"><div class="file-controls"><label class="file-button" for="fileInput">Open replay</label></div>${renderGraphPalette()}</div>`
+            ? `<div class="topbar">${renderGraphPalette()}</div>`
             : ""
         }
         ${renderOverlay()}
@@ -2108,9 +2155,11 @@ function bindPointerActivation(element: HTMLElement | null, handler: (event: Poi
 
 function bindGraphEvents() {
   const palette = document.querySelector<HTMLElement>(".graph-palette");
+  const paletteZone = document.querySelector<HTMLElement>(".graph-palette-zone");
   if (palette) {
-    palette.addEventListener("pointerenter", () => openGraphPalette(palette));
-    palette.addEventListener("pointerleave", () => scheduleGraphPaletteClose(palette));
+    const hoverTarget = paletteZone ?? palette;
+    hoverTarget.addEventListener("pointerenter", () => openGraphPalette(palette));
+    hoverTarget.addEventListener("pointerleave", () => scheduleGraphPaletteClose(palette));
     palette.addEventListener("focusin", () => openGraphPalette(palette));
     palette.addEventListener("focusout", () => scheduleGraphPaletteClose(palette));
   }
@@ -2575,6 +2624,21 @@ function teamProgressFacts(event: CaptureProgressEvent, job: Job | undefined): s
   });
 }
 
+function slowestTimingFact(event: CaptureProgressEvent): string | null {
+  const timing = event.timing_ms ?? {};
+  const entries = Object.entries(timing)
+    .filter(([, value]) => Number.isFinite(Number(value)))
+    .sort((first, second) => Number(second[1]) - Number(first[1]));
+  const slowest = entries[0];
+  if (!slowest) {
+    const pump = Number(event.previous_pump_ms);
+    return Number.isFinite(pump) ? `Previous pump ${formatStat(pump)} ms` : null;
+  }
+  const pump = Number(event.previous_pump_ms);
+  const pumpText = Number.isFinite(pump) ? `, pump ${formatStat(pump)} ms` : "";
+  return `Slowest ${slowest[0].replaceAll("_", " ")} ${formatStat(slowest[1])} ms${pumpText}`;
+}
+
 function applyCaptureProgress(payload: CaptureProgressPayload, filename: string) {
   if (!payload.found) {
     setProgress(
@@ -2601,9 +2665,9 @@ function applyCaptureProgress(payload: CaptureProgressPayload, filename: string)
     facts = [
       `Target end tick ${formatStat(event.end_tick)}`,
       `Replay samples ${formatStat(event.replay_sample_hz ?? event.sample_hz)} Hz`,
-      `Sample gap ${formatStat(event.replay_sample_tick_gap)} ticks`,
-      `Game pump ${formatStat(event.target_sim_speed)}x`,
-      `Manual burst ${formatStat(event.fast_forward_frames_per_sample)} frames/sample`,
+      `Target pace ${formatStat(event.target_game_seconds_per_wall_second)} game sec/sec`,
+      `Target step ${formatStat(event.target_ticks_per_poll ?? event.fast_forward_frames_per_sample)} ticks/poll`,
+      `Burst ${formatStat(event.fast_forward_frames_per_sample)} / max ${formatStat(event.max_fast_forward_frames_per_sample)} frames`,
       `Throttle ${Number(event.capture_throttle_seconds ?? 0) > 0 ? `${(Number(event.capture_throttle_seconds) * 1000).toFixed(0)} ms` : "off"}`,
       `Controller ${event.fast_forward_controller ? "on" : "off"} / ${event.fast_forward_step_method ?? "step"}`,
     ];
@@ -2620,13 +2684,17 @@ function applyCaptureProgress(payload: CaptureProgressPayload, filename: string)
     value = Math.max(value, 30 + boundedPercent * 70);
     label = "Capturing live gamestate";
     detail = `Captured tick ${formatStat(tick)} / ${formatStat(endTick)} (${(boundedPercent * 100).toFixed(1)}%) at ${formatReplayClock(tick)} / ${formatReplayClock(endTick)}.`;
+    const timingFact = slowestTimingFact(event);
     facts = [
       `Samples ${formatStat(event.sample_count)} / ${formatStat(event.max_samples)}`,
       `Replay cadence ${formatStat(event.replay_sample_hz)} Hz / ${formatStat(event.replay_sample_tick_gap)} ticks`,
       `Objects ${formatStat(event.game_object_count)} game / ${formatStat(event.game_scene_count)} scene`,
       `Visible units ${formatStat(event.troop_count)}`,
       `Cities ${formatStat(event.controlled_city_count)} / ${formatStat(event.city_count)} controlled`,
-      `Burst ${formatStat(event.fast_forward_frames_per_sample)} frames/sample`,
+      `Capture pace ${formatStat(event.actual_game_seconds_per_wall_second)} game sec/sec`,
+      `Tick step ${formatStat(event.tick_delta)} in ${formatStat(event.wall_delta_ms)} ms`,
+      `Burst ${formatStat(event.fast_forward_frames_per_sample)} -> ${formatStat(event.next_fast_forward_frames_per_sample)} frames/poll`,
+      ...(timingFact ? [timingFact] : []),
       `Elapsed ${formatTime(Number(event.elapsed_ms ?? 0))}`,
       ...teamProgressFacts(event, payload.job),
     ];
@@ -2696,8 +2764,8 @@ function startCaptureProgressPolling(filename: string, startedAfterMs: number) {
 
   void progressPoll();
   void samplePoll();
-  captureProgressTimer = window.setInterval(() => void progressPoll(), 500);
-  sampleDeltaTimer = window.setInterval(() => void samplePoll(), 100);
+  captureProgressTimer = window.setInterval(() => void progressPoll(), 250);
+  sampleDeltaTimer = window.setInterval(() => void samplePoll(), 250);
 }
 
 async function refreshBackend({ quiet = false } = {}) {

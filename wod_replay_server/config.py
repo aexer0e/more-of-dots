@@ -28,13 +28,6 @@ def _load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
-def _bool_env(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _path_env(name: str, default: Path) -> Path:
     raw = os.environ.get(name)
     if not raw:
@@ -52,8 +45,6 @@ def _int_env(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class AppSettings:
     project_root: Path
-    host: str
-    port: int
     runtime_dir: Path
     jobs_dir: Path
     staged_game_dir: Path
@@ -64,7 +55,6 @@ class AppSettings:
     game_desktop_strategy: str
     game_window_strategy: str
     capture_source: str
-    runner_smoke_required: bool
     max_replay_bytes: int
     max_replay_json_bytes: int
     capture_sample_hz: int
@@ -97,8 +87,6 @@ def get_settings() -> AppSettings:
 
     return AppSettings(
         project_root=PROJECT_ROOT,
-        host=os.environ.get("WOD_HOST", "127.0.0.1"),
-        port=_int_env("WOD_PORT", 8787),
         runtime_dir=runtime_dir,
         jobs_dir=runtime_dir / "jobs",
         staged_game_dir=runtime_dir / "staged-game",
@@ -109,7 +97,6 @@ def get_settings() -> AppSettings:
         game_desktop_strategy=os.environ.get("WOD_GAME_DESKTOP_STRATEGY", "automation-desktop"),
         game_window_strategy=os.environ.get("WOD_GAME_WINDOW_STRATEGY", "offscreen"),
         capture_source=os.environ.get("WOD_CAPTURE_SOURCE", "auto"),
-        runner_smoke_required=_bool_env("WOD_RUNNER_SMOKE_REQUIRED", False),
         max_replay_bytes=_int_env("WOD_MAX_REPLAY_BYTES", 20 * 1024 * 1024),
         max_replay_json_bytes=_int_env("WOD_MAX_REPLAY_JSON_BYTES", 100 * 1024 * 1024),
         capture_sample_hz=_int_env("WOD_CAPTURE_SAMPLE_HZ", 10),

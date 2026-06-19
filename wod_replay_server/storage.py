@@ -18,10 +18,6 @@ class JobPaths:
     root: Path
 
     @property
-    def replay_path(self) -> Path:
-        return self.root / "replay.rep"
-
-    @property
     def input_replay_path(self) -> Path:
         return self.root / "input.rep"
 
@@ -68,12 +64,10 @@ class JobStore:
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
                 "metadata": None,
-                "runner_smoke": None,
                 "capture": None,
                 "synthesis": None,
                 "address_profile": None,
                 "error": None,
-                "links": self.links(job_id),
             },
         )
         return paths
@@ -98,16 +92,6 @@ class JobStore:
             if len(jobs) >= limit:
                 break
         return jobs
-
-    @staticmethod
-    def links(job_id: str) -> dict[str, str]:
-        return {
-            "job": f"/api/jobs/{job_id}",
-            "replay": f"/api/jobs/{job_id}/replay",
-            "stats": f"/api/jobs/{job_id}/stats",
-            "simulated_replay": f"/api/jobs/{job_id}/simulated-replay",
-            "logs": f"/api/jobs/{job_id}/logs",
-        }
 
     def read_job(self, paths: JobPaths) -> dict[str, Any]:
         return json.loads(paths.job_json_path.read_text(encoding="utf-8"))

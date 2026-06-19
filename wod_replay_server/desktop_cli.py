@@ -13,7 +13,6 @@ from .address_profiles import AddressProfile, MissingAddressProfile, load_matchi
 from .config import get_settings
 from .local_runner import LocalSessionRunner
 from .replay import ReplayValidationError, validate_replay
-from .replay_simulator import simulate_replay_file
 from .stage_game import stage_game
 from .storage import JobPaths, JobStore
 from .synthesis import synthesize_replay
@@ -26,7 +25,7 @@ def _json_default(value: Any) -> str:
     return str(value)
 
 
-def _load_backend(runtime_dir: Path | None):
+def _load_backend(runtime_dir: Path | None, owner_pid: int | None = None):
     if runtime_dir is not None:
         os.environ["WOD_RUNTIME_DIR"] = str(runtime_dir.expanduser().resolve())
 
@@ -36,7 +35,7 @@ def _load_backend(runtime_dir: Path | None):
     return SimpleNamespace(
         settings=settings,
         store=JobStore(settings.jobs_dir),
-        replay_runner=LocalSessionRunner(settings),
+        replay_runner=LocalSessionRunner(settings, owner_pid=owner_pid),
         capture_lock=Lock(),
         stage_lock=Lock(),
     )
@@ -47,12 +46,10 @@ def _job_response(job: dict[str, Any]) -> dict[str, Any]:
         "job_id": job["job_id"],
         "status": job["status"],
         "metadata": job.get("metadata"),
-        "runner_smoke": job.get("runner_smoke"),
         "capture": job.get("capture"),
         "synthesis": job.get("synthesis"),
         "address_profile": job.get("address_profile"),
         "error": job.get("error"),
-        "links": job["links"],
     }
 
 
@@ -93,20 +90,6 @@ def _write_capture_request(ctx, paths: JobPaths, metadata: dict[str, Any], profi
         "replay_metadata": metadata,
     }
     paths.capture_request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
-
-
-def _run_replay_file_capture(ctx, paths: JobPaths) -> dict[str, Any]:
-    stats = simulate_replay_file(
-        input_replay_path=paths.input_replay_path,
-        stats_path=paths.stats_path,
-        max_json_bytes=ctx.settings.max_replay_json_bytes,
-    )
-    return {
-        "status": "succeeded",
-        "phase": "replay_file_simulation",
-        "source": "replay-file-derived",
-        "stats": stats,
-    }
 
 
 def _run_game_python_capture(ctx, paths: JobPaths, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -190,7 +173,7 @@ def _finalize_capture(ctx, paths: JobPaths, capture: dict[str, Any]) -> None:
         return
 
     source = capture.get("source") or capture.get("stats", {}).get("source") or capture.get("stats_summary", {}).get("source")
-    if source not in AUTHORITATIVE_CAPTURE_SOURCES and source != "replay-file-derived":
+    if source not in AUTHORITATIVE_CAPTURE_SOURCES:
         ctx.store.update_job(
             paths,
             status="failed",
@@ -239,16 +222,8 @@ def _run_capture_job(ctx, job_id: str) -> None:
             capture_source = ctx.settings.capture_source.lower()
             if capture_source == "game-python":
                 capture_source = "game-live-python"
-            if capture_source == "replay-file":
-                capture_source = "replay-file-dev"
-            if capture_source not in {"auto", "memory", "game-live-python", "replay-file-dev"}:
-                raise ValueError("WOD_CAPTURE_SOURCE must be auto, game-live-python, memory, or replay-file-dev.")
-
-            if capture_source == "replay-file-dev":
-                ctx.store.append_log(paths, "Using explicit dev-only replay-file-derived capture.")
-                ctx.store.update_job(paths, status="simulating_from_replay_dev")
-                _finalize_capture(ctx, paths, _run_replay_file_capture(ctx, paths))
-                return
+            if capture_source not in {"auto", "memory", "game-live-python"}:
+                raise ValueError("WOD_CAPTURE_SOURCE must be auto, game-live-python, or memory.")
 
             if capture_source == "game-live-python":
                 ctx.store.update_job(paths, status="spawning_hidden_game_process")
@@ -309,8 +284,8 @@ def _run_capture_job(ctx, job_id: str) -> None:
             _cleanup_capture_processes(ctx, paths, "Post-capture")
 
 
-def command_health(runtime_dir: Path | None) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
     settings = ctx.settings
     runner = ctx.replay_runner.describe()
     return {
@@ -328,27 +303,32 @@ def command_health(runtime_dir: Path | None) -> dict[str, Any]:
     }
 
 
-def command_stage_game(runtime_dir: Path | None) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+def command_stage_game(runtime_dir: Path | None, owner_pid: int | None = None) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
     with ctx.stage_lock:
         result = stage_game(ctx.settings.steam_game_dir, ctx.settings.staged_game_dir)
     return {"status": "staged", **result}
 
 
-def command_list_jobs(runtime_dir: Path | None, limit: int) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+def command_list_jobs(runtime_dir: Path | None, limit: int, owner_pid: int | None = None) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
     bounded_limit = min(max(limit, 1), 100)
     return {"jobs": [_job_response(job) for job in ctx.store.list_jobs(limit=bounded_limit)]}
 
 
-def command_job(runtime_dir: Path | None, job_id: str) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+def command_job(runtime_dir: Path | None, job_id: str, owner_pid: int | None = None) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
     paths = ctx.store.paths_for(job_id)
     return _job_response(ctx.store.read_job(paths))
 
 
-def command_capture_file(runtime_dir: Path | None, input_path: Path, filename: str | None) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+def command_capture_file(
+    runtime_dir: Path | None,
+    input_path: Path,
+    filename: str | None,
+    owner_pid: int | None = None,
+) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
     raw = input_path.read_bytes()
     paths = ctx.store.create_job(filename or input_path.name)
     ctx.store.append_log(paths, f"Created desktop capture job for {filename or input_path.name!r}.")
@@ -366,7 +346,6 @@ def command_capture_file(runtime_dir: Path | None, input_path: Path, filename: s
         job = ctx.store.update_job(paths, status="failed", error=str(exc))
         return _job_response(job)
 
-    paths.replay_path.write_bytes(raw)
     paths.input_replay_path.write_bytes(raw)
     ctx.store.append_log(paths, "Replay gzip and JSON structure validated.")
     ctx.store.update_job(paths, metadata=document.metadata)
@@ -387,7 +366,6 @@ def _create_capture_job(ctx, input_path: Path, filename: str | None):
         return paths, None
 
     document = validate_replay(raw, max_json_bytes=ctx.settings.max_replay_json_bytes)
-    paths.replay_path.write_bytes(raw)
     paths.input_replay_path.write_bytes(raw)
     ctx.store.append_log(paths, "Replay gzip and JSON structure validated for probe.")
     ctx.store.update_job(paths, status="probe_queued", metadata=document.metadata)
@@ -395,8 +373,12 @@ def _create_capture_job(ctx, input_path: Path, filename: str | None):
     return paths, document
 
 
-def command_probe_runtime(runtime_dir: Path | None, job_id: str | None = None) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+def command_probe_runtime(
+    runtime_dir: Path | None,
+    job_id: str | None = None,
+    owner_pid: int | None = None,
+) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
     return ctx.replay_runner.probe_runtime(job_id)
 
 
@@ -405,8 +387,9 @@ def command_probe_file(
     input_path: Path,
     filename: str | None,
     mode: str,
+    owner_pid: int | None = None,
 ) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir)
+    ctx = _load_backend(runtime_dir, owner_pid)
     paths, document = _create_capture_job(ctx, input_path, filename)
     if document is None:
         return _job_response(ctx.store.read_job(paths))
@@ -441,6 +424,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--filename", default=None)
     parser.add_argument("--job-id", default=None)
+    parser.add_argument("--owner-pid", type=int, default=None)
     return parser
 
 
@@ -449,25 +433,25 @@ def run(argv: list[str] | None = None) -> int:
 
     try:
         if args.desktop_command == "health":
-            payload = command_health(args.runtime_dir)
+            payload = command_health(args.runtime_dir, args.owner_pid)
         elif args.desktop_command == "stage-game":
-            payload = command_stage_game(args.runtime_dir)
+            payload = command_stage_game(args.runtime_dir, args.owner_pid)
         elif args.desktop_command == "list-jobs":
-            payload = command_list_jobs(args.runtime_dir, args.limit)
+            payload = command_list_jobs(args.runtime_dir, args.limit, args.owner_pid)
         elif args.desktop_command == "job":
             if not args.job_id:
                 raise ValueError("--job-id is required for job.")
-            payload = command_job(args.runtime_dir, args.job_id)
+            payload = command_job(args.runtime_dir, args.job_id, args.owner_pid)
         elif args.desktop_command == "capture-file":
             if args.input is None:
                 raise ValueError("--input is required for capture-file.")
-            payload = command_capture_file(args.runtime_dir, args.input, args.filename)
+            payload = command_capture_file(args.runtime_dir, args.input, args.filename, args.owner_pid)
         elif args.desktop_command == "probe-runtime":
-            payload = command_probe_runtime(args.runtime_dir, args.job_id)
+            payload = command_probe_runtime(args.runtime_dir, args.job_id, args.owner_pid)
         elif args.desktop_command in {"probe-replay-state", "sample-live-state", "capture-live-replay"}:
             if args.input is None:
                 raise ValueError(f"--input is required for {args.desktop_command}.")
-            payload = command_probe_file(args.runtime_dir, args.input, args.filename, args.desktop_command)
+            payload = command_probe_file(args.runtime_dir, args.input, args.filename, args.desktop_command, args.owner_pid)
         else:
             raise ValueError(f"Unknown desktop command: {args.desktop_command}")
     except Exception as exc:

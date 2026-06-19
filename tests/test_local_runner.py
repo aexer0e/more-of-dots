@@ -21,7 +21,7 @@ def test_runner_command_contains_local_capture_arguments(tmp_path: Path) -> None
         game_desktop_strategy="automation-desktop",
         game_window_strategy="offscreen",
     )
-    runner = LocalSessionRunner(settings)
+    runner = LocalSessionRunner(settings, owner_pid=4321)
 
     command = runner._runner_command(  # noqa: SLF001
         ["-CaptureReplay", "-JobId", "abc123", "-SampleHz", "10"],
@@ -33,5 +33,7 @@ def test_runner_command_contains_local_capture_arguments(tmp_path: Path) -> None
     assert "-CaptureReplay" in command
     assert "-DesktopStrategy" in command
     assert "automation-desktop" in command
+    assert "-OwnerProcessId" in command
+    assert "4321" in command
     assert "abc123" in command
     assert str(runtime_dir) in command

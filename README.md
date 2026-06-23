@@ -1,4 +1,4 @@
-# War of Dots Replay
+# More of Dots
 
 Local Windows replay desktop app for War of Dots. The installed Tauri app validates `.rep` files, launches the staged game on a private Windows desktop, injects the local Python probe, captures live gamestate from the game's replay scene, and returns stats plus a synthesized replay artifact. Normal capture fails closed if it cannot produce game-backed samples.
 
@@ -12,11 +12,12 @@ npm run build
 ```
 
 The Tauri NSIS installer is emitted under `src-tauri\target\release\bundle\nsis`.
+The Tauri MSI installer is emitted under `src-tauri\target\release\bundle\msi`.
 The build also writes a non-failing size report to `build\size-audit.json`.
 
 ## Desktop App
 
-Install Node/Rust dependencies, build the Python backend command executable, then build the Tauri installer:
+Install Node/Rust dependencies, build the Python backend command executable, then build the Tauri installers:
 
 ```powershell
 npm install

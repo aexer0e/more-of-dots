@@ -31,12 +31,17 @@ Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri\binaries') -Filter 'wod-r
     Select-Object -First 1 |
     ForEach-Object { $entries += New-SizeEntry 'sidecar' $_.FullName }
 
-$entries += New-SizeEntry 'tauri-exe' (Join-Path $Root 'src-tauri\target\release\wod-replay-desktop.exe')
+$entries += New-SizeEntry 'tauri-exe' (Join-Path $Root 'src-tauri\target\release\more-of-dots.exe')
 
 Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri\target\release\bundle\nsis') -Filter '*.exe' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTimeUtc -Descending |
     Select-Object -First 1 |
     ForEach-Object { $entries += New-SizeEntry 'nsis-installer' $_.FullName }
+
+Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri\target\release\bundle\msi') -Filter '*.msi' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1 |
+    ForEach-Object { $entries += New-SizeEntry 'msi-installer' $_.FullName }
 
 if (-not $entries) {
     $entries += [ordered]@{

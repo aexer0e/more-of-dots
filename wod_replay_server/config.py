@@ -62,6 +62,7 @@ class AppSettings:
     capture_in_process_sample_limit: int
     ui_sample_window: int
     sample_delta_max_bytes: int
+    runtime_jobs_max_bytes: int
 
     def ensure_runtime_dirs(self) -> None:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -104,4 +105,5 @@ def get_settings() -> AppSettings:
         capture_in_process_sample_limit=_int_env("WOD_CAPTURE_IN_PROCESS_SAMPLE_LIMIT", 900),
         ui_sample_window=_int_env("WOD_UI_SAMPLE_WINDOW", 2400),
         sample_delta_max_bytes=_int_env("WOD_SAMPLE_DELTA_MAX_BYTES", 2 * 1024 * 1024),
+        runtime_jobs_max_bytes=_int_env("WOD_RUNTIME_JOBS_MAX_BYTES", 200 * 1024 * 1024),
     )

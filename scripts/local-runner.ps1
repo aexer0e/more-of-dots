@@ -107,13 +107,27 @@ $STARTF_USESHOWWINDOW = 0x00000001
 $SW_HIDE = 0
 $SW_MINIMIZE = 6
 $script:AutomationDesktopHandle = [IntPtr]::Zero
+$script:CurrentGameDir = ''
+$StageGameMutexName = 'Global\MoreOfDotsStageGame'
 
 function Write-JsonResult([hashtable]$Data) {
     $Data | ConvertTo-Json -Depth 32 -Compress
 }
 
+function Write-TextUtf8NoBom([string]$Path, [string]$Text) {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Text, $encoding)
+}
+
 function Write-JsonFile([string]$Path, $Data) {
-    $Data | ConvertTo-Json -Depth 64 | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-TextUtf8NoBom -Path $Path -Text ($Data | ConvertTo-Json -Depth 64)
+}
+
+function Set-JsonProperty($Object, [string]$Name, $Value) {
+    if ($null -eq $Object) {
+        return
+    }
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
 }
 
 function ConvertTo-JsonBytes($Data) {
@@ -178,11 +192,70 @@ function Get-Sha256([string]$Path) {
 }
 
 function Get-GameExe {
+    if ($script:CurrentGameDir) {
+        return Join-Path $script:CurrentGameDir 'game.exe'
+    }
     Join-Path $ShareRoot 'staged-game\game.exe'
 }
 
 function Get-GameDir {
     Split-Path -Parent (Get-GameExe)
+}
+
+function Invoke-WithStageGameLock([scriptblock]$Action, [int]$TimeoutSeconds = 120) {
+    $mutex = New-Object System.Threading.Mutex($false, $StageGameMutexName)
+    $hasLock = $false
+    try {
+        try {
+            $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        } catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+        }
+        if (-not $hasLock) {
+            throw "Timed out waiting for staged game lock after $TimeoutSeconds seconds."
+        }
+        & $Action
+    } finally {
+        if ($hasLock) {
+            [void]$mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
+}
+
+function Get-SharedGameDir {
+    Join-Path $ShareRoot 'staged-game'
+}
+
+function Get-JobGameDir([string]$Id) {
+    Join-Path (Get-JobRoot -Id $Id) 'game-runtime'
+}
+
+function Use-JobGameRuntime([string]$Id) {
+    $source = Get-SharedGameDir
+    $destination = Get-JobGameDir -Id $Id
+    Invoke-WithStageGameLock -Action {
+        if (-not (Test-Path -LiteralPath (Join-Path $source 'game.exe'))) {
+            throw "Staged game.exe not found: $(Join-Path $source 'game.exe')"
+        }
+        if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Force -Path $destination | Out-Null
+        Copy-Item -Path (Join-Path $source '*') -Destination $destination -Recurse -Force
+    }
+    $script:CurrentGameDir = (Resolve-Path -LiteralPath $destination).Path
+    return $script:CurrentGameDir
+}
+
+function Clear-JobGameRuntime([string]$Id) {
+    if ($script:CurrentGameDir -and ((Get-NormalizedPath $script:CurrentGameDir) -eq (Get-NormalizedPath (Get-JobGameDir -Id $Id)))) {
+        $script:CurrentGameDir = ''
+    }
+    $gameDir = Get-JobGameDir -Id $Id
+    if (Test-Path -LiteralPath $gameDir) {
+        Remove-Item -LiteralPath $gameDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-GameProcessIds {
@@ -207,8 +280,9 @@ function Get-NormalizedPath([string]$Path) {
     }
 }
 
-function Test-StagedGameProcessId([int]$ProcessId) {
-    $expected = Get-NormalizedPath (Get-GameExe)
+function Test-StagedGameProcessId([int]$ProcessId, [string]$ExpectedGameExe = '') {
+    $candidateGameExe = if ($ExpectedGameExe) { $ExpectedGameExe } else { Get-GameExe }
+    $expected = Get-NormalizedPath $candidateGameExe
     if (-not $expected) {
         return $false
     }
@@ -361,11 +435,11 @@ function Remove-CaptureProcessManifest([string]$Id) {
     }
 }
 
-function Stop-StagedGameProcessId([int]$ProcessId) {
+function Stop-StagedGameProcessId([int]$ProcessId, [string]$ExpectedGameExe = '') {
     if ($ProcessId -le 0) {
         return $false
     }
-    if (Test-StagedGameProcessId -ProcessId $ProcessId) {
+    if (Test-StagedGameProcessId -ProcessId $ProcessId -ExpectedGameExe $ExpectedGameExe) {
         Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
         return $true
     }
@@ -374,6 +448,8 @@ function Stop-StagedGameProcessId([int]$ProcessId) {
 
 function Stop-CaptureGameProcess($Process, [string]$OwnerJobId = '') {
     $processIds = @()
+    $stopped = @()
+    $expectedGameExe = Get-GameExe
     if ($Process) {
         try {
             if (-not $Process.HasExited) {
@@ -392,14 +468,20 @@ function Stop-CaptureGameProcess($Process, [string]$OwnerJobId = '') {
             if ($manifest.pid) {
                 $processIds += [int]$manifest.pid
             }
+            if ($manifest.expected_executable_path) {
+                $expectedGameExe = [string]$manifest.expected_executable_path
+            }
         } catch {}
     }
     foreach ($processId in @($processIds | Select-Object -Unique)) {
-        [void](Stop-StagedGameProcessId -ProcessId ([int]$processId))
+        if (Stop-StagedGameProcessId -ProcessId ([int]$processId) -ExpectedGameExe $expectedGameExe) {
+            $stopped += [int]$processId
+        }
     }
     if ($OwnerJobId) {
         Remove-CaptureProcessManifest -Id $OwnerJobId
     }
+    return @($stopped)
 }
 
 function Stop-AllStagedGameProcesses {
@@ -415,7 +497,6 @@ function Stop-AllStagedGameProcesses {
 
 function Stop-JobStagedGameProcesses([string]$Id) {
     Stop-CaptureGameProcess -Process $null -OwnerJobId $Id
-    Stop-AllStagedGameProcesses
 }
 
 function Stop-NewGameProcesses($ExistingProcessIds) {
@@ -950,13 +1031,11 @@ function Capture-Replay([string]$Id) {
         throw "Address profile is not enabled: $profilePath"
     }
 
-    $mutex = New-Object System.Threading.Mutex($false, 'Global\WodReplayCapture')
-    Wait-CaptureMutex -Mutex $mutex -CurrentJobId $Id
-
     $process = $null
     $handle = [IntPtr]::Zero
     $slotState = $null
     try {
+        [void](Use-JobGameRuntime -Id $Id)
         $slotState = Prepare-ReplaySlot -Id $Id
         $process = Start-GameProcess -OwnerJobId $Id
         Open-ReplayWithMouse -Process $process
@@ -1021,11 +1100,10 @@ function Capture-Replay([string]$Id) {
         if ($handle -ne [IntPtr]::Zero) {
             [void][Win32.Native]::CloseHandle($handle)
         }
-        Stop-CaptureGameProcess -Process $process -OwnerJobId $Id
+        [void](Stop-CaptureGameProcess -Process $process -OwnerJobId $Id)
         Close-AutomationDesktop
         Restore-ReplaySlot $slotState
-        $mutex.ReleaseMutex()
-        $mutex.Dispose()
+        Clear-JobGameRuntime -Id $Id
     }
 }
 
@@ -1093,6 +1171,7 @@ function New-PythonProbePayload([string]$OutputPath) {
 import gc
 import inspect
 import json
+import math
 import os
 import sys
 import traceback
@@ -1342,10 +1421,66 @@ function Invoke-PythonRuntimeProbe {
             inject_result = $injectResult
         }
     } finally {
-        Stop-CaptureGameProcess -Process $process -OwnerJobId $JobId
+        [void](Stop-CaptureGameProcess -Process $process -OwnerJobId $JobId)
         Close-AutomationDesktop
         Restore-ReplaySlot $slotState
     }
+}
+
+function Publish-PartialStatsIfAvailable([string]$StatsPath) {
+    $metaPath = $StatsPath + '.partial.meta.json'
+    $samplesPath = $StatsPath + '.samples.jsonl'
+    if ((Test-Path -LiteralPath $StatsPath) -or -not (Test-Path -LiteralPath $metaPath) -or -not (Test-Path -LiteralPath $samplesPath)) {
+        return $false
+    }
+
+    $sampleBytes = 0
+    try {
+        $sampleBytes = (Get-Item -LiteralPath $samplesPath).Length
+    } catch {
+        return $false
+    }
+    if ($sampleBytes -le 0) {
+        return $false
+    }
+
+    try {
+        $stats = Read-JsonFile $metaPath
+    } catch {
+        return $false
+    }
+    if (-not $stats) {
+        return $false
+    }
+    if (-not $stats.summary) {
+        Set-JsonProperty -Object $stats -Name 'summary' -Value ([ordered]@{})
+    }
+
+    $sampleCount = 0
+    try {
+        $sampleCount = [int]$stats.summary.sample_count
+    } catch {
+        $sampleCount = 0
+    }
+    if ($sampleCount -le 0) {
+        try {
+            $sampleCount = [int]((Get-Content -LiteralPath $samplesPath | Measure-Object -Line).Lines)
+        } catch {
+            $sampleCount = 0
+        }
+    }
+    if ($sampleCount -le 0) {
+        return $false
+    }
+
+    Set-JsonProperty -Object $stats.summary -Name 'sample_count' -Value $sampleCount
+    Set-JsonProperty -Object $stats.summary -Name 'buffered_sample_count' -Value $sampleCount
+    Set-JsonProperty -Object $stats.summary -Name 'embedded_sample_count' -Value 0
+    Set-JsonProperty -Object $stats.summary -Name 'sample_stream_path' -Value $samplesPath
+    Set-JsonProperty -Object $stats.summary -Name 'partial' -Value $true
+    Set-JsonProperty -Object $stats -Name 'samples' -Value @()
+    Write-JsonFile -Path $StatsPath -Data $stats
+    return $true
 }
 
 function New-GamePythonCapturePayload([string]$RequestPath, [string]$StatsPath) {
@@ -1488,6 +1623,7 @@ function New-LiveGameCapturePayload([string]$RequestPath, [string]$StatsPath, [s
     $escapedMode = $Mode.Replace("'", "\\'")
     return @"
 import gc
+import gzip
 import inspect
 import json
 import os
@@ -1506,6 +1642,11 @@ MAX_SAMPLES = $MaxSamples
 SOURCE = 'game-live-python'
 TRACE_EVENTS = []
 RECENT_RENDER_PROJECTION_LINES = []
+RECENT_RENDER_BRIDGE_LINES = []
+MAP_METADATA_CACHE = {}
+STATIC_BRIDGE_LINE_CACHE = {}
+TERRAIN_BRIDGE_LINE_CACHE = {}
+BRIDGE_FIELD_LINE_CACHE = {}
 PROGRESS_PATH = ARTIFACT_PATH + '.progress.jsonl'
 SAMPLE_STREAM_PATH = STATS_PATH + '.samples.jsonl' if STATS_PATH else None
 PARTIAL_META_PATH = STATS_PATH + '.partial.meta.json' if STATS_PATH else None
@@ -1547,7 +1688,7 @@ try:
 except Exception:
     SIM_UPDATE_BURST = max(0, min(2000, int(((TARGET_SIM_SPEED - 1.0) * 30.0) / max(1, int(SAMPLE_HZ)))))
 FAST_FORWARD_CORE = os.environ.get('WOD_LIVE_FAST_FORWARD_CORE', '1').strip().lower() not in ('0', 'false', 'no', 'off')
-default_fast_forward_step_method = 'components' if CAPTURE_UNTIL_END else 'game-update'
+default_fast_forward_step_method = 'manual' if CAPTURE_UNTIL_END else 'game-update'
 FAST_FORWARD_STEP_METHOD = os.environ.get('WOD_LIVE_FAST_FORWARD_STEP_METHOD', default_fast_forward_step_method).strip().lower()
 default_fast_forward_controller = '0' if CAPTURE_UNTIL_END and FAST_FORWARD_STEP_METHOD in ('manual', 'component', 'components') else '1'
 FAST_FORWARD_CONTROLLER = os.environ.get('WOD_LIVE_FAST_FORWARD_CONTROLLER', default_fast_forward_controller).strip().lower() not in ('0', 'false', 'no', 'off')
@@ -1579,12 +1720,43 @@ TROOP_SOURCE_CACHE = []
 FUND_SOURCE_CACHE = {}
 DISPLAYED_CASUALTY_SOURCE_CACHE = {}
 TIMING_TOTALS = {}
+TROOP_DISPLAY_SCALE = 100
+CITY_CAPTURE_RADIUS = 95.0
+CITY_OWNER_MEMORY = {}
+CITY_CAPTURE_HINTS = {}
+TEAM_PEAK_TROOPS_ESTIMATE = []
+TEAM_PEAK_ALIVE_UNITS = []
 try:
-    TROOP_CACHE_REFRESH_SAMPLES = max(1, int(os.environ.get('WOD_LIVE_TROOP_CACHE_REFRESH_SAMPLES', '12')))
+    TROOP_CACHE_REFRESH_SAMPLES = max(1, int(os.environ.get('WOD_LIVE_TROOP_CACHE_REFRESH_SAMPLES', '4' if CAPTURE_UNTIL_END else '12')))
 except Exception:
-    TROOP_CACHE_REFRESH_SAMPLES = 12
+    TROOP_CACHE_REFRESH_SAMPLES = 4 if CAPTURE_UNTIL_END else 12
 READ_UNIT_PROJECTION_FIELDS = os.environ.get('WOD_LIVE_READ_UNIT_PROJECTION_FIELDS', '0' if CAPTURE_UNTIL_END else '1').strip().lower() in ('1', 'true', 'yes', 'on')
-READ_SCENE_PROJECTION_LINES = os.environ.get('WOD_LIVE_READ_SCENE_PROJECTION_LINES', '0' if CAPTURE_UNTIL_END else '1').strip().lower() in ('1', 'true', 'yes', 'on')
+READ_SCENE_PROJECTION_LINES = os.environ.get('WOD_LIVE_READ_SCENE_PROJECTION_LINES', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+DEFAULT_COMPONENT_STEP_METHODS = (
+    'tick_frame',
+    'pay_turn',
+    'dot_production_new',
+    'update_alive_dots',
+    'move_dots',
+    'victory_check',
+    'update_strength',
+    'extract_dot_positions',
+)
+FULL_CAPTURE_COMPONENT_STEP_METHODS = (
+    'tick_frame',
+    'move_dots',
+    'update_strength',
+    'extract_dot_positions',
+    'victory_check',
+)
+default_component_step_methods = FULL_CAPTURE_COMPONENT_STEP_METHODS if CAPTURE_UNTIL_END else DEFAULT_COMPONENT_STEP_METHODS
+FAST_FORWARD_COMPONENT_STEP_METHODS = tuple(
+    item.strip()
+    for item in os.environ.get('WOD_LIVE_FAST_FORWARD_COMPONENT_METHODS', ','.join(default_component_step_methods)).split(',')
+    if item.strip()
+)
+if not FAST_FORWARD_COMPONENT_STEP_METHODS:
+    FAST_FORWARD_COMPONENT_STEP_METHODS = default_component_step_methods
 
 KEYWORDS = (
     'battle', 'replay', 'dot', 'dots', 'city', 'cities', 'health', 'morale',
@@ -1918,7 +2090,7 @@ def install_trace_hooks(attempts):
                     try:
                         lines = projection_lines_from_call(args, kwargs)
                         if lines:
-                            remember_render_projection_lines(lines)
+                            remember_render_lines(lines, 'bridge' if meth_name == 'draw_textured_line_ingame' else 'projection')
                     except Exception:
                         pass
                 add_trace({
@@ -2303,7 +2475,7 @@ def point_sequence(value, limit=16, depth=0):
             return []
     return []
 
-def normalize_line(points):
+def normalize_line(points, max_points=2048):
     clean = []
     for point in points:
         if not point:
@@ -2315,23 +2487,25 @@ def normalize_line(points):
         next_point = {'x': x, 'y': y}
         if not clean or point_distance_sq(clean[-1], next_point) > 4:
             clean.append(next_point)
+            if len(clean) >= max_points:
+                break
     if len(clean) < 2 or point_distance_sq(clean[0], clean[-1]) <= 25:
         return []
-    return clean[:32]
+    return clean[:max_points]
 
-def numeric_sequence_to_line(values):
+def numeric_sequence_to_line(values, max_points=2048):
     numbers = [to_float(item) for item in values]
     if len(numbers) < 4 or any(number is None for number in numbers[:4]):
         return []
     paired = []
     usable = len(numbers) - (len(numbers) % 2)
-    for index in range(0, min(usable, 64), 2):
+    for index in range(0, min(usable, max_points * 2), 2):
         x = numbers[index]
         y = numbers[index + 1]
         if x is None or y is None:
             return []
         paired.append({'x': x, 'y': y})
-    return normalize_line(paired)
+    return normalize_line(paired, max_points=max_points)
 
 def direct_mapping_line(value):
     for names in (
@@ -2354,7 +2528,7 @@ def direct_mapping_line(value):
     return []
 
 def projection_lines_from_value(value, limit=24, depth=0):
-    if value is None or depth > 3 or limit <= 0:
+    if value is None or depth > 5 or limit <= 0:
         return []
     value = native_value(value)
     if isinstance(value, Mapping):
@@ -2363,7 +2537,7 @@ def projection_lines_from_value(value, limit=24, depth=0):
             return [direct]
         lines = []
         preferred = (
-            'line', 'lines', 'projection', 'projection_line', 'projection_lines',
+            'render_line', 'line', 'lines', 'projection', 'projection_line', 'projection_lines',
             'path', 'paths', 'route', 'routes', 'points', 'segments'
         )
         for key in preferred:
@@ -2371,7 +2545,7 @@ def projection_lines_from_value(value, limit=24, depth=0):
                 lines.extend(projection_lines_from_value(value.get(key), limit - len(lines), depth + 1))
                 if len(lines) >= limit:
                     return lines[:limit]
-        points = point_sequence(value, limit=32, depth=0)
+        points = point_sequence(value, limit=2048, depth=0)
         line = normalize_line(points)
         return [line] if line else []
     if isinstance(value, (list, tuple, set)):
@@ -2379,12 +2553,17 @@ def projection_lines_from_value(value, limit=24, depth=0):
         numeric_line = numeric_sequence_to_line(values)
         if numeric_line:
             return [numeric_line]
+        points = [to_point(item) for item in values]
+        points = [point for point in points if point is not None]
+        if len(points) >= 2:
+            line = normalize_line(points)
+            return [line] if line else []
         child_lines = []
         for child in values[:limit]:
             child_lines.extend(projection_lines_from_value(child, limit - len(child_lines), depth + 1))
             if len(child_lines) >= limit:
                 return child_lines[:limit]
-        points = point_sequence(values, limit=32, depth=0)
+        points = point_sequence(values, limit=2048, depth=0)
         line = normalize_line(points)
         return [line] if line else []
     if not isinstance(value, (str, bytes, int, float, bool)):
@@ -2407,6 +2586,36 @@ def dedupe_projection_lines(lines, limit=80):
             break
     return unique
 
+def line_bounds(line):
+    xs = []
+    ys = []
+    for point in line or []:
+        x = to_float(point.get('x') if isinstance(point, Mapping) else None)
+        y = to_float(point.get('y') if isinstance(point, Mapping) else None)
+        if x is None or y is None:
+            continue
+        xs.append(x)
+        ys.append(y)
+    if not xs or not ys:
+        return None
+    return {
+        'width': max(xs) - min(xs),
+        'height': max(ys) - min(ys),
+    }
+
+def filter_projection_boundary_lines(lines, limit=80):
+    filtered = []
+    for line in dedupe_projection_lines(lines, limit=limit * 2):
+        bounds = line_bounds(line)
+        if bounds is None:
+            continue
+        if len(line) >= 4 and bounds.get('width', 0) <= 48 and bounds.get('height', 0) <= 24:
+            continue
+        filtered.append(line)
+        if len(filtered) >= limit:
+            break
+    return filtered
+
 def projection_lines_from_call(args, kwargs):
     lines = []
     for value in list(args or [])[:6]:
@@ -2425,6 +2634,21 @@ def remember_render_projection_lines(lines):
     })
     del RECENT_RENDER_PROJECTION_LINES[:-12]
 
+def remember_render_bridge_lines(lines):
+    if not lines:
+        return
+    RECENT_RENDER_BRIDGE_LINES.append({
+        'time_ms': int(time.time() * 1000),
+        'lines': dedupe_projection_lines(lines, limit=48),
+    })
+    del RECENT_RENDER_BRIDGE_LINES[:-12]
+
+def remember_render_lines(lines, kind='projection'):
+    if kind == 'bridge':
+        remember_render_bridge_lines(lines)
+    else:
+        remember_render_projection_lines(lines)
+
 def recent_render_projection_lines(max_age_ms=1200):
     now = int(time.time() * 1000)
     lines = []
@@ -2435,6 +2659,131 @@ def recent_render_projection_lines(max_age_ms=1200):
             lines.extend(entry.get('lines') or [])
     RECENT_RENDER_PROJECTION_LINES[:] = keep
     return dedupe_projection_lines(lines, limit=80)
+
+def recent_render_bridge_lines(max_age_ms=1200):
+    now = int(time.time() * 1000)
+    lines = []
+    keep = []
+    for entry in RECENT_RENDER_BRIDGE_LINES:
+        if now - int(entry.get('time_ms', 0)) <= max_age_ms:
+            keep.append(entry)
+            lines.extend(entry.get('lines') or [])
+    RECENT_RENDER_BRIDGE_LINES[:] = keep
+    return dedupe_projection_lines(lines, limit=80)
+
+def terrain_bridge_lines_from_game(game, limit=120):
+    if game is None:
+        return []
+    attrs = attrs_of(game)
+    raw_terrain = attrs.get('terrain_map')
+    bridge_idx = to_int(attrs.get('BRIDGE_IDX'))
+    if bridge_idx is None:
+        bridge_idx = 8
+    cache_key = (id(game), id(raw_terrain), bridge_idx)
+    if cache_key in TERRAIN_BRIDGE_LINE_CACHE:
+        return TERRAIN_BRIDGE_LINE_CACHE[cache_key][:limit]
+    terrain = native_value(raw_terrain)
+    if not isinstance(terrain, (list, tuple)) or not terrain:
+        TERRAIN_BRIDGE_LINE_CACHE[cache_key] = []
+        return []
+    outer = list(terrain)
+    first_inner = native_value(outer[0]) if outer else None
+    if not isinstance(first_inner, (list, tuple)) or not first_inner:
+        TERRAIN_BRIDGE_LINE_CACHE[cache_key] = []
+        return []
+    outer_len = len(outer)
+    inner_len = len(first_inner)
+    map_size = read_map_size(game)
+    width = max(1.0, float(map_size.get('width') or 1600))
+    height = max(1.0, float(map_size.get('height') or 900))
+    x_major = abs((width / max(1, outer_len)) - (height / max(1, inner_len))) <= abs((width / max(1, inner_len)) - (height / max(1, outer_len)))
+    columns = outer_len if x_major else inner_len
+    rows = inner_len if x_major else outer_len
+    cell_w = width / max(1, columns)
+    cell_h = height / max(1, rows)
+    lines = []
+
+    for outer_index, child in enumerate(outer):
+        values = native_value(child)
+        if not isinstance(values, (list, tuple)):
+            continue
+        for inner_index, value in enumerate(values):
+            if to_int(value) != bridge_idx:
+                continue
+            column = outer_index if x_major else inner_index
+            row = inner_index if x_major else outer_index
+            x0 = column * cell_w
+            y0 = row * cell_h
+            x1 = x0 + cell_w
+            y1 = y0 + cell_h
+            lines.append([
+                {'x': x0, 'y': y0},
+                {'x': x1, 'y': y0},
+                {'x': x1, 'y': y1},
+                {'x': x0, 'y': y1},
+            ])
+            if len(lines) >= limit:
+                TERRAIN_BRIDGE_LINE_CACHE[cache_key] = lines
+                return lines
+    TERRAIN_BRIDGE_LINE_CACHE[cache_key] = lines
+    return lines
+
+def bridge_lines_from_entries(entries, limit=120):
+    entries = native_value(entries)
+    if not isinstance(entries, (list, tuple, set)):
+        return []
+    lines = []
+    for entry in list(entries):
+        entry = native_value(entry)
+        points = []
+        if isinstance(entry, Mapping):
+            for key in ('points', 'line', 'endpoints', 'ends', 'vertices'):
+                if key in entry:
+                    points = point_sequence(entry.get(key), limit=8)
+                    break
+            if not points:
+                first = to_point(entry.get('start') or entry.get('a') or entry.get('from'))
+                second = to_point(entry.get('end') or entry.get('b') or entry.get('to'))
+                points = [point for point in (first, second) if point is not None]
+        elif isinstance(entry, (list, tuple)):
+            points = [to_point(item) for item in entry]
+            points = [point for point in points if point is not None]
+            if len(points) < 2:
+                points = point_sequence(entry, limit=8)
+        else:
+            points = point_sequence(entry, limit=8)
+        line = normalize_line(points)
+        if line:
+            lines.append(line)
+            if len(lines) >= limit:
+                break
+    return dedupe_projection_lines(lines, limit=limit)
+
+def static_bridge_lines_from_replay(replay, limit=120):
+    safe_map_id = safe_map_id_from_replay(replay)
+    custom_map = replay.get('custom_map') if isinstance(replay, Mapping) else None
+    cache_key = '%s:%s' % (safe_map_id or '', hex(id(custom_map)) if isinstance(custom_map, Mapping) else '')
+    if cache_key in STATIC_BRIDGE_LINE_CACHE:
+        return STATIC_BRIDGE_LINE_CACHE[cache_key][:limit]
+    lines = []
+    if isinstance(replay, Mapping):
+        if isinstance(custom_map, Mapping):
+            lines.extend(bridge_lines_from_entries(custom_map.get('bridges'), limit=limit))
+        if len(lines) < limit:
+            metadata, path = load_packaged_map_metadata(replay)
+            if isinstance(metadata, Mapping):
+                packaged_lines = bridge_lines_from_entries(metadata.get('bridges'), limit=limit - len(lines))
+                if packaged_lines:
+                    record_progress({
+                        'stage': 'map-metadata',
+                        'status': 'bridges-loaded',
+                        'path': path,
+                        'bridge_count': len(packaged_lines),
+                    })
+                    lines.extend(packaged_lines)
+    lines = dedupe_projection_lines(lines, limit=limit)
+    STATIC_BRIDGE_LINE_CACHE[cache_key] = lines
+    return lines[:limit]
 
 def read_sample_projection_lines(games, game_scenes):
     lines = []
@@ -2458,9 +2807,148 @@ def read_sample_projection_lines(games, game_scenes):
             low = str(key).lower()
             if low not in field_names and not ('projection' in low and 'line' in low):
                 continue
+            child_attrs = attrs_of(value)
+            if 'render_line' in child_attrs:
+                lines.extend(projection_lines_from_value(child_attrs.get('render_line'), limit=32))
+                continue
             lines.extend(projection_lines_from_value(value, limit=32))
-    lines.extend(recent_render_projection_lines())
-    return dedupe_projection_lines(lines, limit=80)
+    return filter_projection_boundary_lines(lines, limit=80)
+
+def read_sample_bridges(replay, games, game_scenes):
+    lines = static_bridge_lines_from_replay(replay, limit=120)
+    containers = []
+    for item in list(games or []) + list(game_scenes or []):
+        if item is not None and all(id(item) != id(existing) for existing in containers):
+            containers.append(item)
+        attrs = attrs_of(item)
+        for key in ('core', 'game', 'interface', 'controller', 'map', 'map_manager'):
+            child = attrs.get(key)
+            if child is not None and all(id(child) != id(existing) for existing in containers):
+                containers.append(child)
+    for obj in containers:
+        lines.extend(terrain_bridge_lines_from_game(obj, limit=120 - len(lines)))
+        if len(lines) >= 120:
+            return dedupe_projection_lines(lines, limit=120)
+        bridge_field_key = id(obj)
+        if bridge_field_key in BRIDGE_FIELD_LINE_CACHE:
+            lines.extend(BRIDGE_FIELD_LINE_CACHE[bridge_field_key])
+        else:
+            field_lines = []
+            attrs = attrs_of(obj)
+            for key, value in list(attrs.items())[:220]:
+                low = str(key).lower()
+                if 'bridge' not in low:
+                    continue
+                field_lines.extend(projection_lines_from_value(value, limit=48))
+            field_lines = dedupe_projection_lines(field_lines, limit=120)
+            BRIDGE_FIELD_LINE_CACHE[bridge_field_key] = field_lines
+            lines.extend(field_lines)
+    lines.extend(recent_render_bridge_lines())
+    return dedupe_projection_lines(lines, limit=120)
+
+def geometry_field_profile(games, game_scenes):
+    def numeric_grid_profile(value, max_rows=120, max_cols=120):
+        value = native_value(value)
+        if not isinstance(value, (list, tuple)) or not value:
+            return None
+        shape = [len(value)]
+        first = native_value(value[0])
+        if isinstance(first, (list, tuple)):
+            shape.append(len(first))
+        counts = {}
+        scanned = 0
+        rows = list(value)[:max_rows]
+        for row in rows:
+            row = native_value(row)
+            values = list(row)[:max_cols] if isinstance(row, (list, tuple)) else [row]
+            for item in values:
+                number = to_int(item)
+                if number is None:
+                    continue
+                counts[number] = counts.get(number, 0) + 1
+                scanned += 1
+        if not counts:
+            return {'shape': shape, 'scanned': scanned, 'counts': {}}
+        return {
+            'shape': shape,
+            'scanned': scanned,
+            'counts': {
+                str(key): counts[key]
+                for key in sorted(counts.keys(), key=lambda item: (-counts[item], item))[:16]
+            },
+        }
+
+    def value_profile(value):
+        raw_value = value
+        shape = None
+        dtype = None
+        try:
+            shape = [int(item) for item in list(getattr(raw_value, 'shape'))]
+        except Exception:
+            pass
+        try:
+            dtype = str(getattr(raw_value, 'dtype'))
+        except Exception:
+            pass
+        value = native_value(value)
+        out = trace_value(value, 5)
+        if not isinstance(out, Mapping):
+            out = {'value': out}
+        else:
+            out = dict(out)
+        if shape is not None:
+            out['shape'] = shape
+        if dtype is not None:
+            out['dtype'] = dtype
+        try:
+            if shape is not None and hasattr(raw_value, 'min') and hasattr(raw_value, 'max'):
+                out['min'] = jsonable(raw_value.min())
+                out['max'] = jsonable(raw_value.max())
+        except Exception:
+            pass
+        grid_profile = numeric_grid_profile(value)
+        if grid_profile is not None:
+            out['grid'] = grid_profile
+        return out
+
+    profile = []
+    containers = []
+    for item in list(games or []) + list(game_scenes or []):
+        if item is not None and all(id(item) != id(existing) for existing in containers):
+            containers.append(item)
+        attrs = attrs_of(item)
+        for key in ('core', 'game', 'interface', 'controller', 'map', 'map_manager'):
+            child = attrs.get(key)
+            if child is not None and all(id(child) != id(existing) for existing in containers):
+                containers.append(child)
+    for obj in containers[:12]:
+        attrs = attrs_of(obj)
+        fields = {}
+        for key, value in list(attrs.items())[:260]:
+            low = str(key).lower()
+            if not any(word in low for word in ('line', 'bridge', 'projection', 'curve', 'terrain', 'map', 'color', 'idx')):
+                continue
+            child_fields = {}
+            child_attrs = attrs_of(value)
+            for child_key in ('line', 'regions', 'regions_old', 'render_line'):
+                if child_key in child_attrs:
+                    child_value = child_attrs.get(child_key)
+                    child_fields[child_key] = {
+                        'value': value_profile(child_value),
+                        'line_count': len(projection_lines_from_value(child_value, limit=48)),
+                    }
+            fields[str(key)] = {
+                'value': value_profile(value),
+                'line_count': len(projection_lines_from_value(value, limit=48)),
+                'child_fields': child_fields,
+            }
+        if fields:
+            profile.append({
+                'class': getattr(type(obj), '__name__', safe_repr(type(obj), 80)),
+                'id': hex(id(obj)),
+                'fields': fields,
+            })
+    return profile
 
 def read_projection_lines(obj, origin):
     attrs = attrs_of(obj)
@@ -2520,7 +3008,7 @@ COLOR_NAME_HEX = {
     'black': '#222222',
     'white': '#f4f4f4',
 }
-FALLBACK_TEAM_HEX = ['#063bff', '#ff1616', '#1ebd5a', '#ffdd22', '#7d35ff', '#ff8a1f', '#19d8ff', '#ff5aa8']
+FALLBACK_TEAM_HEX = ['#063bff', '#ff1616', '#7d35ff', '#ff8a1f', '#1ebd5a', '#ffdd22', '#19d8ff', '#ff5aa8']
 
 def flatten_player_name(value):
     if isinstance(value, (list, tuple)):
@@ -2545,7 +3033,7 @@ def owner_to_index(owner):
         return number
     if isinstance(owner, str):
         low = owner.strip().lower()
-        for index, name in enumerate(('blue', 'red', 'green', 'yellow', 'purple', 'orange', 'cyan', 'pink')):
+        for index, name in enumerate(('blue', 'red', 'purple', 'orange', 'green', 'yellow', 'cyan', 'pink')):
             if low == name:
                 return index
     return None
@@ -2634,10 +3122,62 @@ def capital_city_indices(capitals):
                 output.add(number)
     return output
 
+def capital_city_owner_map(capitals, city_positions=None):
+    capitals = native_value(capitals)
+    if capitals is None:
+        return {}
+    if isinstance(capitals, Mapping):
+        values = list(capitals.values())
+    elif isinstance(capitals, (list, tuple, set)):
+        values = list(capitals)
+    else:
+        values = [capitals]
+
+    positions = native_value(city_positions)
+    position_points = []
+    if isinstance(positions, (list, tuple)):
+        position_points = [to_point(item) for item in positions]
+
+    owner_map = {}
+    used_city_ids = set()
+    for owner_index, value in enumerate(values):
+        value = native_value(value)
+        city_id = to_int(value)
+        attrs = attrs_of(value) if city_id is None else {}
+        if city_id is None:
+            for key in ('city_id', 'city_index', 'index', 'idx', 'id'):
+                if key in attrs:
+                    city_id = to_int(attrs.get(key))
+                    if city_id is not None:
+                        break
+        if city_id is None:
+            point = read_position(value)
+            if point is None:
+                point = to_point(value)
+            if point is not None and position_points:
+                best_index = None
+                best_distance = None
+                for index, city_point in enumerate(position_points):
+                    if city_point is None or index in used_city_ids:
+                        continue
+                    distance = point_distance_sq(point, city_point)
+                    if best_distance is None or distance < best_distance:
+                        best_index = index
+                        best_distance = distance
+                if best_index is not None and best_distance is not None and best_distance <= 2500:
+                    city_id = best_index
+        if city_id is None or city_id in used_city_ids:
+            continue
+        owner_map[city_id] = owner_index
+        used_city_ids.add(city_id)
+    if not owner_map and position_points and len(values) <= len(position_points):
+        for owner_index, _ in enumerate(values):
+            owner_map[owner_index] = owner_index
+    return owner_map
+
 def city_owner_from_game_field(game_attrs, city_index):
     owner_fields = (
-        'city_owners', 'city_owner', 'city_colors', 'city_colours', 'city_color',
-        'city_colour', 'city_control', 'city_controls', 'city_owner_ids',
+        'city_owners', 'city_owner', 'city_control', 'city_controls', 'city_owner_ids',
         'city_player', 'city_players', 'city_teams', 'city_team'
     )
     for key in owner_fields:
@@ -2649,14 +3189,331 @@ def city_owner_from_game_field(game_attrs, city_index):
             return owner, key, value
     return None, None, None
 
+def city_owner_from_static_game_field(game_attrs, city_index):
+    owner_fields = ('city_colors', 'city_colours', 'city_color', 'city_colour')
+    for key in owner_fields:
+        if key not in game_attrs:
+            continue
+        value = read_indexed_value(game_attrs.get(key), city_index)
+        owner = owner_to_index(value)
+        if owner is not None:
+            return owner, key, value
+    return None, None, None
+
+def indexed_length(value):
+    value = native_value(value)
+    try:
+        if isinstance(value, Mapping):
+            return len(value)
+        if isinstance(value, (list, tuple, set)):
+            return len(value)
+    except Exception:
+        return 0
+    return 0
+
+def owner_from_control_value(value):
+    owner = owner_to_index(value)
+    if owner is not None:
+        return owner
+    value = native_value(value)
+    if isinstance(value, Mapping):
+        attrs = snapshot_mapping(value)
+        for key in (
+            'owner', 'team', 'player', 'color', 'colour', 'control', 'controller',
+            'captured_by', 'owned_by', 'current_owner', 'current_team', 'current_player'
+        ):
+            if key not in attrs:
+                continue
+            owner = owner_to_index(attrs.get(key))
+            if owner is not None:
+                return owner
+        weighted = []
+        for key, child in mapping_items(value, limit=16):
+            key_owner = owner_to_index(key)
+            number = to_float(native_value(child))
+            if key_owner is not None and number is not None:
+                weighted.append((key_owner, number))
+        if weighted:
+            weighted.sort(key=lambda item: item[1], reverse=True)
+            if weighted[0][1] > 0 and (len(weighted) == 1 or weighted[0][1] > weighted[1][1] + 0.000001):
+                return weighted[0][0]
+    values = number_list(value, limit=16)
+    finite = [(index, float(number)) for index, number in enumerate(values) if number is not None]
+    if len(finite) >= 2:
+        finite.sort(key=lambda item: item[1], reverse=True)
+        if finite[0][1] > 0 and finite[0][1] > finite[1][1] + 0.000001:
+            return finite[0][0]
+    return None
+
+def city_control_sources(game, game_attrs, city_total):
+    dynamic_fields = (
+        'city_owners', 'city_owner', 'city_control', 'city_controls', 'city_owner_ids',
+        'city_player', 'city_players', 'city_teams', 'city_team', 'city_controller',
+        'city_controllers', 'city_ownership', 'city_owner_map'
+    )
+    generic_fields = ('controls', 'owners', 'ownership', 'controllers')
+    method_names = ('get_city_owners', 'get_city_controls', 'get_city_control', 'get_controls')
+    sources = []
+
+    containers = [('game', game, game_attrs)]
+    economy = game_attrs.get('economy') if isinstance(game_attrs, Mapping) else None
+    economy_attrs = attrs_of(economy)
+    if economy_attrs:
+        containers.append(('game.economy', economy, economy_attrs))
+
+    for prefix, obj, attrs in containers:
+        for key in dynamic_fields:
+            if key in attrs:
+                sources.append(('%s.%s' % (prefix, key), attrs.get(key)))
+        for key in generic_fields:
+            if key in attrs and indexed_length(attrs.get(key)) >= max(1, city_total):
+                sources.append(('%s.%s' % (prefix, key), attrs.get(key)))
+        for method_name in method_names:
+            method = getattr(obj, method_name, None) if obj is not None else None
+            if not callable_no_args(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            if indexed_length(value) >= max(1, city_total):
+                sources.append(('%s.%s()' % (prefix, method_name), value))
+    return sources
+
+def authoritative_city_owner_source(source):
+    text = str(source or '').lower()
+    if not text:
+        return False
+    if (
+        'nearby-units' in text
+        or 'memory' in text
+        or 'fallback' in text
+        or 'city_color' in text
+        or 'city_colour' in text
+        or 'capital' in text
+        or 'city_enc' in text
+    ):
+        return False
+    return True
+
+def city_owner_from_control_sources(sources, city_index):
+    for source, value in sources:
+        raw = read_indexed_value(value, city_index)
+        owner = owner_from_control_value(raw)
+        if owner is not None:
+            return owner, source, raw
+    return None, None, None
+
+def valid_city_count_values(value, team_count):
+    values = number_list(value, limit=max(team_count, 8))
+    if len(values) < team_count:
+        return []
+    output = []
+    for value in values[:team_count]:
+        number = to_float(value)
+        output.append(int(round(number)) if number is not None and number >= 0 else None)
+    return output if any(value is not None for value in output) else []
+
+def read_team_city_counts(game_attrs, team_count):
+    containers = [('game', game_attrs)]
+    economy_attrs = attrs_of(game_attrs.get('economy')) if isinstance(game_attrs, Mapping) else {}
+    if economy_attrs:
+        containers.append(('game.economy', economy_attrs))
+    preferred = (
+        'city_count', 'city_counts', 'controlled_city_count', 'controlled_city_counts',
+        'owned_city_count', 'owned_city_counts'
+    )
+    for prefix, attrs in containers:
+        for key in preferred:
+            if key not in attrs:
+                continue
+            values = valid_city_count_values(attrs.get(key), team_count)
+            if values:
+                return values, '%s.%s' % (prefix, key)
+        for key, value in list(attrs.items())[:160]:
+            low = str(key).lower()
+            if 'city' not in low or 'count' not in low or 'total' in low:
+                continue
+            values = valid_city_count_values(value, team_count)
+            if values:
+                return values, '%s.%s' % (prefix, key)
+    return [], None
+
+def nearby_city_owner_candidate(city, troops, team_count):
+    if not troops:
+        return None
+    point = {'x': city.get('x'), 'y': city.get('y')}
+    radius_sq = CITY_CAPTURE_RADIUS * CITY_CAPTURE_RADIUS
+    scores = [0.0 for _ in range(team_count)]
+    nearest = [None for _ in range(team_count)]
+    for troop in troops:
+        if not troop.get('alive', True):
+            continue
+        owner = owner_to_index(troop.get('owner'))
+        if owner is None or owner < 0 or owner >= team_count:
+            continue
+        troop_point = {'x': troop.get('x'), 'y': troop.get('y')}
+        distance_sq = point_distance_sq(point, troop_point)
+        if distance_sq > radius_sq:
+            continue
+        distance_ratio = max(0.0, min(1.0, distance_sq / radius_sq))
+        weight = 1.0 + (1.0 - distance_ratio)
+        unit_kind = str(troop.get('unit_kind') or troop.get('type') or '').lower()
+        if 'tank' in unit_kind:
+            weight *= 1.25
+        scores[owner] += weight
+        if nearest[owner] is None or distance_sq < nearest[owner]:
+            nearest[owner] = distance_sq
+    ranked = sorted(
+        [(index, score, nearest[index]) for index, score in enumerate(scores) if score > 0],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not ranked:
+        return None
+    best = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best[1] < 0.85 or best[1] < second_score + 0.25:
+        return None
+    return {
+        'owner': best[0],
+        'score': round(best[1], 3),
+        'second_score': round(second_score, 3),
+        'nearest_distance': round(math.sqrt(best[2]), 2) if best[2] is not None else None,
+    }
+
+def reconcile_city_owners_with_counts(cities, troops, teams, city_counts, city_counts_source):
+    global CITY_OWNER_MEMORY
+    if not cities or not city_counts:
+        return
+    team_count = max(len(teams or []), len(city_counts), 1)
+    targets = [0 for _ in range(team_count)]
+    for index, value in enumerate(city_counts[:team_count]):
+        number = to_int(value)
+        if number is not None and number >= 0:
+            targets[index] = number
+    if sum(targets) <= 0 or sum(targets) > len(cities):
+        return
+    current = [0 for _ in range(team_count)]
+    for city in cities:
+        owner = city.get('owner')
+        if isinstance(owner, int) and 0 <= owner < team_count:
+            current[owner] += 1
+    deficits = [max(0, targets[index] - current[index]) for index in range(team_count)]
+    surplus = [max(0, current[index] - targets[index]) for index in range(team_count)]
+    if not any(deficits):
+        return
+
+    candidates = []
+    for index, city in enumerate(cities):
+        old_owner = city.get('owner')
+        if authoritative_city_owner_source(city.get('owner_source')):
+            continue
+        if isinstance(old_owner, int) and 0 <= old_owner < team_count and surplus[old_owner] <= 0:
+            continue
+        candidate = nearby_city_owner_candidate(city, troops, team_count)
+        if not candidate:
+            continue
+        owner = candidate.get('owner')
+        if owner is None or owner >= len(deficits) or deficits[owner] <= 0:
+            continue
+        candidates.append((candidate.get('score', 0), index, old_owner, candidate))
+
+    for _, index, old_owner, candidate in sorted(candidates, reverse=True):
+        owner = candidate.get('owner')
+        if owner is None or deficits[owner] <= 0:
+            continue
+        if isinstance(old_owner, int) and 0 <= old_owner < team_count and surplus[old_owner] <= 0:
+            continue
+        cities[index]['owner'] = owner
+        cities[index]['owner_source'] = 'nearby-units+%s' % city_counts_source
+        cities[index]['owner_raw'] = candidate
+        CITY_OWNER_MEMORY[cities[index].get('city_id')] = owner
+        deficits[owner] -= 1
+        if isinstance(old_owner, int) and 0 <= old_owner < team_count:
+            surplus[old_owner] = max(0, surplus[old_owner] - 1)
+
+def static_city_owner_source(source):
+    text = str(source or '').lower()
+    return (
+        not text
+        or 'city_color' in text
+        or 'city_colour' in text
+        or 'capital' in text
+    )
+
+def apply_city_owner_memory(cities):
+    for city in cities:
+        city_id = city.get('city_id')
+        if city_id not in CITY_OWNER_MEMORY:
+            continue
+        if static_city_owner_source(city.get('owner_source')):
+            city['owner'] = CITY_OWNER_MEMORY.get(city_id)
+            city['owner_source'] = 'memory-after-capture'
+            city['owner_raw'] = CITY_OWNER_MEMORY.get(city_id)
+
+def apply_nearby_city_capture_hints(cities, troops, teams):
+    global CITY_OWNER_MEMORY
+    global CITY_CAPTURE_HINTS
+    if not cities or not troops:
+        return
+    team_count = max(len(teams or []), 2)
+    for troop in troops:
+        owner = owner_to_index(troop.get('owner'))
+        if owner is not None:
+            team_count = max(team_count, owner + 1)
+
+    active_city_ids = set()
+    for city in cities:
+        city_id = city.get('city_id')
+        active_city_ids.add(city_id)
+        current_owner = city.get('owner')
+        if authoritative_city_owner_source(city.get('owner_source')):
+            if current_owner is not None:
+                CITY_OWNER_MEMORY[city_id] = current_owner
+            continue
+        candidate = nearby_city_owner_candidate(city, troops, team_count)
+        if not candidate:
+            if current_owner is not None:
+                CITY_OWNER_MEMORY.setdefault(city_id, current_owner)
+            continue
+        owner = candidate.get('owner')
+        if owner is None:
+            continue
+        if owner == current_owner:
+            CITY_OWNER_MEMORY[city_id] = owner
+            for key in list(CITY_CAPTURE_HINTS.keys()):
+                if key[0] == city_id:
+                    CITY_CAPTURE_HINTS.pop(key, None)
+            continue
+
+        hint_key = (city_id, owner)
+        CITY_CAPTURE_HINTS[hint_key] = CITY_CAPTURE_HINTS.get(hint_key, 0) + 1
+        for key in list(CITY_CAPTURE_HINTS.keys()):
+            if key[0] == city_id and key != hint_key:
+                CITY_CAPTURE_HINTS.pop(key, None)
+        strong_hint = candidate.get('score', 0) >= 1.7 or (
+            candidate.get('nearest_distance') is not None and candidate.get('nearest_distance') <= CITY_CAPTURE_RADIUS * 0.42
+        )
+        if CITY_CAPTURE_HINTS.get(hint_key, 0) < 2 and not strong_hint:
+            continue
+
+        city['owner'] = owner
+        city['owner_source'] = 'nearby-units-capture'
+        city['owner_raw'] = dict(candidate, streak=CITY_CAPTURE_HINTS.get(hint_key, 0))
+        CITY_OWNER_MEMORY[city_id] = owner
+
+    for key in list(CITY_CAPTURE_HINTS.keys()):
+        if key[0] not in active_city_ids:
+            CITY_CAPTURE_HINTS.pop(key, None)
+
 def city_owner_from_obj(city):
     attrs = attrs_of(city)
-    preferred = (
-        'owner', 'team', 'player', 'color', 'colour', 'control', 'controller',
-        'captured_by', 'owned_by', 'player_index', 'team_index', 'color_index',
-        'colour_index'
+    dynamic_preferred = (
+        'owner', 'control', 'controller', 'captured_by', 'owned_by',
+        'current_owner', 'current_team', 'current_player', 'player_index', 'team_index'
     )
-    for key in preferred:
+    for key in dynamic_preferred:
         if key not in attrs:
             continue
         raw = attrs.get(key)
@@ -2665,12 +3522,38 @@ def city_owner_from_obj(city):
             return owner, key, raw
     for key, raw in list(attrs.items())[:80]:
         low = str(key).lower()
-        if not any(word in low for word in ('owner', 'team', 'player', 'color', 'colour', 'control')):
+        if not any(word in low for word in ('owner', 'control', 'captur', 'owned')):
+            continue
+        owner = owner_to_index(raw)
+        if owner is not None:
+            return owner, str(key), raw
+
+    static_preferred = ('team', 'player', 'color', 'colour', 'color_index', 'colour_index')
+    for key in static_preferred:
+        if key not in attrs:
+            continue
+        raw = attrs.get(key)
+        owner = owner_to_index(raw)
+        if owner is not None:
+            return owner, key, raw
+    for key, raw in list(attrs.items())[:80]:
+        low = str(key).lower()
+        if not any(word in low for word in ('team', 'player', 'color', 'colour')):
             continue
         owner = owner_to_index(raw)
         if owner is not None:
             return owner, str(key), raw
     return None, None, None
+
+def valid_city_owner(owner, teams, team_count=None):
+    if owner is None:
+        return None
+    if owner < 0:
+        return None
+    team_count = max(1, int(team_count) if team_count is not None else len(teams or []))
+    if owner >= team_count:
+        return None
+    return owner
 
 def city_object_profile(city, limit=40):
     attrs = attrs_of(city)
@@ -2697,16 +3580,28 @@ def city_profile(game, limit=12):
     cities = native_value(attrs.get('cities'))
     city_positions = native_value(attrs.get('city_positions'))
     city_items = list(cities) if isinstance(cities, (list, tuple)) else []
+    economy_attrs = attrs_of(attrs.get('economy'))
     return {
         'game_id': hex(id(game)) if game is not None else None,
-        'game_city_fields': [str(key) for key in attrs.keys() if 'city' in str(key).lower() or 'capital' in str(key).lower()][:60],
+        'game_city_fields': [
+            str(key) for key in attrs.keys()
+            if 'city' in str(key).lower()
+            or 'capital' in str(key).lower()
+            or str(key).lower() in ('controls', 'owners', 'ownership', 'controllers')
+        ][:80],
+        'economy_city_fields': [
+            str(key) for key in economy_attrs.keys()
+            if 'city' in str(key).lower()
+            or 'capital' in str(key).lower()
+            or str(key).lower() in ('controls', 'owners', 'ownership', 'controllers')
+        ][:80],
         'city_positions_preview': jsonable(city_positions, limit=4),
         'capitals_preview': jsonable(attrs.get('capitals'), limit=8),
         'city_object_count': len(city_items),
         'city_objects': [city_object_profile(city) for city in city_items[:limit]],
     }
 
-def collect_cities(games, teams):
+def collect_cities(games, teams, troops=None):
     if not games:
         return []
     game = games[0]
@@ -2715,8 +3610,15 @@ def collect_cities(games, teams):
     city_objects = native_value(game_attrs.get('cities'))
     positions_list = list(positions) if isinstance(positions, (list, tuple)) else []
     city_list = list(city_objects) if isinstance(city_objects, (list, tuple)) else []
-    capital_indices = capital_city_indices(game_attrs.get('capitals'))
+    capital_owner_by_city = capital_city_owner_map(game_attrs.get('capitals'), positions)
+    capital_indices = set(capital_owner_by_city.keys()) or capital_city_indices(game_attrs.get('capitals'))
     count = max(len(positions_list), len(city_list))
+    team_count = max(len(teams or []), 2)
+    for troop in troops or []:
+        troop_owner = owner_to_index(troop.get('owner'))
+        if troop_owner is not None:
+            team_count = max(team_count, troop_owner + 1)
+    control_sources = city_control_sources(game, game_attrs, count)
     cities = []
     for index in range(count):
         city_obj = city_list[index] if index < len(city_list) else None
@@ -2725,13 +3627,39 @@ def collect_cities(games, teams):
             point = read_position(city_obj)
         if point is None:
             continue
-        owner, owner_source, raw_owner = city_owner_from_obj(city_obj) if city_obj is not None else (None, None, None)
+        owner = None
+        owner_source = None
+        raw_owner = None
+
+        candidate_owner, candidate_source, candidate_raw = city_owner_from_control_sources(control_sources, index)
+        candidate_owner = valid_city_owner(candidate_owner, teams, team_count)
+        if candidate_owner is not None:
+            owner = candidate_owner
+            owner_source = candidate_source
+            raw_owner = candidate_raw
+
+        if owner is None and city_obj is not None:
+            candidate_owner, candidate_source, candidate_raw = city_owner_from_obj(city_obj)
+            candidate_owner = valid_city_owner(candidate_owner, teams, team_count)
+            if candidate_owner is not None:
+                owner = candidate_owner
+                owner_source = candidate_source
+                raw_owner = candidate_raw
+
         if owner is None:
-            owner, owner_source, raw_owner = city_owner_from_game_field(game_attrs, index)
-        if owner is None and index in capital_indices and index < len(teams):
-            owner = index
-            owner_source = 'capitals-index-fallback'
-            raw_owner = index
+            candidate_owner, candidate_source, candidate_raw = city_owner_from_static_game_field(game_attrs, index)
+            candidate_owner = valid_city_owner(candidate_owner, teams, team_count)
+            if candidate_owner is not None:
+                owner = candidate_owner
+                owner_source = candidate_source
+                raw_owner = candidate_raw
+
+        if owner is None and index in capital_owner_by_city:
+            candidate_owner = valid_city_owner(capital_owner_by_city[index], teams, team_count)
+            if candidate_owner is not None:
+                owner = candidate_owner
+                owner_source = 'capitals-owner-map-fallback'
+                raw_owner = candidate_owner
         cities.append({
             'city_id': index,
             'x': point.get('x'),
@@ -2741,6 +3669,10 @@ def collect_cities(games, teams):
             'owner_raw': safe_repr(raw_owner, 80) if raw_owner is not None and not isinstance(raw_owner, (int, float, str, bool)) else raw_owner,
             'capital': index in capital_indices,
         })
+    apply_city_owner_memory(cities)
+    city_counts, city_counts_source = read_team_city_counts(game_attrs, team_count)
+    reconcile_city_owners_with_counts(cities, troops or [], teams, city_counts, city_counts_source)
+    apply_nearby_city_capture_hints(cities, troops or [], teams)
     return cities
 
 def build_teams(replay, games):
@@ -2822,6 +3754,57 @@ def official_map_asset_payload(replay, map_size):
         except Exception as exc:
             record_progress({'stage': 'map-capture', 'status': 'asset-map-failed', 'path': path, 'error': repr(exc)})
     return None
+
+def safe_map_id_from_replay(replay):
+    if not isinstance(replay, Mapping):
+        return None
+    map_id = replay.get('map')
+    if map_id is None:
+        return None
+    safe_map_id = ''.join(ch for ch in str(map_id) if ch.isdigit())
+    return safe_map_id or None
+
+def map_metadata_candidates(replay):
+    safe_map_id = safe_map_id_from_replay(replay)
+    if not safe_map_id:
+        return []
+    file_name = 'generated_map%s.txt' % safe_map_id
+    job_root = os.path.dirname(ARTIFACT_PATH)
+    runtime_root = os.path.dirname(os.path.dirname(job_root))
+    game_dir = os.environ.get('WOD_STEAM_GAME_DIR', r'C:\Program Files (x86)\Steam\steamapps\common\War of Dots')
+    return [
+        os.path.join(runtime_root, 'staged-game', 'map_editor', file_name),
+        os.path.join(os.getcwd(), 'map_editor', file_name),
+        os.path.join(os.path.dirname(sys.executable), 'map_editor', file_name),
+        os.path.join(game_dir, 'map_editor', file_name),
+    ]
+
+def decode_map_metadata_bytes(data):
+    try:
+        data = gzip.decompress(data)
+    except Exception:
+        pass
+    return json.loads(data.decode('utf-8'))
+
+def load_packaged_map_metadata(replay):
+    safe_map_id = safe_map_id_from_replay(replay)
+    if not safe_map_id:
+        return None, None
+    if safe_map_id in MAP_METADATA_CACHE:
+        return MAP_METADATA_CACHE[safe_map_id]
+    for path in map_metadata_candidates(replay):
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, 'rb') as handle:
+                result = (decode_map_metadata_bytes(handle.read()), path)
+                MAP_METADATA_CACHE[safe_map_id] = result
+                return result
+        except Exception as exc:
+            record_progress({'stage': 'map-metadata', 'status': 'metadata-failed', 'path': path, 'error': repr(exc)})
+    result = (None, None)
+    MAP_METADATA_CACHE[safe_map_id] = result
+    return result
 
 def capture_map_image(replay, games, game_scenes):
     primary_game = games[0] if games else None
@@ -2938,6 +3921,8 @@ def score_casualty_counter_key(key, values, nested=False):
     low = str(key).lower()
     if any(word in low for word in ('ratio', 'percent', 'percentage', 'rate', 'color', 'colour', 'sound', 'time', 'tick', 'position')):
         return -100
+    if low in ('casualties', 'troop_casualties', 'strength', 'health_total'):
+        return -100
     score = 0
     if 'casual' in low:
         score += 64
@@ -2954,8 +3939,6 @@ def score_casualty_counter_key(key, values, nested=False):
     finite = [abs(float(value)) for value in values if isinstance(value, (int, float))]
     if finite and max(finite) >= 1000:
         score += 10
-    if low in ('casualties', 'troop_casualties'):
-        score -= 12
     return score
 
 def metric_container_attrs(container):
@@ -3025,17 +4008,64 @@ def normalize_display_fund(value, source):
     if not isinstance(value, (int, float)):
         return value
     source_text = str(source or '').lower()
-    if 'zrtyz' in source_text and abs(float(value)) >= 1000:
-        return int(round(float(value) / 1000.0))
+    if 'zrtyz' in source_text:
+        return int(round(float(value)))
     return value
 
 def normalize_display_casualties(value, source):
-    if not isinstance(value, (int, float)):
-        return value
-    source_text = str(source or '').lower()
-    if 'troop_casualties' in source_text and abs(float(value)) < 10000:
-        return int(round(float(value) * 100.0))
     return value
+
+def estimated_strength_value(raw_strength, alive_units):
+    if not isinstance(raw_strength, (int, float)):
+        return int(round(float(alive_units or 0) * TROOP_DISPLAY_SCALE))
+    value = float(raw_strength)
+    if alive_units and abs(value) <= max(2, alive_units * 2):
+        value *= 100.0
+    return int(round(value * TROOP_DISPLAY_SCALE))
+
+def estimated_casualty_value(raw_casualties, raw_troop_casualties, alive_units):
+    if isinstance(raw_troop_casualties, (int, float)) and (
+        abs(float(raw_troop_casualties)) > 0.000001 or not isinstance(raw_casualties, (int, float))
+    ):
+        return int(round(float(raw_troop_casualties)))
+    if isinstance(raw_casualties, (int, float)):
+        value = float(raw_casualties)
+        if alive_units and abs(value) <= max(2, alive_units * 2):
+            return int(round(value * 100.0))
+        return int(round(value))
+    return 0
+
+def derived_casualty_value(team_index, troops_estimate, alive_units, estimated_casualties):
+    global TEAM_PEAK_TROOPS_ESTIMATE
+    global TEAM_PEAK_ALIVE_UNITS
+    while len(TEAM_PEAK_TROOPS_ESTIMATE) <= team_index:
+        TEAM_PEAK_TROOPS_ESTIMATE.append(None)
+    while len(TEAM_PEAK_ALIVE_UNITS) <= team_index:
+        TEAM_PEAK_ALIVE_UNITS.append(None)
+
+    dynamic_loss = 0
+    current = to_float(troops_estimate)
+    peak = to_float(TEAM_PEAK_TROOPS_ESTIMATE[team_index])
+    if current is not None:
+        if peak is None or current > peak:
+            peak = current
+            TEAM_PEAK_TROOPS_ESTIMATE[team_index] = current
+        if peak is not None and peak > current:
+            dynamic_loss = max(dynamic_loss, int(round(peak - current)))
+
+    current_alive = to_float(alive_units)
+    peak_alive = to_float(TEAM_PEAK_ALIVE_UNITS[team_index])
+    if current_alive is not None:
+        if peak_alive is None or current_alive > peak_alive:
+            peak_alive = current_alive
+            TEAM_PEAK_ALIVE_UNITS[team_index] = current_alive
+        if peak_alive is not None and peak_alive > current_alive:
+            alive_loss = int(round((peak_alive - current_alive) * TROOP_DISPLAY_SCALE))
+            dynamic_loss = max(dynamic_loss, alive_loss)
+
+    if dynamic_loss > 0:
+        return max(dynamic_loss, int(round(float(estimated_casualties or 0))))
+    return int(round(float(estimated_casualties or 0)))
 
 def build_metrics(games, troops, teams):
     metric_timing = {}
@@ -3056,6 +4086,9 @@ def build_metrics(games, troops, teams):
     step_start = timing_start()
     funds, funds_source = read_funds(attrs.get('economy'), team_count)
     timing_end(metric_timing, 'metrics_read_funds', step_start)
+    step_start = timing_start()
+    city_counts, city_counts_source = read_team_city_counts(attrs, team_count)
+    timing_end(metric_timing, 'metrics_read_city_counts', step_start)
     step_start = timing_start()
     displayed_casualties, displayed_casualties_source = read_displayed_casualties(games, team_count)
     timing_end(metric_timing, 'metrics_read_displayed_casualties', step_start)
@@ -3086,8 +4119,13 @@ def build_metrics(games, troops, teams):
         display_casualties = normalize_display_casualties(raw_displayed_casualties, displayed_casualties_source)
         raw_funds = funds[index] if index < len(funds) else None
         display_funds = normalize_display_fund(raw_funds, funds_source)
-        estimated_casualties = int(raw_casualties * 100) if isinstance(raw_casualties, (int, float)) else (
-            int(raw_troop_casualties * 100) if isinstance(raw_troop_casualties, (int, float)) else 0
+        raw_city_count = city_counts[index] if index < len(city_counts) else None
+        estimated_casualties = estimated_casualty_value(raw_casualties, raw_troop_casualties, rollup['alive_units'])
+        troops_estimate = estimated_strength_value(raw_strength, rollup['alive_units'])
+        derived_casualties = derived_casualty_value(index, troops_estimate, rollup['alive_units'], estimated_casualties)
+        displayed_casualty_estimate = int(display_casualties) if isinstance(display_casualties, (int, float)) else None
+        casualty_estimate = derived_casualties if derived_casualties > 0 else (
+            displayed_casualty_estimate if displayed_casualty_estimate is not None else estimated_casualties
         )
         teams_out.append({
             'index': index,
@@ -3095,15 +4133,16 @@ def build_metrics(games, troops, teams):
             'total_units': rollup['total_units'],
             'health_total': round(rollup['health_total'], 2),
             'strength': raw_strength,
-            'troops_estimate': int(raw_strength * 100) if isinstance(raw_strength, (int, float)) else rollup['alive_units'],
+            'troops_estimate': troops_estimate,
             'casualties': raw_casualties,
             'casualties_displayed': display_casualties,
             'displayed_casualties': display_casualties,
-            'casualties_estimate': int(display_casualties) if isinstance(display_casualties, (int, float)) else estimated_casualties,
+            'casualties_estimate': casualty_estimate,
             'troop_casualties': raw_troop_casualties,
             'funds': display_funds,
             'funds_displayed': display_funds,
             'funds_raw': raw_funds,
+            'city_count': raw_city_count,
         })
     return {
         'teams': teams_out,
@@ -3113,6 +4152,7 @@ def build_metrics(games, troops, teams):
             'casualties': 'game.casualties' if casualties else None,
             'troop_casualties': 'game.troop_casualties' if troop_casualties else None,
             'funds': 'game.economy.%s' % funds_source if funds_source else None,
+            'city_count': city_counts_source,
         },
     }
 
@@ -3122,15 +4162,18 @@ def troop_from_obj(obj, slot, context_attrs=None):
     if point is None:
         return None
     alive = read_first_attr(attrs, ('alive', 'is_alive', 'dead', 'is_dead'))
+    health = read_first_attr(attrs, ('health', 'hp'))
     if isinstance(alive, bool) and ('dead' in attrs or 'is_dead' in attrs):
         alive = not alive
     elif alive is None:
         alive = True
+    health_value = to_float(health)
+    if health_value is not None and health_value <= 0:
+        alive = False
     owner = read_first_attr(attrs, ('owner', 'team', 'player', 'color', 'colour'))
     unit_type = read_first_attr(attrs, ('type', 'unit_type', 'kind', 'name', 'dot_type', 'dot_kind', 'ship_info'))
     unit_kind = read_unit_kind(obj, attrs, unit_type)
     ship_state = read_ship_state(attrs)
-    health = read_first_attr(attrs, ('health', 'hp'))
     morale, morale_state = read_unit_morale(obj, attrs, slot, context_attrs=context_attrs)
     projection_lines = read_projection_lines(obj, point) if READ_UNIT_PROJECTION_FIELDS else []
     return {
@@ -3853,18 +4896,8 @@ def step_game_frame(game, method_counts, errors):
     if FAST_FORWARD_STEP_METHOD in ('game-update', 'update', 'core-update'):
         preferred_methods = ('update', 'tick_frame')
     elif FAST_FORWARD_STEP_METHOD in ('manual', 'component', 'components'):
-        component_methods = (
-            'tick_frame',
-            'update_alive_dots',
-            'move_dots',
-            'pay_turn',
-            'dot_production_new',
-            'victory_check',
-            'update_strength',
-            'extract_dot_positions',
-        )
         called = 0
-        for method_name in component_methods:
+        for method_name in FAST_FORWARD_COMPONENT_STEP_METHODS:
             if not hasattr(game, method_name):
                 continue
             method = getattr(game, method_name)
@@ -3899,6 +4932,17 @@ def step_game_frame(game, method_counts, errors):
     errors.append({'method': 'core-step', 'error': 'no callable core step method for %s' % FAST_FORWARD_STEP_METHOD})
     return False
 
+def can_step_game_frame(game):
+    if game is None:
+        return False
+    if FAST_FORWARD_STEP_METHOD in ('manual', 'component', 'components'):
+        return any(hasattr(game, method_name) and callable_no_args(getattr(game, method_name)) for method_name in FAST_FORWARD_COMPONENT_STEP_METHODS)
+    if FAST_FORWARD_STEP_METHOD in ('game-update', 'update', 'core-update'):
+        method_names = ('update', 'tick_frame')
+    else:
+        method_names = ('tick_frame', 'update')
+    return any(hasattr(game, method_name) and callable_no_args(getattr(game, method_name)) for method_name in method_names)
+
 def resolve_fast_forward_frame_budget(frame_budget=None):
     if frame_budget is None:
         frame_budget = FAST_FORWARD_FRAMES_PER_SAMPLE
@@ -3911,6 +4955,8 @@ def fast_forward_game_core(game, replay, end_tick, frame_budget=None):
     global REPLAY_PAYLOAD_CURSOR
     frames_per_sample = resolve_fast_forward_frame_budget(frame_budget)
     if not FAST_FORWARD_CORE or frames_per_sample <= 0 or game is None:
+        return None
+    if not can_step_game_frame(game):
         return None
     payloads = get_replay_payload_cache(replay)
     method_counts = {}
@@ -3960,6 +5006,8 @@ def fast_forward_scene_controller(scene, end_tick, frame_budget=None):
         return None
     if not callable(download_data):
         return None
+    if not can_step_game_frame(game):
+        return None
     method_counts = {}
     errors = []
     start_tick = read_tick([game])
@@ -3997,7 +5045,7 @@ def drive_game_with_replay(game, replay, index):
     data = payloads[index % len(payloads)][1] if payloads else None
     if data is not None:
         calls.append(apply_replay_payload_to_game(game, data, tick))
-    for method_name in ('tick_frame', 'update_alive_dots', 'move_dots', 'update_strength', 'extract_dot_positions', 'update'):
+    for method_name in ('tick_frame', 'pay_turn', 'dot_production_new', 'update_alive_dots', 'move_dots', 'update_strength', 'extract_dot_positions', 'update'):
         if hasattr(game, method_name) and callable_no_args(getattr(game, method_name)):
             try:
                 getattr(game, method_name)()
@@ -4059,14 +5107,14 @@ def collect_troops_from_cache(limit=600):
 
 def collect_troops(candidates, limit=600, refresh=False):
     global TROOP_SOURCE_CACHE
-    if not refresh:
+    if not refresh and TROOP_SOURCE_CACHE:
         cached = collect_troops_from_cache(limit=limit)
         if cached:
             return cached
-
     seen = set()
     troops = []
     source_entries = []
+    nested_container_seen = set()
 
     def iter_children(value):
         if isinstance(value, Mapping):
@@ -4074,11 +5122,24 @@ def collect_troops(candidates, limit=600, refresh=False):
                 yield child_slot, child
             return
         try:
-            values = list(value)[:limit]
+            iterator = iter(value)
         except Exception:
             return
-        for child_slot, child in enumerate(values):
+        for child_slot, child in enumerate(iterator):
+            if child_slot >= limit:
+                break
             yield child_slot, child
+
+    def can_descend_troop_container(value):
+        if value is None or isinstance(value, (str, bytes, bytearray, bool, int, float)):
+            return False
+        if isinstance(value, Mapping) or isinstance(value, (list, tuple, set)):
+            return True
+        try:
+            iter(value)
+            return True
+        except Exception:
+            return False
 
     def consider(obj, slot=None, context_attrs=None, parent=None):
         if id(obj) in seen:
@@ -4090,6 +5151,24 @@ def collect_troops(candidates, limit=600, refresh=False):
             troops.append(troop)
             source_entries.append({'obj': obj, 'slot': normalized_slot, 'parent': parent})
 
+    def scan_troop_container(value, context_attrs=None, parent=None, depth=0):
+        if len(troops) >= limit or depth > 3 or not can_descend_troop_container(value):
+            return
+        container_id = id(value)
+        if container_id in nested_container_seen:
+            return
+        nested_container_seen.add(container_id)
+        for child_slot, child in iter_children(value):
+            if len(troops) >= limit:
+                break
+            before_count = len(troops)
+            consider(child, child_slot, context_attrs, parent)
+            if len(troops) > before_count:
+                source_entries[-1]['nested_depth'] = depth
+                continue
+            if can_descend_troop_container(child):
+                scan_troop_container(child, context_attrs=context_attrs, parent=parent, depth=depth + 1)
+
     for obj in candidates:
         consider(obj)
         attrs = attrs_of(obj)
@@ -4100,16 +5179,17 @@ def collect_troops(candidates, limit=600, refresh=False):
             if not any(word in low for word in ('dot', 'unit', 'troop', 'alive', 'enemy', 'friendly')):
                 continue
             try:
-                for child_slot, child in iter_children(value):
-                    consider(child, child_slot, attrs, obj)
-                    if len(troops) >= limit:
-                        break
+                scan_troop_container(value, context_attrs=attrs, parent=obj)
             except Exception:
                 continue
         if len(troops) >= limit:
             break
 
-    if not troops:
+    if troops:
+        TROOP_SOURCE_CACHE[:] = source_entries
+        return troops
+
+    if refresh or not TROOP_SOURCE_CACHE:
         for obj in gc.get_objects():
             consider(obj)
             if len(troops) >= limit:
@@ -4339,6 +5419,89 @@ def metric_number(team, *keys):
             return value
     return None
 
+def city_owner_summary(cities, metrics=None):
+    owner_counts = {}
+    source_counts = {}
+    controlled_count = 0
+    for city in cities or []:
+        owner = city.get('owner')
+        if owner is not None:
+            controlled_count += 1
+            owner_key = str(owner)
+            owner_counts[owner_key] = owner_counts.get(owner_key, 0) + 1
+        source = city.get('owner_source')
+        source_key = str(source) if source is not None else 'none'
+        source_counts[source_key] = source_counts.get(source_key, 0) + 1
+
+    expected = []
+    teams = metrics.get('teams') if isinstance(metrics, Mapping) else None
+    if isinstance(teams, list):
+        for team in teams:
+            value = metric_number(team, 'city_count')
+            expected.append(int(round(value)) if value is not None else None)
+
+    observed = []
+    if expected:
+        for index in range(len(expected)):
+            observed.append(owner_counts.get(str(index), 0))
+
+    mismatch = False
+    if expected and any(value is not None for value in expected):
+        expected_numeric = [value if value is not None else 0 for value in expected]
+        mismatch = observed != expected_numeric
+
+    return {
+        'count': len(cities or []),
+        'controlled_count': controlled_count,
+        'owner_counts': owner_counts,
+        'owner_source_counts': source_counts,
+        'expected_owner_counts': expected,
+        'observed_owner_counts': observed,
+        'owner_count_mismatch': mismatch,
+    }
+
+def city_owner_state(cities):
+    state = {}
+    for city in cities or []:
+        city_id = city.get('city_id')
+        if city_id is None:
+            continue
+        state[str(city_id)] = {
+            'city_id': city_id,
+            'owner': city.get('owner'),
+            'owner_source': city.get('owner_source'),
+            'owner_raw': city.get('owner_raw'),
+            'x': city.get('x'),
+            'y': city.get('y'),
+        }
+    return state
+
+def city_owner_transitions(previous_state, cities, sample_index, tick):
+    current_state = city_owner_state(cities)
+    if previous_state is None:
+        return current_state, []
+    transitions = []
+    for city_id, current in current_state.items():
+        previous = previous_state.get(city_id)
+        if previous is None:
+            continue
+        if previous.get('owner') == current.get('owner'):
+            continue
+        transitions.append({
+            'sample_index': sample_index,
+            'tick': tick,
+            'city_id': current.get('city_id'),
+            'from_owner': previous.get('owner'),
+            'to_owner': current.get('owner'),
+            'from_source': previous.get('owner_source'),
+            'to_source': current.get('owner_source'),
+            'from_raw': previous.get('owner_raw'),
+            'to_raw': current.get('owner_raw'),
+            'x': current.get('x'),
+            'y': current.get('y'),
+        })
+    return current_state, transitions
+
 def scoreboard_stats_from_samples(samples):
     metric_samples = [
         sample for sample in samples
@@ -4366,15 +5529,15 @@ def scoreboard_stats_from_samples(samples):
         start = metric_number(first_team, 'troops_estimate')
         if start is None:
             strength = metric_number(first_team, 'strength')
-            start = strength * 100 if strength is not None else None
+            start = strength if strength is not None else None
         final = metric_number(last_team, 'troops_estimate')
         if final is None:
             strength = metric_number(last_team, 'strength')
-            final = strength * 100 if strength is not None else None
-        casualties = metric_number(last_team, 'displayed_casualties', 'casualties_displayed', 'casualties_estimate')
+            final = strength if strength is not None else None
+        casualties = metric_number(last_team, 'casualties_estimate', 'displayed_casualties', 'casualties_displayed')
         if casualties is None:
             raw_casualties = metric_number(last_team, 'troop_casualties', 'casualties')
-            casualties = raw_casualties * 100 if raw_casualties is not None else 0
+            casualties = raw_casualties if raw_casualties is not None else 0
         start_troops.append(int(start) if start is not None else None)
         final_troops.append(int(final) if final is not None else None)
         final_casualties.append(int(casualties) if casualties is not None else 0)
@@ -4393,6 +5556,89 @@ def scoreboard_stats_from_samples(samples):
         'casualty_total': int(casualty_total),
         'strength_drop_ratio': round(strength_drop_ratio, 4),
         'casualty_ratio': round(casualty_ratio, 4),
+    }
+
+def city_stats_from_samples(samples):
+    checked_samples = 0
+    city_sample_count = 0
+    mismatches = []
+    transient_mismatches = []
+    last_expected = []
+    last_observed = []
+    records = []
+    for sample in samples:
+        metrics = sample.get('metrics') if isinstance(sample, Mapping) else None
+        teams = metrics.get('teams') if isinstance(metrics, Mapping) else None
+        if not isinstance(teams, list):
+            continue
+        expected = []
+        for team in teams:
+            value = metric_number(team, 'city_count')
+            expected.append(int(round(value)) if value is not None else None)
+        if not any(value is not None for value in expected):
+            continue
+        checked_samples += 1
+        cities = sample.get('cities') or []
+        if cities:
+            city_sample_count += 1
+        observed = []
+        for index in range(len(expected)):
+            observed.append(sum(1 for city in cities if city.get('owner') == index))
+        last_expected = expected
+        last_observed = observed
+        expected_numeric = [value if value is not None else 0 for value in expected]
+        records.append({
+            'sample_index': sample.get('sample_index'),
+            'tick': sample.get('tick'),
+            'observed': observed,
+            'expected': expected,
+            'expected_numeric': expected_numeric,
+            'has_cities': bool(cities),
+        })
+
+    for index, record in enumerate(records):
+        if not record.get('has_cities') or record.get('observed') == record.get('expected_numeric'):
+            continue
+        previous_record = records[index - 1] if index > 0 else None
+        next_record = records[index + 1] if index + 1 < len(records) else None
+        owner_changed_now = (
+            previous_record is not None
+            and previous_record.get('observed') != record.get('observed')
+        )
+        counter_catches_up_next = (
+            next_record is not None
+            and next_record.get('expected_numeric') == record.get('observed')
+        )
+        if owner_changed_now and counter_catches_up_next:
+            if len(transient_mismatches) < 12:
+                transient_mismatches.append({
+                    'sample_index': record.get('sample_index'),
+                    'tick': record.get('tick'),
+                    'observed': record.get('observed'),
+                    'expected': record.get('expected'),
+                    'next_expected': next_record.get('expected'),
+                    'reason': 'city owner changed before aggregate counter caught up',
+                })
+            continue
+        if len(mismatches) < 12:
+            mismatches.append({
+                'sample_index': record.get('sample_index'),
+                'tick': record.get('tick'),
+                'observed': record.get('observed'),
+                'expected': record.get('expected'),
+            })
+    expected_total = sum(value for value in last_expected if isinstance(value, int))
+    return {
+        'available': checked_samples > 0,
+        'checked_samples': checked_samples,
+        'city_sample_count': city_sample_count,
+        'expected_city_total': expected_total,
+        'last_expected': last_expected,
+        'last_observed': last_observed,
+        'mismatch_count': len(mismatches),
+        'mismatches': mismatches,
+        'transient_mismatch_count': len(transient_mismatches),
+        'transient_mismatches': transient_mismatches,
     }
 
 def validate_samples(samples, replay=None):
@@ -4432,6 +5678,7 @@ def validate_samples(samples, replay=None):
         required_live_span = max(60, min(160, replay_motion['max_span'] * 0.18))
         motion_plausible = live_motion['max_span'] >= required_live_span
     scoreboard = scoreboard_stats_from_samples(samples)
+    city_stats = city_stats_from_samples(samples)
     required_scoreboard_drop = 0
     scoreboard_plausible = True
     if live_tick_span >= 3000 and scoreboard.get('available') and scoreboard.get('start_total', 0) >= 100000:
@@ -4460,6 +5707,11 @@ def validate_samples(samples, replay=None):
         warnings.append(
             'scoreboard counters changed less than expected; accepting capture because live ticks and positions advanced'
         )
+    if city_stats.get('available') and city_stats.get('expected_city_total', 0) > 0:
+        if city_stats.get('city_sample_count', 0) < 2:
+            blocking_reasons.append('live city polling did not expose city objects')
+        elif city_stats.get('mismatch_count', 0) > 0:
+            blocking_reasons.append('live city owner totals did not match city counters')
     valid = (
         len(samples) >= 2
         and game_sample_count >= 2
@@ -4468,6 +5720,14 @@ def validate_samples(samples, replay=None):
         and positions_changed
         and motion_plausible
         and synthetic_tick_count < len(samples)
+        and (
+            not city_stats.get('available')
+            or city_stats.get('expected_city_total', 0) <= 0
+            or (
+                city_stats.get('city_sample_count', 0) >= 2
+                and city_stats.get('mismatch_count', 0) == 0
+            )
+        )
     )
     return {
         'tick_advanced': tick_advanced,
@@ -4477,6 +5737,7 @@ def validate_samples(samples, replay=None):
         'live_motion': live_motion,
         'replay_motion': replay_motion,
         'scoreboard': scoreboard,
+        'city_stats': city_stats,
         'required_live_motion_span': round(required_live_span, 3),
         'required_scoreboard_drop_ratio': required_scoreboard_drop,
         'warnings': warnings,
@@ -4529,6 +5790,8 @@ def build_live_stats_payload(
             'troop_slots_seen': effective_troop_slots_seen,
             'city_count': len(last_sample.get('cities', [])) if samples else 0,
             'controlled_city_count': len([city for city in last_sample.get('cities', []) if city.get('owner') is not None]) if samples else 0,
+            'bridge_count': len(last_sample.get('bridges', [])) if samples else 0,
+            'projection_line_count': len(last_sample.get('projection_lines', [])) if samples else 0,
             'result': request.get('replay_metadata', {}).get('result'),
             'end_tick': request.get('replay_metadata', {}).get('end'),
             'replay_sample_hz': REPLAY_SAMPLE_HZ,
@@ -4545,6 +5808,7 @@ def build_live_stats_payload(
             'fast_forward_core': FAST_FORWARD_CORE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
+            'fast_forward_component_methods': list(FAST_FORWARD_COMPONENT_STEP_METHODS),
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
             'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
@@ -4588,6 +5852,8 @@ def build_partial_meta_payload(
             'troop_slots_seen': effective_troop_slots_seen,
             'city_count': len(last_sample.get('cities', [])) if samples else 0,
             'controlled_city_count': len([city for city in last_sample.get('cities', []) if city.get('owner') is not None]) if samples else 0,
+            'bridge_count': len(last_sample.get('bridges', [])) if samples else 0,
+            'projection_line_count': len(last_sample.get('projection_lines', [])) if samples else 0,
             'result': request.get('replay_metadata', {}).get('result'),
             'end_tick': request.get('replay_metadata', {}).get('end'),
             'replay_sample_hz': REPLAY_SAMPLE_HZ,
@@ -4604,6 +5870,7 @@ def build_partial_meta_payload(
             'fast_forward_core': FAST_FORWARD_CORE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
+            'fast_forward_component_methods': list(FAST_FORWARD_COMPONENT_STEP_METHODS),
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
             'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
@@ -4709,6 +5976,7 @@ try:
             'fast_forward_core': FAST_FORWARD_CORE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
+            'fast_forward_component_methods': list(FAST_FORWARD_COMPONENT_STEP_METHODS),
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
             'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
@@ -4756,6 +6024,7 @@ try:
             'target_ticks_per_poll': TARGET_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'fast_forward_controller': FAST_FORWARD_CONTROLLER,
             'fast_forward_step_method': FAST_FORWARD_STEP_METHOD,
+            'fast_forward_component_methods': list(FAST_FORWARD_COMPONENT_STEP_METHODS),
             'fast_forward_frames_per_sample': FAST_FORWARD_FRAMES_PER_SAMPLE,
             'max_fast_forward_frames_per_sample': MAX_FAST_FORWARD_FRAMES_PER_SAMPLE,
             'capture_throttle_seconds': CAPTURE_THROTTLE_SECONDS,
@@ -4766,6 +6035,8 @@ try:
         previous_sample_tick = None
         previous_rate_tick = None
         previous_rate_ms = None
+        previous_city_owner_state = None
+        city_owner_transition_total = 0
         active_fast_forward_frames = FAST_FORWARD_FRAMES_PER_SAMPLE
         last_pump_frame_budget = None
         last_pump_timing_ms = None
@@ -4814,12 +6085,25 @@ try:
             step_start = timing_start()
             sample_projection_lines = read_sample_projection_lines(games, game_scenes) if READ_SCENE_PROJECTION_LINES else []
             timing_end(sample_timing, 'read_scene_projection_lines', step_start)
+            step_start = timing_start()
+            sample_bridges = read_sample_bridges(replay, games, game_scenes)
+            timing_end(sample_timing, 'read_bridges', step_start)
             if index < 12:
                 artifact.setdefault('projection_line_attach', []).append(projection_attach)
                 artifact.setdefault('sample_projection_line_counts', []).append({
                     'sample_index': index,
                     'tick': sample_tick,
                     'count': len(sample_projection_lines),
+                })
+                artifact.setdefault('sample_bridge_counts', []).append({
+                    'sample_index': index,
+                    'tick': sample_tick,
+                    'count': len(sample_bridges),
+                })
+                artifact.setdefault('geometry_field_profiles', []).append({
+                    'sample_index': index,
+                    'tick': sample_tick,
+                    'profile': geometry_field_profile(games, game_scenes),
                 })
             if map_payload is None and (games or game_scenes):
                 step_start = timing_start()
@@ -4828,20 +6112,28 @@ try:
                 artifact['map_capture'] = summarize_map_payload(map_payload)
             step_start = timing_start()
             teams = build_teams(replay, games)
-            cities = collect_cities(games, teams)
+            cities = collect_cities(games, teams, troops)
             timing_end(sample_timing, 'collect_cities', step_start)
-            if index < 12:
-                artifact.setdefault('city_counts', []).append({
-                    'sample_index': index,
-                    'tick': sample_tick,
-                    'count': len(cities),
-                    'controlled_count': len([city for city in cities if city.get('owner') is not None]),
-                })
             if index == 0 and games:
                 artifact['city_profile'] = city_profile(games[0])
             step_start = timing_start()
             metrics = build_metrics(games, troops, teams)
             timing_end(sample_timing, 'build_metrics', step_start)
+            city_summary = city_owner_summary(cities, metrics)
+            previous_city_owner_state, city_owner_changes = city_owner_transitions(previous_city_owner_state, cities, index, sample_tick)
+            if index == 0:
+                artifact['city_initial_owners'] = list(previous_city_owner_state.values()) if previous_city_owner_state else []
+            if city_owner_changes:
+                city_owner_transition_total += len(city_owner_changes)
+                transitions = artifact.setdefault('city_owner_transitions', [])
+                remaining_transition_slots = max(0, 200 - len(transitions))
+                if remaining_transition_slots > 0:
+                    transitions.extend(city_owner_changes[:remaining_transition_slots])
+            if index < 12:
+                artifact.setdefault('city_counts', []).append(dict({
+                    'sample_index': index,
+                    'tick': sample_tick,
+                }, **city_summary))
             now_ms = int(time.time() * 1000)
             actual_game_seconds_per_wall_second = None
             tick_delta = None
@@ -4867,12 +6159,14 @@ try:
                 'game_scene_ids': [hex(id(scene)) for scene in game_scenes[:3]],
                 'troops': troops,
                 'cities': cities,
+                'bridges': sample_bridges,
                 'projection_lines': sample_projection_lines,
                 'metrics': metrics,
                 'events': {
                     'timing_ms': sample_timing,
                     'previous_pump_ms': round(last_pump_timing_ms, 3) if last_pump_timing_ms is not None else None,
                     'troop_cache_refresh': refresh_troop_cache,
+                    'city_owner_transitions': city_owner_changes,
                 },
             }
             if completion.get('done'):
@@ -4911,8 +6205,15 @@ try:
                 'game_object_count': len(games),
                 'game_scene_count': len(game_scenes),
                 'troop_count': len(troops),
-                'city_count': len(cities),
-                'controlled_city_count': len([city for city in cities if city.get('owner') is not None]),
+                'city_count': city_summary.get('count'),
+                'controlled_city_count': city_summary.get('controlled_count'),
+                'city_owner_counts': city_summary.get('owner_counts'),
+                'city_owner_source_counts': city_summary.get('owner_source_counts'),
+                'city_expected_owner_counts': city_summary.get('expected_owner_counts'),
+                'city_observed_owner_counts': city_summary.get('observed_owner_counts'),
+                'city_owner_count_mismatch': city_summary.get('owner_count_mismatch'),
+                'city_owner_transitions': city_owner_changes,
+                'bridge_count': len(sample_bridges),
                 'projection_line_count': len(sample_projection_lines),
                 'target_sim_speed': TARGET_SIM_SPEED,
                 'target_game_seconds_per_wall_second': TARGET_GAME_SECONDS_PER_WALL_SECOND,
@@ -4969,6 +6270,7 @@ try:
                 artifact['economy_profile'] = economy_profile(attrs_of(games[0]).get('economy'), max(len(teams), 2))
             except Exception as exc:
                 artifact['economy_profile'] = {'error': repr(exc)}
+        artifact['city_owner_transition_count'] = city_owner_transition_total
 
     validation = validate_samples(samples, replay)
     validation['total_sample_count'] = sample_count_total
@@ -5030,7 +6332,7 @@ function Invoke-GamePythonCapture([string]$Id) {
         throw "Python probe DLL is not built: $builtDll"
     }
 
-    $probeRoot = Join-Path $ShareRoot 'probes\game-live-python-capture'
+    $probeRoot = Join-Path $jobRoot 'probe\game-live-python-capture'
     New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
     $probeDll = Join-Path $probeRoot 'wod_python_probe.dll'
     $payloadPath = Join-Path $probeRoot 'wod_python_probe_payload.py'
@@ -5051,13 +6353,10 @@ function Invoke-GamePythonCapture([string]$Id) {
     $maxSamples = [Math]::Max(2, [Math]::Min(50000, $SampleHz * $captureSeconds))
     Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath $statsPath -ArtifactPath $artifactPath -Mode 'capture-live-replay' -SampleHz $SampleHz -MaxSamples $maxSamples) -Encoding UTF8
 
-    $mutex = New-Object System.Threading.Mutex($false, 'Global\WodReplayCapture')
-    Wait-CaptureMutex -Mutex $mutex -CurrentJobId $Id
-
     $process = $null
     $slotState = $null
-    $existingGamePids = Get-GameProcessIds
     try {
+        [void](Use-JobGameRuntime -Id $Id)
         $slotState = Prepare-ReplaySlot -Id $Id
         $process = Start-GameProcess -OwnerJobId $Id
         $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
@@ -5085,9 +6384,11 @@ function Invoke-GamePythonCapture([string]$Id) {
         }
 
         if (-not (Test-Path -LiteralPath $statsPath)) {
-            $errorPath = $statsPath + '.error.txt'
-            $message = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw } else { 'Game Python capture did not produce stats.json.' }
-            throw $message
+            if (-not (Publish-PartialStatsIfAvailable -StatsPath $statsPath)) {
+                $errorPath = $statsPath + '.error.txt'
+                $message = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw } else { 'Game Python capture did not produce stats.json.' }
+                throw $message
+            }
         }
 
         $stats = Read-JsonFile $statsPath
@@ -5103,12 +6404,10 @@ function Invoke-GamePythonCapture([string]$Id) {
         }
         exit 0
     } finally {
-        Stop-CaptureGameProcess -Process $process -OwnerJobId $Id
-        Stop-NewGameProcesses $existingGamePids
+        [void](Stop-CaptureGameProcess -Process $process -OwnerJobId $Id)
         Close-AutomationDesktop
         Restore-ReplaySlot $slotState
-        $mutex.ReleaseMutex()
-        $mutex.Dispose()
+        Clear-JobGameRuntime -Id $Id
     }
 }
 
@@ -5125,7 +6424,7 @@ function Invoke-LiveStateExperiment([string]$Id, [string]$Mode) {
         throw "Python probe DLL is not built: $builtDll"
     }
 
-    $probeRoot = Join-Path $ShareRoot "probes\$Mode"
+    $probeRoot = Join-Path $jobRoot "probe\$Mode"
     New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
     $probeDll = Join-Path $probeRoot 'wod_python_probe.dll'
     $payloadPath = Join-Path $probeRoot 'wod_python_probe_payload.py'
@@ -5138,13 +6437,10 @@ function Invoke-LiveStateExperiment([string]$Id, [string]$Mode) {
     $sampleCount = if ($Mode -eq 'probe-replay-state') { 1 } else { [Math]::Max(2, [Math]::Min(240, $SampleHz * [Math]::Min($MaxSeconds, 30))) }
     Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath $statsPath -ArtifactPath $artifactPath -Mode $Mode -SampleHz $SampleHz -MaxSamples $sampleCount) -Encoding UTF8
 
-    $mutex = New-Object System.Threading.Mutex($false, 'Global\WodReplayCapture')
-    Wait-CaptureMutex -Mutex $mutex -CurrentJobId $Id
-
     $process = $null
     $slotState = $null
-    $existingGamePids = Get-GameProcessIds
     try {
+        [void](Use-JobGameRuntime -Id $Id)
         $slotState = Prepare-ReplaySlot -Id $Id
         $process = Start-GameProcess -OwnerJobId $Id
         $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
@@ -5189,12 +6485,10 @@ function Invoke-LiveStateExperiment([string]$Id, [string]$Mode) {
         }
         exit 0
     } finally {
-        Stop-CaptureGameProcess -Process $process -OwnerJobId $Id
-        Stop-NewGameProcesses $existingGamePids
+        [void](Stop-CaptureGameProcess -Process $process -OwnerJobId $Id)
         Close-AutomationDesktop
         Restore-ReplaySlot $slotState
-        $mutex.ReleaseMutex()
-        $mutex.Dispose()
+        Clear-JobGameRuntime -Id $Id
     }
 }
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import ctypes
 import json
 import os
 from pathlib import Path
 import sys
+import time
 from threading import Lock
 from types import SimpleNamespace
 from typing import Any
@@ -15,10 +18,45 @@ from .local_runner import LocalSessionRunner
 from .replay import ReplayValidationError, validate_replay
 from .stage_game import stage_game
 from .storage import JobPaths, JobStore
-from .synthesis import synthesize_replay
+from .synthesis import MAX_INLINE_STATS_BYTES, synthesize_replay
 
 
 AUTHORITATIVE_CAPTURE_SOURCES = {"game-live-python", "memory", "local-session-memory-capture"}
+ORPHAN_UPLOAD_MAX_AGE_SECONDS = 60 * 60
+STAGE_GAME_MUTEX_NAME = "Global\\MoreOfDotsStageGame"
+
+
+@contextmanager
+def _stage_game_mutex(timeout_seconds: int = 120):
+    if os.name != "nt":
+        yield
+        return
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel32.ReleaseMutex.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    handle = kernel32.CreateMutexW(None, False, STAGE_GAME_MUTEX_NAME)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "CreateMutexW failed for staged game lock")
+
+    acquired = False
+    try:
+        wait = kernel32.WaitForSingleObject(handle, max(1, timeout_seconds) * 1000)
+        if wait not in (0, 0x80):
+            raise TimeoutError(f"Timed out waiting for staged game lock after {timeout_seconds}s.")
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
 
 
 def _json_default(value: Any) -> str:
@@ -155,12 +193,133 @@ def _capture_public_summary(capture: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _sample_stream_path(paths: JobPaths) -> Path:
+    return paths.stats_path.with_name(paths.stats_path.name + ".samples.jsonl")
+
+
+def _write_sample_stream_if_needed(stream_path: Path, samples: list[Any]) -> None:
+    if not samples or (stream_path.exists() and stream_path.stat().st_size > 0):
+        return
+    with stream_path.open("w", encoding="utf-8") as handle:
+        for sample in samples:
+            if isinstance(sample, dict):
+                handle.write(json.dumps(sample, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _metadata_only_stats(stats: dict[str, Any], stream_path: Path) -> dict[str, Any]:
+    metadata = dict(stats)
+    samples = stats.get("samples")
+    sample_count = len(samples) if isinstance(samples, list) else 0
+    summary = dict(stats.get("summary")) if isinstance(stats.get("summary"), dict) else {}
+    if sample_count and not isinstance(summary.get("sample_count"), int):
+        summary["sample_count"] = sample_count
+    summary["embedded_sample_count"] = 0
+    summary["sample_stream_path"] = str(stream_path)
+    metadata["summary"] = summary
+    metadata["samples"] = []
+    return metadata
+
+
+def _write_metadata_only_stats(paths: JobPaths, stats: dict[str, Any]) -> None:
+    samples = stats.get("samples")
+    stream_path = _sample_stream_path(paths)
+    if isinstance(samples, list):
+        _write_sample_stream_if_needed(stream_path, samples)
+    paths.stats_path.write_text(
+        json.dumps(_metadata_only_stats(stats, stream_path), indent=2),
+        encoding="utf-8",
+    )
+
+
+def _stats_summary_from_file(stats_path: Path) -> dict[str, Any] | None:
+    try:
+        if not stats_path.exists() or stats_path.stat().st_size > MAX_INLINE_STATS_BYTES:
+            return None
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(stats, dict):
+        return None
+    return _stats_public_summary(stats)
+
+
+def _compact_existing_stats_file(paths: JobPaths) -> None:
+    if not paths.stats_path.exists():
+        return
+    stream_path = _sample_stream_path(paths)
+    try:
+        stats_size = paths.stats_path.stat().st_size
+    except OSError:
+        return
+
+    if stats_size > MAX_INLINE_STATS_BYTES:
+        meta_path = paths.stats_path.with_name(paths.stats_path.name + ".partial.meta.json")
+        if not stream_path.exists() or not meta_path.exists():
+            return
+        try:
+            if meta_path.stat().st_size > MAX_INLINE_STATS_BYTES:
+                return
+            stats = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(stats, dict):
+            return
+        summary = dict(stats.get("summary")) if isinstance(stats.get("summary"), dict) else {}
+        summary["partial"] = False
+        stats["summary"] = summary
+        _write_metadata_only_stats(paths, stats)
+        return
+
+    try:
+        stats = json.loads(paths.stats_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(stats, dict) and isinstance(stats.get("samples"), list) and stats["samples"]:
+        _write_metadata_only_stats(paths, stats)
+
+
+def _cleanup_orphan_uploads(runtime_dir: Path) -> dict[str, Any]:
+    uploads_dir = runtime_dir / "desktop-uploads"
+    if not uploads_dir.exists():
+        return {"removed_files": 0, "removed_bytes": 0}
+
+    now = time.time()
+    removed_files = 0
+    removed_bytes = 0
+    for path in uploads_dir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if now - path.stat().st_mtime < ORPHAN_UPLOAD_MAX_AGE_SECONDS:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        removed_files += 1
+        removed_bytes += size
+    return {"removed_files": removed_files, "removed_bytes": removed_bytes}
+
+
+def _cleanup_runtime(ctx, *, preserve_job_ids: set[str] | None = None) -> dict[str, Any]:
+    return {
+        "uploads": _cleanup_orphan_uploads(ctx.settings.runtime_dir),
+        "jobs": ctx.store.prune_finished_jobs(
+            max_bytes=ctx.settings.runtime_jobs_max_bytes,
+            preserve_job_ids=preserve_job_ids or set(),
+        ),
+    }
+
+
 def _finalize_capture(ctx, paths: JobPaths, capture: dict[str, Any]) -> None:
-    if capture.get("stats"):
-        paths.stats_path.write_text(
-            json.dumps(capture["stats"], indent=2),
-            encoding="utf-8",
-        )
+    stats = capture.get("stats")
+    if isinstance(stats, dict):
+        _write_metadata_only_stats(paths, stats)
+    else:
+        _compact_existing_stats_file(paths)
+    stats_summary = _stats_summary_from_file(paths.stats_path)
+    if stats_summary is not None:
+        capture["stats_summary"] = stats_summary
 
     public_capture = _capture_public_summary(capture)
     paths.capture_result_path.write_text(json.dumps(public_capture, indent=2), encoding="utf-8")
@@ -286,6 +445,7 @@ def _run_capture_job(ctx, job_id: str) -> None:
 
 def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> dict[str, Any]:
     ctx = _load_backend(runtime_dir, owner_pid)
+    cleanup = _cleanup_runtime(ctx)
     settings = ctx.settings
     runner = ctx.replay_runner.describe()
     return {
@@ -298,6 +458,8 @@ def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> di
         "address_profile_dir": str(settings.address_profile_dir),
         "capture_sample_hz": settings.capture_sample_hz,
         "capture_source": settings.capture_source,
+        "runtime_jobs_max_bytes": settings.runtime_jobs_max_bytes,
+        "runtime_cleanup": cleanup,
         "runner": runner,
         "debug_tools": _debug_tool_inventory(settings),
     }
@@ -306,12 +468,14 @@ def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> di
 def command_stage_game(runtime_dir: Path | None, owner_pid: int | None = None) -> dict[str, Any]:
     ctx = _load_backend(runtime_dir, owner_pid)
     with ctx.stage_lock:
-        result = stage_game(ctx.settings.steam_game_dir, ctx.settings.staged_game_dir)
+        with _stage_game_mutex():
+            result = stage_game(ctx.settings.steam_game_dir, ctx.settings.staged_game_dir)
     return {"status": "staged", **result}
 
 
 def command_list_jobs(runtime_dir: Path | None, limit: int, owner_pid: int | None = None) -> dict[str, Any]:
     ctx = _load_backend(runtime_dir, owner_pid)
+    _cleanup_runtime(ctx)
     bounded_limit = min(max(limit, 1), 100)
     return {"jobs": [_job_response(job) for job in ctx.store.list_jobs(limit=bounded_limit)]}
 
@@ -329,8 +493,9 @@ def command_capture_file(
     owner_pid: int | None = None,
 ) -> dict[str, Any]:
     ctx = _load_backend(runtime_dir, owner_pid)
+    _cleanup_runtime(ctx)
     raw = input_path.read_bytes()
-    paths = ctx.store.create_job(filename or input_path.name)
+    paths = ctx.store.create_job(filename or input_path.name, owner_pid=owner_pid)
     ctx.store.append_log(paths, f"Created desktop capture job for {filename or input_path.name!r}.")
 
     if len(raw) > ctx.settings.max_replay_bytes:
@@ -351,12 +516,24 @@ def command_capture_file(
     ctx.store.update_job(paths, metadata=document.metadata)
 
     _run_capture_job(ctx, paths.job_id)
+    _cleanup_runtime(ctx, preserve_job_ids={paths.job_id})
     return _job_response(ctx.store.read_job(paths))
+
+
+def command_release_job_artifacts(
+    runtime_dir: Path | None,
+    job_id: str,
+    owner_pid: int | None = None,
+) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
+    release = ctx.store.release_job_artifacts(job_id)
+    cleanup = _cleanup_runtime(ctx, preserve_job_ids={job_id})
+    return {"status": "ok", "release": release, "cleanup": cleanup}
 
 
 def _create_capture_job(ctx, input_path: Path, filename: str | None):
     raw = input_path.read_bytes()
-    paths = ctx.store.create_job(filename or input_path.name)
+    paths = ctx.store.create_job(filename or input_path.name, owner_pid=ctx.replay_runner.owner_pid)
     ctx.store.append_log(paths, f"Created desktop probe job for {filename or input_path.name!r}.")
 
     if len(raw) > ctx.settings.max_replay_bytes:
@@ -407,6 +584,7 @@ def command_probe_file(
             timeout_seconds=ctx.settings.capture_timeout_seconds,
         )
         _finalize_capture(ctx, paths, capture)
+        _cleanup_runtime(ctx, preserve_job_ids={paths.job_id})
         result = _capture_public_summary(capture)
     else:
         raise ValueError(f"Unknown probe mode: {mode}")
@@ -442,6 +620,10 @@ def run(argv: list[str] | None = None) -> int:
             if not args.job_id:
                 raise ValueError("--job-id is required for job.")
             payload = command_job(args.runtime_dir, args.job_id, args.owner_pid)
+        elif args.desktop_command == "release-job-artifacts":
+            if not args.job_id:
+                raise ValueError("--job-id is required for release-job-artifacts.")
+            payload = command_release_job_artifacts(args.runtime_dir, args.job_id, args.owner_pid)
         elif args.desktop_command == "capture-file":
             if args.input is None:
                 raise ValueError("--input is required for capture-file.")

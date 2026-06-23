@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "War of Dots Replay",
-  "version": "0.1.0",
-  "identifier": "local.wod.replay",
+  "productName": "More of Dots",
+  "version": "1.0.0",
+  "identifier": "local.more-of-dots",
   "build": {
     "beforeDevCommand": "npm run dev:web",
     "beforeBuildCommand": "npm run build:web",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "War of Dots Replay",
+        "title": "More of Dots",
         "width": 980,
         "height": 720,
         "minWidth": 720,
@@ -22,9 +22,9 @@
       },
       {
         "label": "replayPlayer",
-        "title": "War of Dots Replay",
-        "width": 980,
-        "height": 720,
+        "title": "More of Dots",
+        "width": 960,
+        "height": 540,
         "minWidth": 720,
         "minHeight": 520,
         "resizable": true,
@@ -38,7 +38,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "msi"],
+    "icon": ["icons/icon.ico", "icons/more-of-dots-icon.png"],
+    "resources": [
+      "../scripts/invoke-python-probe.ps1",
+      "../tools/python-probe-dll/target/release/wod_python_probe.dll"
+    ],
     "externalBin": ["binaries/wod-replay-server"],
     "windows": {
       "nsis": {

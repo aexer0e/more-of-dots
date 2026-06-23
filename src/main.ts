@@ -60,6 +60,11 @@ type CaptureProgressEvent = {
   troop_count?: number;
   city_count?: number;
   controlled_city_count?: number;
+  city_owner_counts?: Record<string, number>;
+  city_owner_source_counts?: Record<string, number>;
+  city_expected_owner_counts?: Array<number | null>;
+  city_observed_owner_counts?: Array<number | null>;
+  city_owner_count_mismatch?: boolean;
   target_sim_speed?: number;
   target_game_seconds_per_wall_second?: number;
   target_ticks_per_wall_second?: number;
@@ -126,6 +131,8 @@ type City = {
   x: number | null;
   y: number | null;
   owner?: number | string | null;
+  owner_source?: string | null;
+  owner_raw?: unknown;
   capital?: boolean;
 };
 
@@ -168,6 +175,7 @@ type TeamMetric = {
   funds?: number | null;
   funds_displayed?: number | null;
   funds_raw?: number | null;
+  city_count?: number | null;
 };
 
 type SampleMetrics = {
@@ -181,6 +189,7 @@ type Sample = {
   tick: number;
   troops: Troop[];
   cities?: City[];
+  bridges?: Array<Array<{ x: number; y: number }>>;
   projection_lines?: Array<Array<{ x: number; y: number }>>;
   metrics?: SampleMetrics;
   events: Record<string, unknown>;
@@ -254,6 +263,7 @@ type ReplayBrowserItem = {
   durationSeconds: number;
   thumbnailDataUrl?: string | null;
   modified: number;
+  scoreDelta?: number | null;
 };
 
 type BrowserSuggestion = {
@@ -263,6 +273,49 @@ type BrowserSuggestion = {
   winCount: number;
   lossCount: number;
   opponents: string[];
+};
+type BrowserFilterState = {
+  query: string;
+  enabledTypes: Set<string>;
+  durationRange: { min: number; max: number };
+};
+type BrowserRenderedCard = {
+  element: HTMLElement;
+  searchText: string;
+  matchType: string;
+  durationSeconds: number;
+  modified: number;
+  names: string[];
+  normalizedNames: string[];
+  winnerIndex: number;
+  winnerName: string;
+  nameElements: HTMLElement[];
+  winnerNameElement: HTMLElement | null;
+  visible: boolean;
+};
+type BrowserPage = "replays" | "userData";
+type UserCheckpoint = {
+  fetchedAt: number;
+  source?: string | null;
+  fields: Record<string, unknown>;
+  score?: number | null;
+  username?: string | null;
+};
+type UserDataPayload = {
+  fetchedAt: number;
+  username?: string | null;
+  score?: number | null;
+  source?: string | null;
+  lookupError?: string | null;
+  userData: unknown;
+  messages: unknown[];
+  checkpoints: UserCheckpoint[];
+  checkpointFile?: string;
+};
+type UserField = {
+  key: string;
+  label: string;
+  value: unknown;
 };
 
 const foundAppRoot = document.querySelector<HTMLDivElement>("#app");
@@ -304,7 +357,7 @@ const labelLaunchId = currentWindowLabel.startsWith("replay-player-") ? currentW
 const appMode = routeParams.get("mode") === "player" || labelLaunchId || isStaticReplayPlayer ? "player" : "browser";
 const launchId = routeParams.get("launch") ?? labelLaunchId;
 
-const PLAYER_COLORS = ["#063bff", "#ff1616", "#1ebd5a", "#ffdd22", "#7d35ff", "#ff8a1f", "#19d8ff", "#ff5aa8"];
+const PLAYER_COLORS = ["#063bff", "#ff1616", "#7d35ff", "#ff8a1f", "#1ebd5a", "#ffdd22", "#19d8ff", "#ff5aa8"];
 const AUTHORITATIVE_SOURCES = new Set(["game-live-python", "memory", "local-session-memory-capture"]);
 const GAME_TICKS_PER_SECOND = 30;
 const GRAPH_HISTORY_SECONDS = 300;
@@ -319,8 +372,9 @@ const UNIT_PROJECTION_LOCAL_RADIUS = 50;
 const UNIT_PROJECTION_LOCAL_WEIGHT = 4.375;
 const UNIT_PROJECTION_GUARD_RADIUS = 20;
 const UNIT_PROJECTION_GUARD_WEIGHT = 35;
-const UNIT_PROJECTION_POWER_SCALE = 0.78;
+const UNIT_PROJECTION_POWER_SCALE = 3.12;
 const CITY_PROJECTION_GUARD_WEIGHT = 80;
+const MAX_GRAPH_TEAMS = 4;
 const GRAPH_COMPACT_SIZE = { width: 228, height: 122 };
 const GRAPH_MIN_SIZE = { width: 170, height: 96 };
 const DURATION_SLIDER_STEPS = 1000;
@@ -341,13 +395,6 @@ const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
   morale: { kind: "morale", title: "Morale" },
   casualties: { kind: "casualties", title: "Casualties", approximate: true },
 };
-const LOADING_STAGES = [
-  { value: 8, label: "Read" },
-  { value: 24, label: "Runtime" },
-  { value: 30, label: "Launch" },
-  { value: 60, label: "Sample" },
-  { value: 96, label: "Write" },
-];
 const DEFAULT_GRAPH_WINDOWS: GraphWindow[] = [
   { id: "graph-troops", kind: "troops", x: 18, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: true, z: 9 },
   { id: "graph-funds", kind: "funds", x: 258, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 10 },
@@ -397,7 +444,6 @@ let projectionMemoryFrame = -1;
 let graphWindows = DEFAULT_GRAPH_WINDOWS.map((windowState) => ({ ...windowState }));
 let graphDrag: GraphDragState | null = null;
 let graphResize: GraphResizeState | null = null;
-let graphPaletteCloseTimer = 0;
 let graphZCounter = 20;
 let browserReplays: ReplayBrowserItem[] = [];
 let browserLoading = false;
@@ -409,8 +455,18 @@ let browserDurationBounds = { min: 0, max: 0 };
 let browserDurationRange = { min: 0, max: 0 };
 let browserSuggestionOpen = false;
 let browserSelectedSuggestion = -1;
-let browserOpeningPath = "";
+let browserSuggestionItems: BrowserSuggestion[] = [];
+let browserRenderedCards: BrowserRenderedCard[] = [];
+let pendingBrowserSearchFrame = 0;
+let browserOpeningPaths = new Set<string>();
+let browserReplaySignature = "";
+let browserReplayPollTimer = 0;
+let browserDocumentEventsBound = false;
 let currentLaunchSignature = "";
+let browserPage: BrowserPage = "replays";
+let userDataPayload: UserDataPayload | null = null;
+let userDataLoading = false;
+let userDataError = "";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -486,76 +542,275 @@ function replayMatchType(replay: ReplayBrowserItem): string {
   return `${playerCount}P`;
 }
 
+function replayScoreDelta(replay: ReplayBrowserItem): number | null {
+  const delta = Number(replay.scoreDelta);
+  if (replayMatchType(replay) !== "1v1" || !Number.isFinite(delta) || delta === 0) return null;
+  return Math.round(delta);
+}
+
+function formatScoreDelta(delta: number): string {
+  const sign = delta > 0 ? "+" : "-";
+  return `${sign}${Math.abs(delta).toLocaleString()} elo`;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function prettifyFieldLabel(path: string): string {
+  const tail = path.split(".").at(-1) ?? path;
+  return tail
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/\b\w/g, (letter) => letter.toLocaleUpperCase());
+}
+
+function flattenUserFields(value: unknown, prefix = "", fields: UserField[] = []): UserField[] {
+  if (value === null || value === undefined) return fields;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => flattenUserFields(item, prefix ? `${prefix}.${index}` : String(index), fields));
+    return fields;
+  }
+  if (isPlainObject(value)) {
+    Object.entries(value).forEach(([key, item]) => {
+      flattenUserFields(item, prefix ? `${prefix}.${key}` : key, fields);
+    });
+    return fields;
+  }
+  fields.push({ key: prefix || "value", label: prettifyFieldLabel(prefix || "value"), value });
+  return fields;
+}
+
+function compactUserValue(value: unknown): string {
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number" && Number.isFinite(value)) return value.toLocaleString();
+  if (typeof value === "string") return value;
+  return JSON.stringify(value ?? null);
+}
+
+function fieldNumber(fields: UserField[], patterns: RegExp[]): number | null {
+  for (const pattern of patterns) {
+    const field = fields.find((candidate) => pattern.test(candidate.key) || pattern.test(candidate.label));
+    const value = Number(field?.value);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function fieldText(fields: UserField[], patterns: RegExp[]): string {
+  for (const pattern of patterns) {
+    const field = fields.find((candidate) => pattern.test(candidate.key) || pattern.test(candidate.label));
+    if (field?.value !== null && field?.value !== undefined && String(field.value).trim()) return String(field.value);
+  }
+  return "";
+}
+
+function userDataFields(payload: UserDataPayload | null): UserField[] {
+  if (!payload) return [];
+  const primary = flattenUserFields(payload.userData);
+  if (primary.length) return primary;
+  return flattenUserFields(payload.messages);
+}
+
+function formatUserDate(seconds: unknown): string {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  return new Date(value * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function userScorePoints(payload: UserDataPayload | null): Array<{ time: number; score: number; label: string }> {
+  if (!payload) return [];
+  const points = payload.checkpoints
+    .map((checkpoint) => ({
+      time: Number(checkpoint.fetchedAt),
+      score: Number(checkpoint.score ?? checkpoint.fields?.score),
+      label: checkpoint.username || "Checkpoint",
+    }))
+    .filter((point) => Number.isFinite(point.time) && point.time > 0 && Number.isFinite(point.score));
+  const currentScore = Number(payload.score);
+  if (Number.isFinite(currentScore)) {
+    const currentTime = Number(payload.fetchedAt || Math.floor(Date.now() / 1000));
+    const last = points.at(-1);
+    if (!last || last.time !== currentTime || last.score !== currentScore) {
+      points.push({ time: currentTime, score: currentScore, label: "Current" });
+    }
+  }
+  return points.sort((left, right) => left.time - right.time);
+}
+
+function renderScoreChart(payload: UserDataPayload | null): string {
+  const points = userScorePoints(payload);
+  if (points.length < 2) {
+    return `<div class="score-chart-empty">Score history will appear after at least two scored checkpoints.</div>`;
+  }
+
+  const width = 720;
+  const height = 230;
+  const padding = { left: 56, right: 20, top: 20, bottom: 36 };
+  const minTime = Math.min(...points.map((point) => point.time));
+  const maxTime = Math.max(...points.map((point) => point.time));
+  const minScore = Math.min(...points.map((point) => point.score));
+  const maxScore = Math.max(...points.map((point) => point.score));
+  const timeSpan = Math.max(1, maxTime - minTime);
+  const scorePadding = Math.max(12, Math.round((maxScore - minScore) * 0.12));
+  const lowScore = minScore - scorePadding;
+  const highScore = maxScore + scorePadding;
+  const scoreSpan = Math.max(1, highScore - lowScore);
+  const x = (time: number) => padding.left + ((time - minTime) / timeSpan) * (width - padding.left - padding.right);
+  const y = (score: number) => padding.top + (1 - (score - lowScore) / scoreSpan) * (height - padding.top - padding.bottom);
+  const path = points.map((point, index) => `${index === 0 ? "M" : "L"}${x(point.time).toFixed(1)} ${y(point.score).toFixed(1)}`).join(" ");
+  const last = points.at(-1)!;
+  const first = points[0]!;
+  const delta = last.score - first.score;
+
+  return `
+    <div class="score-chart-meta">
+      <span>${escapeHtml(formatUserDate(first.time))}</span>
+      <strong class="${delta >= 0 ? "is-gain" : "is-loss"}">${escapeHtml(delta >= 0 ? `+${delta.toLocaleString()}` : delta.toLocaleString())}</strong>
+      <span>${escapeHtml(formatUserDate(last.time))}</span>
+    </div>
+    <svg class="score-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Score over time">
+      <line x1="${padding.left}" y1="${y(lowScore).toFixed(1)}" x2="${width - padding.right}" y2="${y(lowScore).toFixed(1)}" />
+      <line x1="${padding.left}" y1="${y(highScore).toFixed(1)}" x2="${width - padding.right}" y2="${y(highScore).toFixed(1)}" />
+      <text x="12" y="${y(highScore).toFixed(1)}">${escapeHtml(Math.round(highScore).toLocaleString())}</text>
+      <text x="12" y="${y(lowScore).toFixed(1)}">${escapeHtml(Math.round(lowScore).toLocaleString())}</text>
+      <path d="${path}" />
+      ${points
+        .map(
+          (point) =>
+            `<circle cx="${x(point.time).toFixed(1)}" cy="${y(point.score).toFixed(1)}" r="4"><title>${escapeHtml(
+              `${point.label}: ${point.score.toLocaleString()} on ${formatUserDate(point.time)}`,
+            )}</title></circle>`,
+        )
+        .join("")}
+    </svg>
+  `;
+}
+
 function playerColorClass(player: ReplayBrowserPlayer, fallbackIndex: number): string {
   const teamIndex = Number.isInteger(player.teamIndex) ? player.teamIndex : fallbackIndex;
   return `player-${teamIndex + 1}`;
 }
 
-function replaySearchText(replay: ReplayBrowserItem): string {
-  return normalizeSearchText(replay.players.map((player) => player.name).join(" "));
-}
+function renderHighlightedText(element: HTMLElement, text: string, query: string) {
+  element.replaceChildren();
+  if (!query) {
+    element.textContent = text;
+    return;
+  }
 
-function replayMatchesNonSearchFilters(replay: ReplayBrowserItem): boolean {
-  return (
-    browserSelectedTypes.has(replayMatchType(replay)) &&
-    Number(replay.durationSeconds) >= browserDurationRange.min &&
-    Number(replay.durationSeconds) <= browserDurationRange.max
-  );
-}
-
-function replayMatchesFilters(replay: ReplayBrowserItem): boolean {
-  const query = normalizeSearchText(browserSearch);
-  return replayMatchesNonSearchFilters(replay) && (!query || replaySearchText(replay).includes(query));
-}
-
-function highlightedHtml(text: string, query: string): string {
-  if (!query) return escapeHtml(text);
   const normalized = normalizeSearchText(text);
   let cursor = 0;
   let matchStart = normalized.indexOf(query);
-  let output = "";
   while (matchStart !== -1) {
-    if (matchStart > cursor) output += escapeHtml(text.slice(cursor, matchStart));
+    if (matchStart > cursor) element.append(document.createTextNode(text.slice(cursor, matchStart)));
     const matchEnd = matchStart + query.length;
-    output += `<mark>${escapeHtml(text.slice(matchStart, matchEnd))}</mark>`;
+    const mark = document.createElement("mark");
+    mark.textContent = text.slice(matchStart, matchEnd);
+    element.append(mark);
     cursor = matchEnd;
     matchStart = normalized.indexOf(query, cursor);
   }
-  if (cursor < text.length) output += escapeHtml(text.slice(cursor));
-  return output;
+  if (cursor < text.length) element.append(document.createTextNode(text.slice(cursor)));
 }
 
-function browserSuggestions(): BrowserSuggestion[] {
-  const query = normalizeSearchText(browserSearch);
+function browserSearchValue(): string {
+  return document.querySelector<HTMLInputElement>("#playerSearch")?.value ?? browserSearch;
+}
+
+function selectedBrowserMatchTypes(): Set<string> {
+  const typeFilters = document.querySelectorAll<HTMLInputElement>(".type-filter");
+  if (!typeFilters.length) return new Set(browserSelectedTypes);
+  return new Set(Array.from(typeFilters).filter((filter) => filter.checked).map((filter) => filter.value));
+}
+
+function currentBrowserDurationRange(): { min: number; max: number } {
+  const durationMin = document.querySelector<HTMLInputElement>("#durationMin");
+  const durationMax = document.querySelector<HTMLInputElement>("#durationMax");
+  if (!durationMin || !durationMax) return { ...browserDurationRange };
+  return {
+    min: durationPositionToSeconds(durationMin.value),
+    max: durationPositionToSeconds(durationMax.value),
+  };
+}
+
+function currentBrowserFilterState(): BrowserFilterState {
+  return {
+    query: normalizeSearchText(browserSearchValue()),
+    enabledTypes: selectedBrowserMatchTypes(),
+    durationRange: currentBrowserDurationRange(),
+  };
+}
+
+function cardMatchesNonSearchFilters(card: BrowserRenderedCard, filterState: BrowserFilterState): boolean {
+  return (
+    filterState.enabledTypes.has(card.matchType) &&
+    card.durationSeconds >= filterState.durationRange.min &&
+    card.durationSeconds <= filterState.durationRange.max
+  );
+}
+
+function cardMatchesFilters(card: BrowserRenderedCard, filterState: BrowserFilterState): boolean {
+  return (!filterState.query || card.searchText.includes(filterState.query)) && cardMatchesNonSearchFilters(card, filterState);
+}
+
+function pluralize(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+function suggestionMatchRank(name: string, query: string): number {
+  if (!query) return 0;
+  if (name === query) return 0;
+  if (name.startsWith(query)) return 1;
+  if (name.split(/\s+/).some((part) => part.startsWith(query))) return 2;
+  return name.includes(query) ? 3 : Number.POSITIVE_INFINITY;
+}
+
+function sortedOpponentNames(opponents: Map<string, number>): string[] {
+  return [...opponents.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], undefined, { sensitivity: "base" }))
+    .map(([name]) => name);
+}
+
+function buildBrowserSuggestionItems(filterState: BrowserFilterState): BrowserSuggestion[] {
   const stats = new Map<string, BrowserSuggestion & { latestModified: number; rank: number; opponentCounts: Map<string, number> }>();
 
-  for (const replay of browserReplays) {
-    if (!replayMatchesNonSearchFilters(replay)) continue;
-    replay.players.forEach((player, index) => {
-      const key = normalizeSearchText(player.name);
-      const rank = !query ? 0 : key === query ? 0 : key.startsWith(query) ? 1 : key.includes(query) ? 2 : Number.POSITIVE_INFINITY;
+  for (const card of browserRenderedCards) {
+    if (!cardMatchesNonSearchFilters(card, filterState)) continue;
+
+    card.names.forEach((name, index) => {
+      const key = card.normalizedNames[index];
+      const rank = suggestionMatchRank(key, filterState.query);
       if (!Number.isFinite(rank)) return;
+
       const existing =
         stats.get(key) ??
         {
-          name: player.name,
+          name,
           normalizedName: key,
           replayCount: 0,
           winCount: 0,
           lossCount: 0,
+          opponents: [],
           latestModified: 0,
           rank,
-          opponents: [],
           opponentCounts: new Map<string, number>(),
         };
+
       existing.rank = Math.min(existing.rank, rank);
       existing.replayCount += 1;
-      existing.winCount += player.winner ? 1 : 0;
-      existing.lossCount += replay.players.some((candidate) => candidate.winner) && !player.winner ? 1 : 0;
-      existing.latestModified = Math.max(existing.latestModified, Number(replay.modified) || 0);
-      replay.players.forEach((opponent, opponentIndex) => {
+      existing.winCount += card.winnerIndex === index ? 1 : 0;
+      existing.lossCount += card.winnerIndex >= 0 && card.winnerIndex !== index ? 1 : 0;
+      existing.latestModified = Math.max(existing.latestModified, card.modified);
+      card.names.forEach((opponentName, opponentIndex) => {
         if (opponentIndex === index) return;
-        existing.opponentCounts.set(opponent.name, (existing.opponentCounts.get(opponent.name) ?? 0) + 1);
+        existing.opponentCounts.set(opponentName, (existing.opponentCounts.get(opponentName) ?? 0) + 1);
       });
       stats.set(key, existing);
     });
@@ -564,9 +819,7 @@ function browserSuggestions(): BrowserSuggestion[] {
   return [...stats.values()]
     .map((item) => ({
       ...item,
-      opponents: [...item.opponentCounts.entries()]
-        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], undefined, { sensitivity: "base" }))
-        .map(([name]) => name),
+      opponents: sortedOpponentNames(item.opponentCounts),
     }))
     .sort(
       (left, right) =>
@@ -597,61 +850,179 @@ function setupBrowserDuration(replays: ReplayBrowserItem[], preserveRange: boole
   }
 }
 
-function renderBrowserSuggestions(): string {
-  const suggestions = browserSuggestions();
-  if (!browserSuggestionOpen || !suggestions.length) return "";
-  const query = normalizeSearchText(browserSearch);
-  return `
-    <div id="playerSuggestionPanel" class="player-suggestion-panel">
-      <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions">
-        ${suggestions
-          .map((item, index) => {
-            const opponents = item.opponents.slice(0, 3);
-            const remaining = item.opponents.length - opponents.length;
-            const detail = opponents.length ? `vs ${opponents.join(", ")}${remaining ? `, and ${remaining} more` : ""}` : "No opponents yet";
-            return `
-              <button
-                id="player-suggestion-${index}"
-                class="player-suggestion ${index === browserSelectedSuggestion ? "is-active" : ""}"
-                type="button"
-                data-suggestion-index="${index}"
-                role="option"
-                aria-selected="${index === browserSelectedSuggestion ? "true" : "false"}"
-              >
-                <span class="suggestion-primary">
-                  <span class="suggestion-name">${highlightedHtml(item.name, query)}</span>
-                  <span class="suggestion-meta">${item.replayCount} replay${item.replayCount === 1 ? "" : "s"} - ${item.winCount} win${item.winCount === 1 ? "" : "s"} - ${item.lossCount} loss${item.lossCount === 1 ? "" : "es"}</span>
-                </span>
-                <span class="suggestion-detail">${escapeHtml(detail)}</span>
-              </button>
-            `;
-          })
-          .join("")}
-      </div>
-    </div>
-  `;
+function updateBrowserClearButton() {
+  const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
+  const clearButton = document.querySelector<HTMLButtonElement>("#clearPlayerSearch");
+  if (!clearButton || !searchInput) return;
+  clearButton.hidden = searchInput.value.length === 0 || searchInput.disabled;
 }
 
-function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number, dimmed: boolean): string {
-  const query = normalizeSearchText(browserSearch);
-  const winner = replay.players.find((player) => player.winner);
+function setBrowserSuggestionsOpen(open: boolean) {
+  const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
+  const searchBox = document.querySelector<HTMLElement>("#playerSearchBox");
+  const suggestionPanel = document.querySelector<HTMLElement>("#playerSuggestionPanel");
+  const shouldOpen = open && !searchInput?.disabled && browserSuggestionItems.length > 0;
+
+  browserSuggestionOpen = shouldOpen;
+  if (suggestionPanel) suggestionPanel.hidden = !shouldOpen;
+  if (searchBox) searchBox.setAttribute("aria-expanded", String(shouldOpen));
+  if (!shouldOpen) {
+    browserSelectedSuggestion = -1;
+    searchInput?.removeAttribute("aria-activedescendant");
+    updateActiveBrowserSuggestion();
+  }
+}
+
+function closeBrowserSuggestions() {
+  setBrowserSuggestionsOpen(false);
+}
+
+function suggestionDetailText(item: BrowserSuggestion): string {
+  if (!item.opponents.length) return "No opponents yet";
+  const opponents = item.opponents.slice(0, 3);
+  const remaining = item.opponents.length - opponents.length;
+  return `vs ${opponents.join(", ")}${remaining ? `, and ${remaining} more` : ""}`;
+}
+
+function renderBrowserSuggestions(query: string) {
+  const suggestionList = document.querySelector<HTMLElement>("#playerSuggestionList");
+  if (!suggestionList) return;
+
+  const fragment = document.createDocumentFragment();
+  browserSuggestionItems.forEach((item, index) => {
+    const option = document.createElement("button");
+    const primary = document.createElement("span");
+    const name = document.createElement("span");
+    const meta = document.createElement("span");
+    const detail = document.createElement("span");
+
+    option.id = `player-suggestion-${index}`;
+    option.type = "button";
+    option.className = "player-suggestion";
+    option.dataset.index = String(index);
+    option.setAttribute("role", "option");
+
+    primary.className = "suggestion-primary";
+    name.className = "suggestion-name";
+    meta.className = "suggestion-meta";
+    detail.className = "suggestion-detail";
+
+    renderHighlightedText(name, item.name, query);
+    meta.textContent = `${pluralize(item.replayCount, "replay")} - ${pluralize(item.winCount, "win")} - ${pluralize(item.lossCount, "loss")}`;
+    detail.textContent = suggestionDetailText(item);
+
+    primary.append(name, meta);
+    option.append(primary, detail);
+    fragment.append(option);
+  });
+
+  suggestionList.replaceChildren(fragment);
+  updateActiveBrowserSuggestion();
+}
+
+function refreshBrowserSuggestions(open = document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch")) {
+  const filterState = currentBrowserFilterState();
+  browserSuggestionItems = buildBrowserSuggestionItems(filterState);
+  if (browserSelectedSuggestion >= browserSuggestionItems.length) {
+    browserSelectedSuggestion = browserSuggestionItems.length - 1;
+  }
+  renderBrowserSuggestions(filterState.query);
+  setBrowserSuggestionsOpen(open);
+}
+
+function updateActiveBrowserSuggestion() {
+  const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
+  const suggestionList = document.querySelector<HTMLElement>("#playerSuggestionList");
+  if (!searchInput || !suggestionList) return;
+
+  Array.from(suggestionList.children).forEach((option, index) => {
+    if (!(option instanceof HTMLElement)) return;
+    const selected = index === browserSelectedSuggestion;
+    option.classList.toggle("is-active", selected);
+    option.setAttribute("aria-selected", String(selected));
+  });
+
+  if (browserSelectedSuggestion < 0) {
+    searchInput.removeAttribute("aria-activedescendant");
+    return;
+  }
+
+  const activeOption = suggestionList.children[browserSelectedSuggestion];
+  if (!(activeOption instanceof HTMLElement)) {
+    searchInput.removeAttribute("aria-activedescendant");
+    return;
+  }
+
+  searchInput.setAttribute("aria-activedescendant", activeOption.id);
+  activeOption.scrollIntoView({ block: "nearest" });
+}
+
+function moveBrowserSuggestionSelection(delta: number) {
+  if (!browserSuggestionItems.length) refreshBrowserSuggestions(true);
+  if (!browserSuggestionItems.length) return;
+
+  const suggestionPanel = document.querySelector<HTMLElement>("#playerSuggestionPanel");
+  if (suggestionPanel?.hidden) setBrowserSuggestionsOpen(true);
+
+  const startIndex = browserSelectedSuggestion < 0 ? (delta > 0 ? -1 : 0) : browserSelectedSuggestion;
+  browserSelectedSuggestion = (startIndex + delta + browserSuggestionItems.length) % browserSuggestionItems.length;
+  updateActiveBrowserSuggestion();
+}
+
+function selectBrowserSuggestion(index: number) {
+  const item = browserSuggestionItems[index];
+  const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
+  if (!item || !searchInput) return;
+
+  browserSearch = item.name;
+  searchInput.value = item.name;
+  browserSelectedSuggestion = -1;
+  updateBrowserClearButton();
+  closeBrowserSuggestions();
+  scheduleBrowserSearch();
+  searchInput.focus();
+}
+
+function clearBrowserSearch() {
+  const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
+  browserSearch = "";
+  browserSelectedSuggestion = -1;
+  if (searchInput) searchInput.value = "";
+  updateBrowserClearButton();
+  refreshBrowserSuggestions(true);
+  scheduleBrowserSearch();
+  searchInput?.focus();
+}
+
+function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): string {
+  const winnerIndex = replay.players.findIndex((player) => player.winner);
+  const winner = winnerIndex >= 0 ? replay.players[winnerIndex] : null;
+  const matchType = replayMatchType(replay);
+  const scoreDelta = replayScoreDelta(replay);
+  const scoreDeltaLabel =
+    scoreDelta === null
+      ? ""
+      : `<div class="replay-label elo-delta ${scoreDelta > 0 ? "is-gain" : "is-loss"}">${escapeHtml(formatScoreDelta(scoreDelta))}</div>`;
   const names = replay.players
     .map((player, index) => {
       const separator = index > 0 ? `<span class="matchup-separator"> vs </span>` : "";
-      return `${separator}<span class="player-name ${playerColorClass(player, index)}">${highlightedHtml(player.name, query)}</span>`;
+      return `${separator}<span class="player-name ${playerColorClass(player, index)}" data-player-index="${index}">${escapeHtml(player.name)}</span>`;
     })
     .join("");
   const winnerLine = winner
-    ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, replay.players.indexOf(winner))}">${highlightedHtml(winner.name, query)}</span></div>`
+    ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, winnerIndex)}" data-winner-name>${escapeHtml(winner.name)}</span></div>`
     : "";
   const label = replay.players.map((player) => player.name).join(" versus ");
-  const isOpening = browserOpeningPath === replay.filePath;
+  const isOpening = browserOpeningPaths.has(replay.filePath);
   return `
-    <article class="replay-card ${dimmed ? "is-dimmed" : ""}" aria-label="${escapeHtml(label)}">
+    <article class="replay-card" data-card-index="${replayIndex}" aria-label="${escapeHtml(label)}">
       <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
       <div class="replay-shade"></div>
       <div class="replay-labels">
-        <div class="replay-label match-type">${escapeHtml(replayMatchType(replay))}</div>
+        <div class="replay-label-group">
+          <div class="replay-label match-type">${escapeHtml(matchType)}</div>
+          ${scoreDeltaLabel}
+        </div>
         <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
       </div>
       <button class="replay-play-button" type="button" data-replay-index="${replayIndex}" ${isOpening ? "disabled" : ""} aria-label="Play ${escapeHtml(label)}">
@@ -668,6 +1039,7 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number, dimmed
 }
 
 function renderBrowserGrid(): string {
+  browserRenderedCards = [];
   if (browserLoading && !browserReplays.length) {
     return `<section id="replayGrid" class="replay-grid is-loading"><div class="state-message">Loading replays...</div></section>`;
   }
@@ -678,15 +1050,193 @@ function renderBrowserGrid(): string {
     return `<section id="replayGrid" class="replay-grid is-empty"><div class="state-message">No replays found.</div></section>`;
   }
 
-  const rows = browserReplays
-    .map((replay, index) => ({ replay, index, matches: replayMatchesFilters(replay) }))
-    .filter((item) => item.matches || !browserHideUnmatched);
   return `
     <section id="replayGrid" class="replay-grid" aria-live="polite">
-      ${rows.map((item) => renderReplayCard(item.replay, item.index, !item.matches)).join("")}
+      ${browserReplays.map((replay, index) => renderReplayCard(replay, index)).join("")}
     </section>
-    <div id="searchEmpty" class="state-message search-empty" ${rows.length || !browserHideUnmatched ? "hidden" : ""}>No matching replays.</div>
+    <div id="searchEmpty" class="state-message search-empty" hidden>No matching replays.</div>
   `;
+}
+
+function renderBrowserNav(): string {
+  return `
+    <nav class="browser-nav" aria-label="Main navigation">
+      <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
+      <button class="browser-nav-button ${browserPage === "userData" ? "is-active" : ""}" type="button" data-browser-page="userData">User data</button>
+    </nav>
+  `;
+}
+
+function renderUserDataPage(): string {
+  const fields = userDataFields(userDataPayload);
+  const score = Number(userDataPayload?.score ?? fieldNumber(fields, [/(^|\.)(score|elo)$/i]));
+  const username =
+    userDataPayload?.username ||
+    fieldText(fields, [/(^|\.)(username|userName|name|displayName|playerName)$/i]) ||
+    "Unknown user";
+  const rank = fieldNumber(fields, [/(^|\.)(rank|ratingRank|leaderboardRank|position|place)$/i]);
+  const wins = fieldNumber(fields, [/number\s*of\s*wins/i, /(^|\.)(wins|winCount|victories)$/i]);
+  const totalFromFields = fieldNumber(fields, [/number\s*of\s*games/i, /(^|\.)(games|matches|played|gameCount|matchCount|totalGames)$/i]);
+  const total = totalFromFields ?? null;
+  const losses = total !== null && wins !== null ? Math.max(0, total - wins) : fieldNumber(fields, [/(^|\.)(losses|lossCount|defeats)$/i]);
+  const winRatio = total && wins !== null ? clamp((wins / total) * 100, 0, 100) : 0;
+  const lossRatio = total && losses !== null ? clamp((losses / total) * 100, 0, 100) : 0;
+  const winPercent = total && wins !== null ? `${Math.round(winRatio)}%` : "-";
+  const fieldRows = fields.length
+    ? fields
+        .map(
+          (field) => `
+            <div class="user-field">
+              <dt title="${escapeHtml(field.key)}">${escapeHtml(field.label)}</dt>
+              <dd>${escapeHtml(compactUserValue(field.value))}</dd>
+            </div>
+          `,
+        )
+        .join("")
+    : `<div class="state-message">No user fields returned yet.</div>`;
+
+  return `
+    <section class="user-data-page" aria-label="User data">
+      <div class="user-data-actions">
+        <div>
+          <h1>User data</h1>
+          <p>${userDataPayload ? `Fetched ${escapeHtml(formatUserDate(userDataPayload.fetchedAt))}` : "Fetching account data from War of Dots."}</p>
+        </div>
+        <button id="refreshUserData" class="refresh-user-button ${userDataLoading ? "is-loading" : ""}" type="button" ${userDataLoading ? "disabled" : ""}>
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M20 12a8 8 0 0 1-13.7 5.7" />
+            <path d="M4 12A8 8 0 0 1 17.7 6.3" />
+            <path d="M17.7 2.7v3.6h-3.6" />
+            <path d="M6.3 21.3v-3.6h3.6" />
+          </svg>
+          <span>Refresh</span>
+        </button>
+      </div>
+      ${
+        userDataError
+          ? `<div class="state-message user-data-error">${escapeHtml(userDataError)}</div>`
+          : ""
+      }
+      ${
+        userDataLoading && !userDataPayload
+          ? `<div class="state-message">Fetching user data...</div>`
+          : `
+            <div class="profile-board">
+              <div class="profile-hero">
+                <div class="profile-name">
+                  <span>Player</span>
+                  <strong>${escapeHtml(username)}</strong>
+                </div>
+                <div class="profile-metrics">
+                  <div class="profile-metric is-score">
+                    <span>Score</span>
+                    <strong>${Number.isFinite(score) ? escapeHtml(score.toLocaleString()) : "-"}</strong>
+                  </div>
+                  <div class="profile-metric">
+                    <span>Rank</span>
+                    <strong>${rank !== null ? `Top ${escapeHtml(rank.toLocaleString())}` : "-"}</strong>
+                  </div>
+                  <div class="profile-metric">
+                    <span>Games</span>
+                    <strong>${total !== null ? escapeHtml(total.toLocaleString()) : "-"}</strong>
+                  </div>
+                  <div class="profile-metric">
+                    <span>Wins</span>
+                    <strong>${wins !== null ? escapeHtml(wins.toLocaleString()) : "-"}</strong>
+                  </div>
+                </div>
+              </div>
+              <div class="profile-pie-panel">
+                <div class="pie-title">
+                  <span>Win rate</span>
+                  <strong>${escapeHtml(winPercent)}</strong>
+                </div>
+                <div class="profile-pie" style="--win-ratio:${winRatio.toFixed(2)}">
+                  <div>
+                    <strong>${wins !== null ? escapeHtml(wins.toLocaleString()) : "-"}</strong>
+                    <span>wins</span>
+                  </div>
+                </div>
+                <div class="profile-record">
+                  <span><i class="is-win"></i>${wins !== null ? escapeHtml(wins.toLocaleString()) : "-"} wins</span>
+                  <span><i class="is-loss"></i>${losses !== null ? escapeHtml(losses.toLocaleString()) : "-"} losses</span>
+                  <span>${total !== null ? escapeHtml(total.toLocaleString()) : "-"} games</span>
+                </div>
+              </div>
+            </div>
+            <section class="score-history">
+              <div class="section-heading">
+                <h2>Score over time</h2>
+                <span>${escapeHtml(String(userScorePoints(userDataPayload).length))} points</span>
+              </div>
+              ${renderScoreChart(userDataPayload)}
+            </section>
+            <section class="user-fields-section">
+              <div class="section-heading">
+                <h2>Returned fields</h2>
+                <span>${escapeHtml(String(fields.length))} fields</span>
+              </div>
+              <dl class="user-fields">${fieldRows}</dl>
+            </section>
+          `
+      }
+    </section>
+  `;
+}
+
+function hydrateBrowserCards() {
+  browserRenderedCards = [];
+  const cardElements = document.querySelectorAll<HTMLElement>("#replayGrid .replay-card");
+  cardElements.forEach((element) => {
+    const replayIndex = Number(element.dataset.cardIndex);
+    const replay = browserReplays[replayIndex];
+    if (!replay) return;
+
+    const winnerIndex = replay.players.findIndex((player) => player.winner);
+    browserRenderedCards.push({
+      element,
+      searchText: normalizeSearchText(replay.players.map((player) => player.name).join(" ")),
+      matchType: replayMatchType(replay),
+      durationSeconds: Number(replay.durationSeconds) || 0,
+      modified: Number(replay.modified) || 0,
+      names: replay.players.map((player) => player.name),
+      normalizedNames: replay.players.map((player) => normalizeSearchText(player.name)),
+      winnerIndex,
+      winnerName: winnerIndex >= 0 ? replay.players[winnerIndex]?.name ?? "" : "",
+      nameElements: Array.from(element.querySelectorAll<HTMLElement>("[data-player-index]")),
+      winnerNameElement: element.querySelector<HTMLElement>("[data-winner-name]"),
+      visible: true,
+    });
+  });
+}
+
+function applyBrowserSearch() {
+  pendingBrowserSearchFrame = 0;
+  const filterState = currentBrowserFilterState();
+  let visibleCount = 0;
+
+  for (const card of browserRenderedCards) {
+    const visible = cardMatchesFilters(card, filterState);
+    card.nameElements.forEach((element, index) => {
+      renderHighlightedText(element, card.names[index] ?? "", filterState.query);
+    });
+    if (card.winnerNameElement) {
+      renderHighlightedText(card.winnerNameElement, card.winnerName, filterState.query);
+    }
+
+    card.element.hidden = browserHideUnmatched && !visible;
+    card.element.classList.toggle("is-dimmed", !browserHideUnmatched && !visible);
+    card.visible = visible;
+    if (visible) visibleCount += 1;
+  }
+
+  const searchEmpty = document.querySelector<HTMLElement>("#searchEmpty");
+  if (searchEmpty) searchEmpty.hidden = !browserHideUnmatched || visibleCount > 0;
+}
+
+function scheduleBrowserSearch() {
+  if (pendingBrowserSearchFrame) return;
+  pendingBrowserSearchFrame = window.requestAnimationFrame(applyBrowserSearch);
 }
 
 function renderReplayBrowser() {
@@ -694,16 +1244,27 @@ function renderReplayBrowser() {
   const maxPosition = secondsToDurationPosition(browserDurationRange.max);
   const fillLeft = (minPosition / DURATION_SLIDER_STEPS) * 100;
   const fillRight = ((DURATION_SLIDER_STEPS - maxPosition) / DURATION_SLIDER_STEPS) * 100;
-  const suggestionsOpen = browserSuggestionOpen && browserSuggestions().length > 0;
+  if (browserPage === "userData") {
+    appRoot.innerHTML = `
+      <main class="replay-browser" aria-label="War of Dots user data">
+        ${renderBrowserNav()}
+        ${renderUserDataPage()}
+      </main>
+    `;
+    bindBrowserEvents();
+    return;
+  }
+
   appRoot.innerHTML = `
     <main class="replay-browser" aria-label="War of Dots replays">
+      ${renderBrowserNav()}
       <div class="search-row">
         <div class="search-controls">
           <div
             id="playerSearchBox"
             class="search-combobox"
             role="combobox"
-            aria-expanded="${suggestionsOpen ? "true" : "false"}"
+            aria-expanded="false"
             aria-haspopup="listbox"
             aria-owns="playerSuggestionList"
           >
@@ -721,11 +1282,13 @@ function renderReplayBrowser() {
               ${browserLoading || browserError || !browserReplays.length ? "disabled" : ""}
             >
             <button id="clearPlayerSearch" class="search-clear" type="button" aria-label="Clear search" ${browserSearch ? "" : "hidden"}>x</button>
-            ${renderBrowserSuggestions()}
+            <div id="playerSuggestionPanel" class="player-suggestion-panel" hidden>
+              <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions"></div>
+            </div>
           </div>
           <label class="match-mode-toggle" title="Dim non-matching replays">
             <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
-            <span class="match-mode-icon" aria-hidden="true">👻</span>
+            <span aria-hidden="true">&#128123;&#65039;</span>
           </label>
         </div>
         <div class="filter-controls">
@@ -761,74 +1324,86 @@ function renderReplayBrowser() {
       </button>
     </main>
   `;
+  hydrateBrowserCards();
   bindBrowserEvents();
+  updateBrowserClearButton();
+  refreshBrowserSuggestions(browserSuggestionOpen);
+  scheduleBrowserSearch();
+}
+
+function handleBrowserSuggestionPointerDown(event: PointerEvent) {
+  const target = event.target instanceof Element ? event.target : null;
+  const option = target?.closest<HTMLButtonElement>(".player-suggestion");
+  if (!option) return;
+  event.preventDefault();
+  selectBrowserSuggestion(Number(option.dataset.index));
+}
+
+function handleBrowserOutsidePointerDown(event: PointerEvent) {
+  if (event.target instanceof Node && document.querySelector("#playerSearchBox")?.contains(event.target)) return;
+  closeBrowserSuggestions();
 }
 
 function bindBrowserEvents() {
-  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("input", (event) => {
-    browserSearch = (event.target as HTMLInputElement).value;
-    browserSuggestionOpen = true;
-    browserSelectedSuggestion = -1;
-    renderReplayBrowser();
-    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
-  });
-  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("focus", () => {
-    browserSuggestionOpen = true;
-    renderReplayBrowser();
-    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
-  });
-  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("keydown", (event) => {
-    const suggestions = browserSuggestions();
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      browserSuggestionOpen = true;
-      const delta = event.key === "ArrowDown" ? 1 : -1;
-      browserSelectedSuggestion = suggestions.length
-        ? (browserSelectedSuggestion + delta + suggestions.length) % suggestions.length
-        : -1;
-      renderReplayBrowser();
-      document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
-    } else if (event.key === "Enter" && browserSelectedSuggestion >= 0) {
-      event.preventDefault();
-      const suggestion = suggestions[browserSelectedSuggestion];
-      if (suggestion) {
-        browserSearch = suggestion.name;
-        browserSuggestionOpen = false;
-        browserSelectedSuggestion = -1;
-        renderReplayBrowser();
-      }
-    } else if (event.key === "Escape") {
-      browserSuggestionOpen = false;
-      renderReplayBrowser();
-    }
-  });
-  document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("click", () => {
-    browserSearch = "";
-    browserSuggestionOpen = true;
-    renderReplayBrowser();
-    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-suggestion-index]").forEach((button) => {
-    button.addEventListener("pointerdown", (event) => event.preventDefault());
+  document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
-      const suggestion = browserSuggestions()[Number(button.dataset.suggestionIndex)];
-      if (!suggestion) return;
-      browserSearch = suggestion.name;
-      browserSuggestionOpen = false;
-      browserSelectedSuggestion = -1;
+      const nextPage = button.dataset.browserPage === "userData" ? "userData" : "replays";
+      if (browserPage === nextPage) return;
+      browserPage = nextPage;
       renderReplayBrowser();
+      if (browserPage === "userData" && !userDataPayload && !userDataLoading) void loadUserData();
     });
   });
-  document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("change", (event) => {
+  document.querySelector<HTMLButtonElement>("#refreshUserData")?.addEventListener("click", () => {
+    void loadUserData();
+  });
+  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("input", (event) => {
+    browserSearch = (event.target as HTMLInputElement).value;
+    browserSelectedSuggestion = -1;
+    updateBrowserClearButton();
+    refreshBrowserSuggestions(true);
+    scheduleBrowserSearch();
+  });
+  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("focus", () => {
+    refreshBrowserSuggestions(true);
+  });
+  document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveBrowserSuggestionSelection(1);
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveBrowserSuggestionSelection(-1);
+      return;
+    }
+
+    const suggestionPanel = document.querySelector<HTMLElement>("#playerSuggestionPanel");
+    if (event.key === "Enter" && browserSelectedSuggestion >= 0 && !suggestionPanel?.hidden) {
+      event.preventDefault();
+      selectBrowserSuggestion(browserSelectedSuggestion);
+      return;
+    }
+
+    if (event.key === "Escape") closeBrowserSuggestions();
+  });
+  document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+  });
+  document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("click", clearBrowserSearch);
+  document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("pointerdown", handleBrowserSuggestionPointerDown);
+  document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("click", (event) => {
     browserHideUnmatched = !(event.target as HTMLInputElement).checked;
-    renderReplayBrowser();
+    scheduleBrowserSearch();
   });
   document.querySelectorAll<HTMLInputElement>(".type-filter").forEach((input) => {
     input.addEventListener("change", () => {
       if (input.checked) browserSelectedTypes.add(input.value);
       else browserSelectedTypes.delete(input.value);
-      browserSuggestionOpen = document.activeElement?.id === "playerSearch";
-      renderReplayBrowser();
+      refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
+      scheduleBrowserSearch();
     });
   });
   const durationMin = document.querySelector<HTMLInputElement>("#durationMin");
@@ -860,15 +1435,11 @@ function bindBrowserEvents() {
       }
     }
     updateDurationSliderUi(minPosition, maxPosition);
-  };
-  const commitDurationInput = () => {
-    browserSuggestionOpen = document.activeElement?.id === "playerSearch";
-    renderReplayBrowser();
+    refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
+    scheduleBrowserSearch();
   };
   durationMin?.addEventListener("input", () => handleDurationInput(durationMin));
   durationMax?.addEventListener("input", () => handleDurationInput(durationMax));
-  durationMin?.addEventListener("change", commitDurationInput);
-  durationMax?.addEventListener("change", commitDurationInput);
   document.querySelector<HTMLButtonElement>("#refreshReplays")?.addEventListener("click", () => {
     void loadBrowserReplays(true);
   });
@@ -878,47 +1449,89 @@ function bindBrowserEvents() {
       if (replay) void openReplayFromBrowser(replay);
     });
   });
-  document.addEventListener(
-    "pointerdown",
-    (event) => {
-      if (event.target instanceof Node && document.querySelector("#playerSearchBox")?.contains(event.target)) return;
-      if (browserSuggestionOpen) {
-        browserSuggestionOpen = false;
-        renderReplayBrowser();
-      }
-    },
-    { once: true },
-  );
+  if (!browserDocumentEventsBound) {
+    document.addEventListener("pointerdown", handleBrowserOutsidePointerDown);
+    browserDocumentEventsBound = true;
+  }
+}
+
+async function loadUserData(options: { quiet?: boolean } = {}) {
+  if (userDataLoading) return;
+  userDataLoading = true;
+  userDataError = "";
+  if (!options.quiet && browserPage === "userData") renderReplayBrowser();
+  try {
+    userDataPayload = await invoke<UserDataPayload>("fetch_user_data");
+  } catch (error) {
+    userDataError = error instanceof Error ? error.message : String(error || "Could not fetch user data.");
+  } finally {
+    userDataLoading = false;
+    if (browserPage === "userData") renderReplayBrowser();
+  }
 }
 
 async function openReplayFromBrowser(replay: ReplayBrowserItem) {
-  if (browserOpeningPath) return;
-  browserOpeningPath = replay.filePath;
+  if (browserOpeningPaths.has(replay.filePath)) return;
+  browserOpeningPaths.add(replay.filePath);
   renderReplayBrowser();
   try {
     await invoke<string>("open_replay_window", { fileName: replay.fileName, filePath: replay.filePath });
   } catch (error) {
     browserError = error instanceof Error ? error.message : String(error);
   } finally {
-    browserOpeningPath = "";
+    browserOpeningPaths.delete(replay.filePath);
     renderReplayBrowser();
   }
 }
 
-async function loadBrowserReplays(preserveControls = false) {
+function replayListSignature(replays: ReplayBrowserItem[]): string {
+  return replays
+    .map((replay) =>
+      [
+        replay.filePath,
+        replay.modified,
+        replay.durationSeconds,
+        replay.scoreDelta ?? "",
+        replay.players.map((player) => `${player.name}:${player.winner ? "1" : "0"}`).join(","),
+      ].join("|"),
+    )
+    .join("\n");
+}
+
+async function loadBrowserReplays(preserveControls = false, options: { quiet?: boolean } = {}) {
+  if (browserLoading) return;
+  let shouldRender = !options.quiet;
   browserLoading = true;
   browserError = "";
-  renderReplayBrowser();
+  if (!options.quiet) renderReplayBrowser();
   try {
     const replays = await invoke<ReplayBrowserItem[]>("list_replays");
+    const nextSignature = replayListSignature(replays);
+    const changed = nextSignature !== browserReplaySignature;
     browserReplays = replays;
+    browserReplaySignature = nextSignature;
     setupBrowserDuration(replays, preserveControls);
+    shouldRender = shouldRender || changed;
+    if (changed && replays.length && !userDataLoading) {
+      window.setTimeout(() => void loadUserData({ quiet: true }), 0);
+    }
   } catch (error) {
-    browserError = error instanceof Error ? error.message : String(error || "Could not load replays.");
+    if (!options.quiet) {
+      browserError = error instanceof Error ? error.message : String(error || "Could not load replays.");
+      shouldRender = true;
+    }
   } finally {
     browserLoading = false;
-    renderReplayBrowser();
+    if (shouldRender) renderReplayBrowser();
   }
+}
+
+function startBrowserReplayPolling() {
+  window.clearInterval(browserReplayPollTimer);
+  browserReplayPollTimer = window.setInterval(() => {
+    if (browserOpeningPaths.size > 0 || browserLoading) return;
+    void loadBrowserReplays(true, { quiet: true });
+  }, 5000);
 }
 
 function resetMapImage() {
@@ -995,7 +1608,7 @@ function ownerIndex(owner: unknown): number | null {
   const number = Number(owner);
   if (Number.isInteger(number)) return number;
   const text = String(owner ?? "").trim().toLowerCase();
-  const named = ["blue", "red", "green", "yellow", "purple", "orange", "cyan", "pink"].indexOf(text);
+  const named = ["blue", "red", "purple", "orange", "green", "yellow", "cyan", "pink"].indexOf(text);
   return named >= 0 ? named : null;
 }
 
@@ -1386,38 +1999,26 @@ function metricForTeam(sample: Sample, index: number): TeamMetric {
   return sample.metrics?.teams?.find((metric) => Number(metric.index) === index) ?? { index };
 }
 
-function metricSource(sample: Sample, key: string): string {
-  return String(sample.metrics?.sources?.[key] ?? "").toLowerCase();
-}
-
-function fundsMetricValue(sample: Sample, metric: TeamMetric): number | null {
+function fundsMetricValue(metric: TeamMetric): number | null {
   const displayed = numeric(metric.funds_displayed);
   if (displayed !== null) return displayed;
 
   const raw = numeric(metric.funds);
-  if (raw === null) return null;
-
-  const source = metricSource(sample, "funds");
-  if (source.includes("zrtyz") && Math.abs(raw) >= 1000) return raw / 1000;
   return raw;
 }
 
 function casualtiesMetricValue(sample: Sample, metric: TeamMetric): number | null {
-  const displayed = numeric(metric.displayed_casualties ?? metric.casualties_displayed);
-  if (displayed !== null) {
-    const source = metricSource(sample, "displayed_casualties");
-    if (source.includes("troop_casualties") && Math.abs(displayed) < 10000) return displayed * 100;
-    return displayed;
-  }
-
   const estimate = numeric(metric.casualties_estimate);
   if (estimate !== null) return estimate;
 
+  const displayed = numeric(metric.displayed_casualties ?? metric.casualties_displayed);
+  if (displayed !== null) return displayed;
+
   const troopCasualties = numeric(metric.troop_casualties);
-  if (troopCasualties !== null) return troopCasualties * 100;
+  if (troopCasualties !== null) return troopCasualties;
 
   const rawCasualties = numeric(metric.casualties);
-  return rawCasualties !== null ? rawCasualties * 100 : null;
+  return rawCasualties;
 }
 
 function teamAliveUnitCount(sample: Sample, teamIndex: number): number {
@@ -1455,7 +2056,7 @@ function graphMetricValue(kind: GraphKind, sample: Sample, teamIndex: number): n
     kind === "troops"
       ? metric.troops_estimate ?? metric.strength ?? metric.alive_units
       : kind === "funds"
-        ? fundsMetricValue(sample, metric)
+        ? fundsMetricValue(metric)
         : kind === "units"
           ? metric.alive_units ?? teamAliveUnitCount(sample, teamIndex)
           : kind === "morale"
@@ -1524,7 +2125,7 @@ function showGraphWindow(kind: GraphKind) {
   windowState.visible = true;
   clampGraphWindow(windowState);
   raiseGraphWindow(windowState.id);
-  render();
+  renderGraphLayer();
 }
 
 function toggleGraphKind(kind: GraphKind) {
@@ -1538,7 +2139,22 @@ function closeGraphWindow(id: string) {
   const windowState = graphWindows.find((candidate) => candidate.id === id);
   if (!windowState) return;
   windowState.visible = false;
-  render();
+  renderGraphLayer();
+}
+
+function renderGraphLayer() {
+  const sample = sampleAtFrame();
+  const topbar = document.querySelector<HTMLElement>(".topbar");
+  if (topbar) topbar.innerHTML = renderGraphPalette();
+
+  const viewer = document.querySelector<HTMLElement>(".viewer-area");
+  if (viewer) {
+    document.querySelectorAll<HTMLElement>("[data-graph-window-id]").forEach((element) => element.remove());
+    viewer.insertAdjacentHTML("beforeend", renderGraphWindows(sample));
+  }
+
+  bindGraphEvents();
+  renderGraphCanvases(sample);
 }
 
 function renderGraphPalette(): string {
@@ -1546,11 +2162,6 @@ function renderGraphPalette(): string {
   return `
     <div class="graph-palette-zone" aria-label="Graph windows">
       <div class="graph-palette">
-        <div class="graph-palette-handle" aria-hidden="true">
-          <span></span>
-          <span></span>
-          <span></span>
-        </div>
         <div class="graph-palette-buttons">
         ${Object.values(GRAPH_DEFINITIONS)
           .map(
@@ -1620,19 +2231,19 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
 
   if (!sample) return;
 
-  const teams = teamList().slice(0, 2);
+  const teams = graphTeamsForSample(sample);
   const currentTick = Number(sample.tick);
   if (!Number.isFinite(currentTick)) return;
   const minTick = currentTick - GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS;
   const series = teams.map((team, index) => ({
     team,
-    color: team.color_hex ?? teamColor(index),
+    color: team.color_hex ?? teamColor(Number(team.index)),
     points: graphMetricHistory(windowState.kind, Number(team.index), sample),
   }));
   const values = series.flatMap((item) => item.points.map((point) => point.value));
-  const liveValues = teams.map((team, index) => ({
+  const liveValues = teams.map((team) => ({
     team,
-    color: team.color_hex ?? teamColor(index),
+    color: team.color_hex ?? teamColor(Number(team.index)),
     value: sample ? graphMetricValue(windowState.kind, sample, Number(team.index)) : null,
   }));
 
@@ -1695,6 +2306,26 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
   drawGraphLiveValues(ctx, windowState.kind, liveValues, width);
 }
 
+function graphTeamsForSample(sample: Sample): Team[] {
+  const teamsByIndex = new Map<number, Team>();
+  for (const team of teamList()) {
+    const index = Number(team.index);
+    if (Number.isInteger(index)) teamsByIndex.set(index, team);
+  }
+  for (const metric of sample.metrics?.teams ?? []) {
+    const index = Number(metric.index);
+    if (!Number.isInteger(index) || teamsByIndex.has(index)) continue;
+    teamsByIndex.set(index, {
+      index,
+      name: `Player ${index + 1}`,
+      color_hex: PLAYER_COLORS[index % PLAYER_COLORS.length],
+    });
+  }
+  return [...teamsByIndex.values()]
+    .sort((first, second) => Number(first.index) - Number(second.index))
+    .slice(0, MAX_GRAPH_TEAMS);
+}
+
 function drawGraphLiveValues(
   ctx: CanvasRenderingContext2D,
   kind: GraphKind,
@@ -1706,7 +2337,7 @@ function drawGraphLiveValues(
   ctx.font = "900 11px Inter, Segoe UI, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  values.slice(0, 2).reverse().forEach((item) => {
+  values.slice(0, MAX_GRAPH_TEAMS).reverse().forEach((item) => {
     const text = formatGraphValue(kind, item.value);
     const textWidth = Math.ceil(ctx.measureText(text).width);
     const chipWidth = textWidth + 17;
@@ -2039,6 +2670,34 @@ function drawLineSet(
   ctx.restore();
 }
 
+function drawBridgeLines(
+  ctx: CanvasRenderingContext2D,
+  sample: Sample,
+  toScreen: (point: WorldPoint) => WorldPoint,
+  fit: number,
+) {
+  const lines = cleanProjectionLines(sample.bridges);
+  if (!lines.length) return;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const line of lines) {
+    const points = line.filter(validPoint).map(toScreen);
+    if (points.length < 2) continue;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+    ctx.strokeStyle = "rgba(22, 14, 9, 0.96)";
+    ctx.lineWidth = Math.max(7, 13 * Math.max(0.82, fit));
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(244, 204, 122, 0.98)";
+    ctx.lineWidth = Math.max(4, 7 * Math.max(0.82, fit));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function drawPathLines(
   ctx: CanvasRenderingContext2D,
   sample: Sample,
@@ -2300,6 +2959,12 @@ function drawProjectionLines(
   bounds: Bounds,
   screenRect: { x: number; y: number; width: number; height: number },
 ) {
+  const directLines = cleanProjectionLines(sample.projection_lines);
+  if (directLines.length) {
+    drawLineSet(ctx, directLines, toScreen, fit, { alpha: 0.88, lineWidth: 2.2, arrowSize: 0 });
+    return;
+  }
+
   const sources = projectionSources(sample);
   const owners = projectionOwnerList(sources);
   if (owners.length >= 2 && screenRect.width > 2 && screenRect.height > 2) {
@@ -2357,8 +3022,7 @@ function drawProjectionLines(
     return;
   }
 
-  const lines = cleanProjectionLines(sample.projection_lines);
-  drawLineSet(ctx, lines, toScreen, fit, { alpha: 0.88, lineWidth: 2.2, arrowSize: 0 });
+  drawLineSet(ctx, directLines, toScreen, fit, { alpha: 0.88, lineWidth: 2.2, arrowSize: 0 });
 }
 
 function flagTextureForOwner(owner: unknown): HTMLImageElement | null {
@@ -2576,6 +3240,7 @@ function renderCanvas() {
     width: worldWidth * fit,
     height: worldHeight * fit,
   });
+  drawBridgeLines(ctx, sample, toScreen, fit);
   drawCityBases(ctx, sample, toScreen, fit);
   drawPathLines(ctx, sample, toScreen, fit);
 
@@ -2593,7 +3258,7 @@ function renderCanvas() {
       ctx.globalAlpha = 1;
     }
 
-    if (showDots) {
+    if (showDots && troop.alive) {
       const latest =
         Number.isFinite(troop.x) && Number.isFinite(troop.y)
           ? toScreen({ x: Number(troop.x), y: Number(troop.y) })
@@ -2624,46 +3289,21 @@ function progressPercent(): string {
   return `${Math.max(0, Math.min(100, progress.value)).toFixed(0)}%`;
 }
 
-function loadingStageIndex(): number {
-  let index = 0;
-  LOADING_STAGES.forEach((stage, stageIndex) => {
-    if (progress.value >= stage.value) index = stageIndex;
-  });
-  return index;
-}
-
-function renderLoadingFacts(): string {
-  const facts = progress.facts.slice(0, 8);
-  return Array.from({ length: 8 }, (_, index) => {
-    const fact = facts[index] ?? "";
-    return `<span class="${fact ? "" : "empty"}">${fact ? escapeHtml(fact) : "&nbsp;"}</span>`;
-  }).join("");
-}
-
 function renderOverlay(): string {
   if (phase === "loading") {
-    const activeStage = loadingStageIndex();
     return `
       <div class="loading-screen">
         <div class="loading-card">
           <div class="loading-header">
             <div class="loading-copy">
-              <span class="loading-kicker">Live game capture</span>
               <h2>${escapeHtml(progress.label)}</h2>
               <p>${escapeHtml(progress.detail)}</p>
             </div>
             <div class="loading-percent" aria-label="Progress ${progressPercent()}">${progressPercent()}</div>
           </div>
-          <div class="loading-stages" aria-hidden="true">
-            ${LOADING_STAGES.map((stage, index) => {
-              const state = index < activeStage ? "complete" : index === activeStage ? "active" : "pending";
-              return `<span class="loading-step ${state}" data-loading-stage="${index}"><i></i><b>${escapeHtml(stage.label)}</b></span>`;
-            }).join("")}
-          </div>
           <div class="progress-track" aria-label="Replay loading progress">
             <div class="progress-fill" style="width:${progressPercent()}"></div>
           </div>
-          <div class="progress-facts">${renderLoadingFacts()}</div>
         </div>
       </div>
     `;
@@ -2785,16 +3425,6 @@ function bindPointerActivation(element: HTMLElement | null, handler: (event: Poi
 }
 
 function bindGraphEvents() {
-  const palette = document.querySelector<HTMLElement>(".graph-palette");
-  const paletteZone = document.querySelector<HTMLElement>(".graph-palette-zone");
-  if (palette) {
-    const hoverTarget = paletteZone ?? palette;
-    hoverTarget.addEventListener("pointerenter", () => openGraphPalette(palette));
-    hoverTarget.addEventListener("pointerleave", () => scheduleGraphPaletteClose(palette));
-    palette.addEventListener("focusin", () => openGraphPalette(palette));
-    palette.addEventListener("focusout", () => scheduleGraphPaletteClose(palette));
-  }
-
   document.querySelectorAll<HTMLButtonElement>("[data-graph-toggle]").forEach((button) => {
     bindPointerActivation(button, () => {
       const kind = button.dataset.graphToggle as GraphKind | undefined;
@@ -2901,19 +3531,6 @@ function bindGraphEvents() {
     handle.addEventListener("pointerup", stopResize);
     handle.addEventListener("pointercancel", stopResize);
   });
-}
-
-function openGraphPalette(element: HTMLElement) {
-  window.clearTimeout(graphPaletteCloseTimer);
-  element.classList.add("open");
-}
-
-function scheduleGraphPaletteClose(element: HTMLElement) {
-  window.clearTimeout(graphPaletteCloseTimer);
-  graphPaletteCloseTimer = window.setTimeout(() => {
-    if (element.matches(":hover") || element.matches(":focus-within")) return;
-    element.classList.remove("open");
-  }, 260);
 }
 
 function resizeGraphWindow(event: PointerEvent) {
@@ -3035,22 +3652,14 @@ function updateProgressUi() {
   const fill = document.querySelector<HTMLElement>(".progress-fill");
   if (fill) fill.style.width = progressPercent();
   const percent = document.querySelector<HTMLElement>(".loading-percent");
-  if (percent) percent.textContent = progressPercent();
+  if (percent) {
+    percent.textContent = progressPercent();
+    percent.setAttribute("aria-label", `Progress ${progressPercent()}`);
+  }
   const title = document.querySelector<HTMLElement>(".loading-card h2");
   if (title) title.textContent = progress.label;
   const detail = document.querySelector<HTMLElement>(".loading-card p");
   if (detail) detail.textContent = progress.detail;
-  const activeStage = loadingStageIndex();
-  document.querySelectorAll<HTMLElement>(".loading-step").forEach((step) => {
-    const index = Number(step.dataset.loadingStage);
-    step.classList.toggle("complete", index < activeStage);
-    step.classList.toggle("active", index === activeStage);
-    step.classList.toggle("pending", index > activeStage);
-  });
-  const facts = document.querySelector<HTMLElement>(".progress-facts");
-  if (facts) {
-    facts.innerHTML = renderLoadingFacts();
-  }
 }
 
 function setProgress(value: number, label: string, detail: string, facts: string[] = []) {
@@ -3101,6 +3710,14 @@ async function readStats(jobId: string): Promise<Stats> {
   }
   if (!meta || !samples.length) throw new Error("Stats artifact did not contain playable streamed samples.");
   return statsFromMeta(meta, samples, Boolean(meta && meta.summary?.partial === false));
+}
+
+async function releaseLoadedJobArtifacts(jobId: string) {
+  try {
+    await invoke("release_job_artifacts", { jobId });
+  } catch {
+    // Cleanup is best-effort; playback should not fail if disk pruning is blocked.
+  }
 }
 
 function isPartialCapture(stats: Stats | null): boolean {
@@ -3170,7 +3787,19 @@ function statsFromMeta(meta: CaptureSampleDeltaPayload["meta"] | CaptureSampleDe
   };
 }
 
+function adoptCaptureJob(job: Job | null | undefined) {
+  if (!job) return;
+  if (activeJob?.job_id !== job.job_id) {
+    sampleStreamOffset = 0;
+    activeStats = null;
+    boundsCache = null;
+    resetProjectionMemory();
+  }
+  activeJob = job;
+}
+
 async function applySampleDelta(job: Job | undefined, token = captureProgressToken): Promise<boolean> {
+  if (job?.job_id && activeJob?.job_id !== job.job_id) adoptCaptureJob(job);
   const jobId = job?.job_id ?? activeJob?.job_id;
   if (!jobId) return false;
   const payload = await invoke<CaptureSampleDeltaPayload>("capture_sample_delta", { jobId, offset: sampleStreamOffset });
@@ -3249,8 +3878,8 @@ function teamProgressFacts(event: CaptureProgressEvent, job: Job | undefined): s
   return teams.slice(0, 2).map((team, index) => {
     const label = names[index] || `Player ${index + 1}`;
     const troops = formatStat(team.troops_estimate ?? team.strength, true);
-    const losses = formatStat(team.displayed_casualties ?? team.casualties_displayed ?? team.casualties_estimate ?? team.casualties ?? team.troop_casualties, true);
-    const funds = formatStat(team.funds);
+    const losses = formatStat(team.casualties_estimate ?? team.displayed_casualties ?? team.casualties_displayed ?? team.casualties ?? team.troop_casualties, true);
+    const funds = formatStat(fundsMetricValue(team));
     return `${label}: troops ${troops}, losses ${losses}, funds ${funds}`;
   });
 }
@@ -3281,7 +3910,7 @@ function applyCaptureProgress(payload: CaptureProgressPayload, filename: string)
     return;
   }
 
-  if (payload.job) activeJob = payload.job;
+  adoptCaptureJob(payload.job);
   const status = String(payload.job?.status ?? "");
   const event = payload.event ?? null;
   const statusProgress = jobStatusProgress(status);
@@ -3372,7 +4001,7 @@ function startCaptureProgressPolling(filename: string, startedAfterMs: number) {
       const payload = await invoke<CaptureProgressPayload>("capture_progress", { filename, startedAfterMs });
       if (token !== captureProgressToken || (phase !== "loading" && !(phase === "ready" && liveCaptureActive))) return;
       if (phase === "loading") applyCaptureProgress(payload, filename);
-      else if (payload.job) activeJob = payload.job;
+      else adoptCaptureJob(payload.job);
     } catch {
       // Keep the current loading text; capture itself will report errors when it finishes.
     } finally {
@@ -3494,6 +4123,7 @@ async function loadReplayFile(file: File) {
         };
     render();
     startPlayback();
+    void releaseLoadedJobArtifacts(job.job_id);
     void refreshBackend({ quiet: true });
   } catch (error) {
     liveCaptureActive = false;
@@ -3574,6 +4204,7 @@ async function loadReplayPath(filePath: string, fileName: string) {
         };
     render();
     startPlayback();
+    void releaseLoadedJobArtifacts(job.job_id);
     void refreshBackend({ quiet: true });
   } catch (error) {
     liveCaptureActive = false;
@@ -3708,6 +4339,7 @@ async function loadCurrentLaunchRequest() {
 if (appMode === "browser") {
   renderReplayBrowser();
   void loadBrowserReplays();
+  startBrowserReplayPolling();
   window.addEventListener("keydown", (event) => {
     const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";
     if (!wantsSearch) return;

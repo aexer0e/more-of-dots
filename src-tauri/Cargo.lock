@@ -1789,6 +1789,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "more-of-dots"
+version = "1.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-shell",
+ "winreg",
+]
+
+[[package]]
 name = "muda"
 version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4618,20 +4633,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "wod-replay-desktop"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "flate2",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-shell",
- "winreg",
 ]
 
 [[package]]

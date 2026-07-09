@@ -1,0 +1,8 @@
+name = "more-of-dots-leaderboard"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "more-of-dots-leaderboard"
+database_id = "9d7a6f40-becb-4255-8628-46d00ae5729b"

@@ -5,6 +5,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from wod_replay_server import desktop_cli
+from wod_replay_server.storage import JobStore
+
 
 def test_sidecar_health_command_runs_without_http_server(tmp_path: Path) -> None:
     result = subprocess.run(
@@ -37,3 +40,30 @@ def test_stage_game_command_uses_cross_process_mutex() -> None:
     assert "kernel32.WaitForSingleObject" in content
     assert "with _stage_game_mutex():" in content
     assert "stage_game(ctx.settings.steam_game_dir, ctx.settings.staged_game_dir)" in content
+
+
+def test_health_skips_runtime_cleanup(monkeypatch, tmp_path: Path) -> None:
+    def fail_prune(*args, **kwargs):
+        raise AssertionError("startup health must not prune jobs")
+
+    monkeypatch.setattr(JobStore, "prune_finished_jobs", fail_prune)
+
+    payload = desktop_cli.command_health(tmp_path)
+
+    assert payload["status"] == "ok"
+    assert payload["runtime_cleanup"]["skipped"] is True
+
+
+def test_list_jobs_skips_runtime_cleanup(monkeypatch, tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs")
+    paths = store.create_job("recent.rep")
+    store.update_job(paths, status="captured")
+
+    def fail_prune(*args, **kwargs):
+        raise AssertionError("list-jobs must not prune jobs")
+
+    monkeypatch.setattr(JobStore, "prune_finished_jobs", fail_prune)
+
+    payload = desktop_cli.command_list_jobs(tmp_path, 20)
+
+    assert [job["job_id"] for job in payload["jobs"]] == [paths.job_id]

@@ -8,7 +8,7 @@ from typing import Any
 
 
 GZIP_MAGIC = b"\x1f\x8b"
-REQUIRED_KEYS = {"map", "custom_map", "player_usernames", "version", "result", "end"}
+REQUIRED_KEYS = {"map", "player_usernames", "version", "result"}
 
 
 class ReplayValidationError(ValueError):
@@ -49,6 +49,21 @@ def decompress_gzip_limited(raw: bytes, max_json_bytes: int) -> str:
         raise ReplayValidationError("Replay JSON must be UTF-8 encoded.") from exc
 
 
+def _tick_keys(payload: dict[str, Any]) -> list[int]:
+    return sorted(int(key) for key in payload if key.isdigit())
+
+
+def _metadata_map_name(map_value: Any) -> str:
+    if isinstance(map_value, dict):
+        return "custom"
+    return str(map_value)
+
+
+def _custom_map_present(payload: dict[str, Any]) -> bool:
+    map_value = payload.get("map")
+    return isinstance(map_value, dict) or payload.get("custom_map") is not None
+
+
 def validate_replay(raw: bytes, *, max_json_bytes: int) -> ReplayDocument:
     json_text = decompress_gzip_limited(raw, max_json_bytes)
 
@@ -64,14 +79,19 @@ def validate_replay(raw: bytes, *, max_json_bytes: int) -> ReplayDocument:
     if missing:
         raise ReplayValidationError(f"Replay JSON is missing required keys: {', '.join(missing)}.")
 
-    tick_keys = sorted(int(key) for key in payload if key.isdigit())
+    tick_keys = _tick_keys(payload)
+    end = payload.get("end")
+    if end is None and tick_keys:
+        end = tick_keys[-1]
+    if end is None:
+        raise ReplayValidationError("Replay JSON is missing required keys: end.")
     metadata = {
-        "map": str(payload["map"]),
-        "custom_map_present": payload["custom_map"] is not None,
+        "map": _metadata_map_name(payload["map"]),
+        "custom_map_present": _custom_map_present(payload),
         "player_usernames": payload["player_usernames"],
         "version": payload["version"],
         "result": payload["result"],
-        "end": payload["end"],
+        "end": end,
         "tick_count": len(tick_keys),
         "first_tick": tick_keys[0] if tick_keys else None,
         "max_tick": tick_keys[-1] if tick_keys else None,

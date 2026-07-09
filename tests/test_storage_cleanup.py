@@ -58,6 +58,18 @@ def test_prune_finished_jobs_removes_stale_active_jobs(tmp_path: Path) -> None:
     assert result["after_bytes"] == 0
 
 
+def test_list_jobs_returns_newest_bounded_jobs(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs")
+    for index in range(8):
+        make_job(store, "captured", 16, 10 + index)
+
+    jobs = store.list_jobs(limit=3)
+
+    assert len(jobs) == 3
+    assert [job["filename"] for job in jobs] == ["captured.rep", "captured.rep", "captured.rep"]
+    assert [Path(store.jobs_dir / job["job_id"] / "job.json").stat().st_mtime for job in jobs] == [17, 16, 15]
+
+
 def test_release_job_artifacts_removes_bulky_files_only_for_final_jobs(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs")
     final = make_job(store, "captured", 16, 10)

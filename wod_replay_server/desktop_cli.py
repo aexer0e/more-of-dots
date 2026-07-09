@@ -311,6 +311,15 @@ def _cleanup_runtime(ctx, *, preserve_job_ids: set[str] | None = None) -> dict[s
     }
 
 
+def _skipped_runtime_cleanup(reason: str) -> dict[str, Any]:
+    return {
+        "skipped": True,
+        "reason": reason,
+        "uploads": {"skipped": True, "removed_files": 0, "removed_bytes": 0},
+        "jobs": {"skipped": True, "deleted_jobs": [], "deleted_bytes": 0},
+    }
+
+
 def _finalize_capture(ctx, paths: JobPaths, capture: dict[str, Any]) -> None:
     stats = capture.get("stats")
     if isinstance(stats, dict):
@@ -445,7 +454,6 @@ def _run_capture_job(ctx, job_id: str) -> None:
 
 def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> dict[str, Any]:
     ctx = _load_backend(runtime_dir, owner_pid)
-    cleanup = _cleanup_runtime(ctx)
     settings = ctx.settings
     runner = ctx.replay_runner.describe()
     return {
@@ -459,7 +467,7 @@ def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> di
         "capture_sample_hz": settings.capture_sample_hz,
         "capture_source": settings.capture_source,
         "runtime_jobs_max_bytes": settings.runtime_jobs_max_bytes,
-        "runtime_cleanup": cleanup,
+        "runtime_cleanup": _skipped_runtime_cleanup("startup-health"),
         "runner": runner,
         "debug_tools": _debug_tool_inventory(settings),
     }
@@ -475,7 +483,6 @@ def command_stage_game(runtime_dir: Path | None, owner_pid: int | None = None) -
 
 def command_list_jobs(runtime_dir: Path | None, limit: int, owner_pid: int | None = None) -> dict[str, Any]:
     ctx = _load_backend(runtime_dir, owner_pid)
-    _cleanup_runtime(ctx)
     bounded_limit = min(max(limit, 1), 100)
     return {"jobs": [_job_response(job) for job in ctx.store.list_jobs(limit=bounded_limit)]}
 

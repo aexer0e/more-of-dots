@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -29,16 +31,24 @@ const DEFAULT_SAMPLE_DELTA_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAMPLE_DELTA_RECORDS: usize = 600;
 const MAX_STATS_META_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_REPLAY_PAGE_SIZE: usize = 100;
+const MAX_REPLAY_PAGE_SIZE: usize = 100;
 const REPLAY_PLAYER_LABEL: &str = "replayPlayer";
 const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
+const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
 const USER_DATA_CHECKPOINT_FILE_NAME: &str = "user-data-checkpoints.json";
+const LEADERBOARD_SYNC_FILE_NAME: &str = "leaderboard-sync.json";
 const DEFAULT_USER_DATA_URL: &str = "ws://cs.war-of-dots.com:9056";
 const DEFAULT_USER_DATA_VERSION: &str = "1.2.18.3";
 const USER_DATA_WAIT: Duration = Duration::from_millis(700);
 const USER_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const USER_DATA_EXPORT_WAIT: Duration = Duration::from_secs(8);
+const LEADERBOARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const DEFAULT_LEADERBOARD_URL: &str = "https://more-of-dots-leaderboard.moreofdots.workers.dev";
+const REGION_SELECTION_WAIT: Duration = Duration::from_secs(8);
+const REGION_NAMES: [&str; 3] = ["NA", "EU", "ASIA"];
 const USER_DATA_PERMISSIONS: &[&str] = &[
     "authorize",
     "registration_emailverification",
@@ -131,7 +141,7 @@ struct UnitAssetsPayload {
     assets: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlayerSummary {
     name: String,
@@ -139,7 +149,7 @@ struct PlayerSummary {
     winner: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplaySummary {
     file_name: String,
@@ -152,6 +162,7 @@ struct ReplaySummary {
     score_delta: Option<i64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ParsedReplay {
     summary: ReplaySummary,
     result: Option<Value>,
@@ -160,14 +171,60 @@ struct ParsedReplay {
     custom_map_surface: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameMapRecord {
+    id: String,
+    file_name: String,
+    file_path: String,
+    name: String,
+    data: Value,
+    created_at: u64,
+    updated_at: u64,
+    width: u32,
+    height: u32,
+    team_count: usize,
+}
+
 #[derive(Clone)]
 struct ReplayCandidate {
-    hash: String,
     path: PathBuf,
     original_path: PathBuf,
     file_name: String,
     modified: u64,
+    size: u64,
+    known_hash: Option<String>,
+    is_backup: bool,
     thumbnail_replay_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ReplayIndexEntry {
+    path_key: String,
+    original_path: String,
+    backup_path: String,
+    file_name: String,
+    modified: u64,
+    size: u64,
+    hash: String,
+    parsed: Option<ParsedReplay>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ReplayIndexStore {
+    version: u32,
+    entries: BTreeMap<String, ReplayIndexEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayListPayload {
+    replays: Vec<ReplaySummary>,
+    total_candidates: usize,
+    has_more: bool,
+    next_offset: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -195,9 +252,43 @@ struct UserScoreLookup {
     source: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LeaderboardSyncState {
+    status: String,
+    synced_at: Option<u64>,
+    username: Option<String>,
+    public_rank: Option<i64>,
+    public_score: Option<i64>,
+    message: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LeaderboardPublicStats {
+    username: String,
+    normalized_username: String,
+    score: i64,
+    official_rank: Option<i64>,
+    games: Option<i64>,
+    wins: Option<i64>,
+    losses: Option<i64>,
+    region: Option<String>,
+    source: String,
+    fetched_at: u64,
+}
+
 struct GameLogin {
     username: Option<String>,
     password: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegionSelection {
+    region: String,
+    selected_at: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -267,8 +358,20 @@ fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn replay_index_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_runtime_dir(app)?.join(REPLAY_INDEX_FILE_NAME))
+}
+
 fn user_data_checkpoint_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_runtime_dir(app)?.join(USER_DATA_CHECKPOINT_FILE_NAME))
+}
+
+fn leaderboard_sync_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_runtime_dir(app)?.join(LEADERBOARD_SYNC_FILE_NAME))
+}
+
+fn region_selection_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_runtime_dir(app)?.join("region-selection.json"))
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -348,27 +451,96 @@ fn candidate_file_name(path: &Path) -> String {
         .to_string()
 }
 
-fn insert_candidate(candidates: &mut HashMap<String, ReplayCandidate>, candidate: ReplayCandidate) {
+fn replay_candidate_from_path(
+    path: PathBuf,
+    thumbnail_replay_dir: Option<PathBuf>,
+    known_hash: Option<String>,
+    is_backup: bool,
+) -> Option<ReplayCandidate> {
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || !is_replay_file(&path) {
+        return None;
+    }
+    Some(ReplayCandidate {
+        path: path.clone(),
+        original_path: path.clone(),
+        file_name: candidate_file_name(&path),
+        modified: metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_secs)
+            .unwrap_or(0),
+        size: metadata.len(),
+        known_hash,
+        is_backup,
+        thumbnail_replay_dir,
+    })
+}
+
+fn replay_candidate_key(candidate: &ReplayCandidate) -> String {
+    candidate
+        .known_hash
+        .as_deref()
+        .map(|hash| format!("hash:{}", hash.to_ascii_lowercase()))
+        .unwrap_or_else(|| format!("path:{}", path_key(&candidate.original_path)))
+}
+
+fn insert_candidate(
+    candidates: &mut BTreeMap<String, ReplayCandidate>,
+    candidate: ReplayCandidate,
+) {
+    let key = replay_candidate_key(&candidate);
     candidates
-        .entry(candidate.hash.clone())
+        .entry(key)
         .and_modify(|existing| {
             if existing.thumbnail_replay_dir.is_none() && candidate.thumbnail_replay_dir.is_some() {
                 existing.thumbnail_replay_dir = candidate.thumbnail_replay_dir.clone();
             }
-            if candidate.modified > existing.modified {
-                existing.modified = candidate.modified;
-                existing.file_name = candidate.file_name.clone();
-                existing.original_path = candidate.original_path.clone();
+            if existing.is_backup && !candidate.is_backup {
+                *existing = candidate.clone();
+            } else if existing.is_backup == candidate.is_backup
+                && candidate.modified > existing.modified
+            {
+                *existing = candidate.clone();
             }
         })
         .or_insert(candidate);
 }
 
+fn dedupe_replay_candidates_by_hash(
+    candidates: Vec<ReplayCandidate>,
+) -> (Vec<ReplayCandidate>, Vec<String>) {
+    let mut deduped: BTreeMap<String, ReplayCandidate> = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for mut candidate in candidates {
+        if candidate.known_hash.is_none() {
+            match sha256_file(&candidate.path) {
+                Ok(hash) => candidate.known_hash = Some(hash),
+                Err(error) => {
+                    errors.push(format!("Skipping {}: {error}", candidate.path.display()));
+                    continue;
+                }
+            }
+        }
+        insert_candidate(&mut deduped, candidate);
+    }
+
+    let mut candidates = deduped.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
+    (candidates, errors)
+}
+
 fn collect_replay_candidates(app: &AppHandle) -> Result<Vec<ReplayCandidate>, String> {
-    let backup_dir = replay_backup_dir(app)?;
     let replay_dirs = discover_replay_dirs();
     let fallback_thumbnail_dir = replay_dirs.first().cloned();
-    let mut candidates: HashMap<String, ReplayCandidate> = HashMap::new();
+    let replay_index = load_replay_index(&replay_index_path(app)?);
+    let mut candidates: BTreeMap<String, ReplayCandidate> = BTreeMap::new();
 
     for replay_dir in &replay_dirs {
         let entries = fs::read_dir(replay_dir).map_err(|error| {
@@ -380,32 +552,23 @@ fn collect_replay_candidates(app: &AppHandle) -> Result<Vec<ReplayCandidate>, St
 
         for entry in entries.flatten() {
             let source_path = entry.path();
-            if !source_path.is_file() || !is_replay_file(&source_path) {
-                continue;
+            if let Some(mut candidate) =
+                replay_candidate_from_path(source_path, Some(replay_dir.clone()), None, false)
+            {
+                if let Some(entry) = replay_index
+                    .entries
+                    .get(&path_key(&candidate.original_path))
+                {
+                    if replay_index_entry_matches_metadata(entry, &candidate) {
+                        candidate.known_hash = Some(entry.hash.clone());
+                    }
+                }
+                insert_candidate(&mut candidates, candidate);
             }
-
-            let hash = sha256_file(&source_path)?;
-            let backup_path = backup_replay_file(&source_path, &hash, &backup_dir)?;
-            let modified = source_path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(system_time_to_secs)
-                .unwrap_or(0);
-            insert_candidate(
-                &mut candidates,
-                ReplayCandidate {
-                    hash,
-                    path: backup_path,
-                    original_path: source_path.clone(),
-                    file_name: candidate_file_name(&source_path),
-                    modified,
-                    thumbnail_replay_dir: Some(replay_dir.clone()),
-                },
-            );
         }
     }
 
+    let backup_dir = replay_backup_dir(app)?;
     let backup_entries = fs::read_dir(&backup_dir).map_err(|error| {
         format!(
             "Could not read replay backup folder {}: {error}",
@@ -414,39 +577,18 @@ fn collect_replay_candidates(app: &AppHandle) -> Result<Vec<ReplayCandidate>, St
     })?;
     for entry in backup_entries.flatten() {
         let backup_path = entry.path();
-        if !backup_path.is_file() || !is_replay_file(&backup_path) {
-            continue;
-        }
-
         let hash = backup_path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .filter(|stem| {
                 stem.len() == 64 && stem.chars().all(|character| character.is_ascii_hexdigit())
             })
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| sha256_file(&backup_path).unwrap_or_default());
-        if hash.is_empty() {
-            continue;
+            .map(ToOwned::to_owned);
+        if let Some(candidate) =
+            replay_candidate_from_path(backup_path, fallback_thumbnail_dir.clone(), hash, true)
+        {
+            insert_candidate(&mut candidates, candidate);
         }
-
-        let modified = backup_path
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(system_time_to_secs)
-            .unwrap_or(0);
-        insert_candidate(
-            &mut candidates,
-            ReplayCandidate {
-                hash,
-                path: backup_path.clone(),
-                original_path: backup_path.clone(),
-                file_name: candidate_file_name(&backup_path),
-                modified,
-                thumbnail_replay_dir: fallback_thumbnail_dir.clone(),
-            },
-        );
     }
 
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
@@ -457,6 +599,88 @@ fn collect_replay_candidates(app: &AppHandle) -> Result<Vec<ReplayCandidate>, St
             .then_with(|| left.file_name.cmp(&right.file_name))
     });
     Ok(candidates)
+}
+
+fn load_replay_index(path: &Path) -> ReplayIndexStore {
+    let Some(value) = read_json_file(path) else {
+        return ReplayIndexStore {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+    };
+    let mut store = serde_json::from_value::<ReplayIndexStore>(value).unwrap_or_default();
+    if store.version == 0 {
+        store.version = 1;
+    }
+    store
+}
+
+fn write_replay_index(path: &Path, store: &ReplayIndexStore) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
+    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+fn replay_index_entry_matches_metadata(
+    entry: &ReplayIndexEntry,
+    candidate: &ReplayCandidate,
+) -> bool {
+    entry.path_key == path_key(&candidate.original_path)
+        && path_key_from_str(&entry.original_path) == path_key(&candidate.original_path)
+        && entry.modified == candidate.modified
+        && entry.size == candidate.size
+}
+
+fn replay_index_entry_matches(entry: &ReplayIndexEntry, candidate: &ReplayCandidate) -> bool {
+    replay_index_entry_matches_metadata(entry, candidate) && entry.parsed.is_some()
+}
+
+fn parsed_replay_from_index(
+    entry: &ReplayIndexEntry,
+    candidate: &ReplayCandidate,
+) -> Option<ParsedReplay> {
+    if !replay_index_entry_matches(entry, candidate) {
+        return None;
+    }
+
+    let mut parsed = entry.parsed.clone()?;
+    parsed.summary.file_name = candidate.file_name.clone();
+    parsed.summary.modified = candidate.modified;
+    parsed.summary.thumbnail_data_url = None;
+    let backup_path = PathBuf::from(&entry.backup_path);
+    parsed.summary.file_path = if backup_path.is_file() {
+        entry.backup_path.clone()
+    } else {
+        candidate.original_path.to_string_lossy().to_string()
+    };
+    Some(parsed)
+}
+
+fn parse_replay_candidate(
+    candidate: &ReplayCandidate,
+    backup_dir: &Path,
+) -> Result<(ParsedReplay, ReplayIndexEntry), String> {
+    let hash = match candidate.known_hash.as_deref() {
+        Some(hash) => hash.to_string(),
+        None => sha256_file(&candidate.path)?,
+    };
+    let backup_path = backup_replay_file(&candidate.path, &hash, backup_dir)?;
+    let mut parsed = parse_replay(&backup_path)?;
+    parsed.summary.file_name = candidate.file_name.clone();
+    parsed.summary.modified = candidate.modified;
+    parsed.summary.file_path = backup_path.to_string_lossy().to_string();
+    parsed.summary.thumbnail_data_url = None;
+
+    let entry = ReplayIndexEntry {
+        path_key: path_key(&candidate.original_path),
+        original_path: candidate.original_path.to_string_lossy().to_string(),
+        backup_path: backup_path.to_string_lossy().to_string(),
+        file_name: candidate.file_name.clone(),
+        modified: candidate.modified,
+        size: candidate.size,
+        hash,
+        parsed: Some(parsed.clone()),
+    };
+    Ok((parsed, entry))
 }
 
 fn load_user_data_checkpoint_store(path: &Path) -> UserDataCheckpointStore {
@@ -483,6 +707,15 @@ fn write_user_data_checkpoint_store(
     store: &UserDataCheckpointStore,
 ) -> Result<(), String> {
     let text = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
+    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+fn load_region_selection(path: &Path) -> Option<RegionSelection> {
+    read_json_file(path).and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn write_region_selection(path: &Path, selection: &RegionSelection) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(selection).map_err(|error| error.to_string())?;
     fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
 }
 
@@ -619,6 +852,325 @@ fn checkpoint_json(checkpoint: &UserDataCheckpoint) -> Value {
         "fields": checkpoint.fields,
         "score": checkpoint.fields.get("score").and_then(value_as_i64),
     })
+}
+
+fn load_leaderboard_sync_state(path: &Path) -> LeaderboardSyncState {
+    read_json_file(path)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(|| LeaderboardSyncState {
+            status: "not-submitted".to_string(),
+            ..LeaderboardSyncState::default()
+        })
+}
+
+fn write_leaderboard_sync_state(path: &Path, state: &LeaderboardSyncState) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+fn leaderboard_base_url() -> Option<String> {
+    env::var("WOD_LEADERBOARD_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(DEFAULT_LEADERBOARD_URL.to_string()))
+        .filter(|value| {
+            value.starts_with("https://")
+                || value.starts_with("http://127.0.0.1")
+                || value.starts_with("http://localhost")
+        })
+}
+
+fn normalize_leaderboard_username(username: &str) -> String {
+    username
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+        .collect::<String>()
+}
+
+fn leaderboard_token(username: &str, password: &str) -> String {
+    let normalized = normalize_leaderboard_username(username);
+    let mut hasher = Sha256::new();
+    hasher.update(b"more-of-dots-leaderboard-v1\0");
+    hasher.update(normalized.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn leaderboard_field_i64(fields: &BTreeMap<String, Value>, needles: &[&str]) -> Option<i64> {
+    fields.iter().find_map(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        let compact_key: String = key
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect();
+        let is_match = needles.iter().any(|needle| {
+            let needle = needle.to_ascii_lowercase();
+            let compact_needle: String = needle
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .collect();
+            key.contains(&needle) || compact_key.contains(&compact_needle)
+        });
+        is_match.then(|| value_as_i64(value)).flatten()
+    })
+}
+
+fn leaderboard_public_stats_from_checkpoint(
+    checkpoint: &UserDataCheckpoint,
+    fallback_username: Option<&str>,
+    region: Option<String>,
+) -> Option<LeaderboardPublicStats> {
+    let username = checkpoint
+        .username
+        .as_deref()
+        .or(fallback_username)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let normalized_username = normalize_leaderboard_username(&username);
+    if normalized_username.is_empty() {
+        return None;
+    }
+    let score = checkpoint
+        .fields
+        .get("score")
+        .and_then(value_as_i64)
+        .or_else(|| leaderboard_field_i64(&checkpoint.fields, &["elo", "rating"]))?;
+    let wins = leaderboard_field_i64(
+        &checkpoint.fields,
+        &[
+            "number of wins",
+            "number_of_wins",
+            "wincount",
+            "win_count",
+            "wins",
+            "victories",
+        ],
+    );
+    let games = leaderboard_field_i64(
+        &checkpoint.fields,
+        &[
+            "number of games",
+            "number_of_games",
+            "games played",
+            "games_played",
+            "gamecount",
+            "game_count",
+            "matchcount",
+            "match_count",
+            "totalgames",
+            "total_games",
+            "games",
+            "matches",
+            "played",
+        ],
+    );
+    let losses = leaderboard_field_i64(
+        &checkpoint.fields,
+        &["losses", "loss_count", "losscount", "defeats"],
+    )
+    .or_else(|| games.zip(wins).map(|(games, wins)| (games - wins).max(0)));
+    let official_rank = leaderboard_field_i64(
+        &checkpoint.fields,
+        &[
+            "ratingrank",
+            "leaderboardrank",
+            "officialrank",
+            "rank",
+            "position",
+            "place",
+        ],
+    );
+
+    Some(LeaderboardPublicStats {
+        username,
+        normalized_username,
+        score,
+        official_rank,
+        games,
+        wins,
+        losses,
+        region,
+        source: checkpoint.source.clone(),
+        fetched_at: checkpoint.fetched_at,
+    })
+}
+
+fn latest_leaderboard_stats(
+    app: &AppHandle,
+) -> Result<(Option<LeaderboardPublicStats>, bool, Option<String>), String> {
+    let checkpoint_path = user_data_checkpoint_path(app)?;
+    let store = load_user_data_checkpoint_store(&checkpoint_path);
+    let login = game_login();
+    let region =
+        load_region_selection(&region_selection_path(app)?).map(|selection| selection.region);
+    let stats = store.checkpoints.last().and_then(|checkpoint| {
+        leaderboard_public_stats_from_checkpoint(checkpoint, login.username.as_deref(), region)
+    });
+    Ok((stats, login.password.is_some(), login.username))
+}
+
+fn leaderboard_status_value(app: &AppHandle) -> Result<Value, String> {
+    let (stats, has_password, login_username) = latest_leaderboard_stats(app)?;
+    let sync = load_leaderboard_sync_state(&leaderboard_sync_path(app)?);
+    let configured = leaderboard_base_url().is_some();
+    let submit_reason = match (&stats, has_password, configured) {
+        (None, _, _) => "No scored user-data checkpoint is available.",
+        (Some(_), false, _) => "War of Dots config login password is missing.",
+        (Some(_), true, false) => "WOD_LEADERBOARD_URL is not configured.",
+        (Some(_), true, true) => "Ready to sync.",
+    };
+
+    Ok(json!({
+        "configured": configured,
+        "canSubmit": stats.is_some() && has_password && configured,
+        "submitReason": submit_reason,
+        "hasPassword": has_password,
+        "loginUsername": login_username,
+        "local": stats,
+        "lastSync": sync,
+    }))
+}
+
+fn leaderboard_sync_state_from_error(
+    username: Option<String>,
+    error: String,
+) -> LeaderboardSyncState {
+    LeaderboardSyncState {
+        status: "sync-failed".to_string(),
+        synced_at: Some(now_unix_secs()),
+        username,
+        message: None,
+        error: Some(error),
+        ..LeaderboardSyncState::default()
+    }
+}
+
+async fn post_leaderboard_snapshot(app: &AppHandle) -> Result<Value, String> {
+    let sync_path = leaderboard_sync_path(app)?;
+    let base_url = leaderboard_base_url()
+        .ok_or_else(|| "WOD_LEADERBOARD_URL is not configured.".to_string())?;
+    let checkpoint_path = user_data_checkpoint_path(app)?;
+    let store = load_user_data_checkpoint_store(&checkpoint_path);
+    let Some(checkpoint) = store.checkpoints.last() else {
+        return Err("No scored user-data checkpoint is available.".to_string());
+    };
+    let login = game_login();
+    let username = checkpoint.username.as_deref().or(login.username.as_deref());
+    let Some(password) = login.password.as_deref() else {
+        return Err("War of Dots config login password is missing.".to_string());
+    };
+    let region =
+        load_region_selection(&region_selection_path(app)?).map(|selection| selection.region);
+    let stats = leaderboard_public_stats_from_checkpoint(checkpoint, username, region)
+        .ok_or_else(|| "No scored user-data checkpoint is available.".to_string())?;
+    let token = leaderboard_token(&stats.username, password);
+    let payload = json!({
+        "player": stats,
+        "claimToken": token,
+        "client": {
+            "app": "More of Dots",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    });
+
+    let response = reqwest::Client::builder()
+        .timeout(LEADERBOARD_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!("{base_url}/snapshot"))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let message = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Leaderboard sync failed.")
+            .to_string();
+        let state = leaderboard_sync_state_from_error(Some(stats.username), message.clone());
+        write_leaderboard_sync_state(&sync_path, &state)?;
+        return Err(message);
+    }
+
+    let public_rank = value.get("rank").and_then(value_as_i64).or_else(|| {
+        value
+            .get("player")
+            .and_then(|player| player.get("rank"))
+            .and_then(value_as_i64)
+    });
+    let public_score = value
+        .get("score")
+        .and_then(value_as_i64)
+        .or_else(|| {
+            value
+                .get("player")
+                .and_then(|player| player.get("score"))
+                .and_then(value_as_i64)
+        })
+        .or(Some(stats.score));
+    let state = LeaderboardSyncState {
+        status: "synced".to_string(),
+        synced_at: Some(now_unix_secs()),
+        username: Some(stats.username),
+        public_rank,
+        public_score,
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        error: None,
+    };
+    write_leaderboard_sync_state(&sync_path, &state)?;
+    Ok(json!({
+        "configured": true,
+        "submitted": true,
+        "lastSync": state,
+        "response": value,
+    }))
+}
+
+async fn fetch_leaderboard_rows() -> Result<Value, String> {
+    let Some(base_url) = leaderboard_base_url() else {
+        return Ok(json!({
+            "configured": false,
+            "rows": [],
+            "message": "WOD_LEADERBOARD_URL is not configured.",
+        }));
+    };
+    let response = reqwest::Client::builder()
+        .timeout(LEADERBOARD_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(format!("{base_url}/leaderboard?limit=100"))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Could not load leaderboard.")
+            .to_string());
+    }
+    Ok(value)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -784,7 +1336,24 @@ fn find_python_probe_dll(app: &AppHandle) -> Option<PathBuf> {
     }
     if let Ok(resource_dir) = app.path().resource_dir() {
         candidates.push(resource_dir.join("wod_python_probe.dll"));
-        if let Some(path) = find_file_by_name(&resource_dir, "wod_python_probe.dll", 4) {
+        candidates.push(
+            resource_dir
+                .join("_up_")
+                .join("tools")
+                .join("python-probe-dll")
+                .join("target")
+                .join("release")
+                .join("wod_python_probe.dll"),
+        );
+        candidates.push(
+            resource_dir
+                .join("tools")
+                .join("python-probe-dll")
+                .join("target")
+                .join("release")
+                .join("wod_python_probe.dll"),
+        );
+        if let Some(path) = find_file_by_name(&resource_dir, "wod_python_probe.dll", 8) {
             candidates.push(path);
         }
     }
@@ -810,9 +1379,15 @@ fn find_python_probe_injector(app: &AppHandle) -> Option<PathBuf> {
 
     let mut candidates = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(
+            resource_dir
+                .join("_up_")
+                .join("scripts")
+                .join("invoke-python-probe.ps1"),
+        );
         candidates.push(resource_dir.join("scripts").join("invoke-python-probe.ps1"));
         candidates.push(resource_dir.join("invoke-python-probe.ps1"));
-        if let Some(path) = find_file_by_name(&resource_dir, "invoke-python-probe.ps1", 4) {
+        if let Some(path) = find_file_by_name(&resource_dir, "invoke-python-probe.ps1", 8) {
             candidates.push(path);
         }
     }
@@ -826,11 +1401,312 @@ fn quote_ps_arg(value: &Path) -> String {
     format!("'{}'", value.to_string_lossy().replace('\'', "''"))
 }
 
+fn python_raw_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn region_selection_payload(output_path: &Path, region: &str) -> String {
+    let escaped_output = python_raw_string(&output_path.to_string_lossy());
+    let escaped_region = python_raw_string(region);
+    r#"
+import gc
+import inspect
+import json
+import os
+import sys
+import time
+import traceback
+
+OUTPUT_PATH = r'''__OUTPUT_PATH__'''
+REGION = r'''__REGION__'''
+REGION_NAMES = ['NA', 'EU', 'ASIA']
+STEERING_KEY = '_codex_region_steering'
+CREATE_CONNECTION_ORIGINAL = '_codex_original_create_connection'
+GET_GAMESERVERS_ORIGINAL = '_codex_original_get_gameservers'
+
+def jsonable(value, depth=3, seen=None):
+    if seen is None:
+        seen = set()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    ident = id(value)
+    if ident in seen:
+        return '<cycle>'
+    seen.add(ident)
+    if depth <= 0:
+        return repr(value)[:160]
+    if isinstance(value, dict):
+        return {str(key): jsonable(child, depth - 1, seen) for key, child in list(value.items())[:24]}
+    if isinstance(value, (list, tuple, set)):
+        return [jsonable(item, depth - 1, seen) for item in list(value)[:12]]
+    attrs = getattr(value, '__dict__', None)
+    if isinstance(attrs, dict):
+        return jsonable(attrs, depth - 1, seen)
+    return repr(value)[:160]
+
+def steering_state(module):
+    state = getattr(module, STEERING_KEY, None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(module, STEERING_KEY, state)
+    state.update({
+        'region': REGION,
+        'selectedIndex': REGION_NAMES.index(REGION) if REGION in REGION_NAMES else None,
+        'updatedAt': int(time.time()),
+    })
+    state.setdefault('servers', [])
+    state.setdefault('selectedServerUrl', None)
+    state.setdefault('serversSource', None)
+    state.setdefault('blockedLatencyUrls', [])
+    return state
+
+def write_result(result):
+    result['region'] = REGION
+    selected = result.get('selectedServerUrl')
+    if selected:
+        result['selectedServerUrl'] = selected
+    result['writtenAt'] = int(time.time())
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    temp_path = OUTPUT_PATH + '.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as handle:
+        json.dump(result, handle, indent=2, default=str)
+    os.replace(temp_path, OUTPUT_PATH)
+
+def normalize_servers(value):
+    if not isinstance(value, (list, tuple)):
+        return None
+    servers = []
+    for item in value:
+        if isinstance(item, str) and item.strip().startswith('ws://'):
+            servers.append(item.strip())
+    return servers or None
+
+def extract_gameservers(value, depth=5):
+    if depth <= 0:
+        return None
+    servers = normalize_servers(value)
+    if servers:
+        return servers
+    if isinstance(value, dict):
+        if 'gameservers' in value:
+            servers = extract_gameservers(value.get('gameservers'), depth - 1)
+            if servers:
+                return servers
+        for key in ('content', 'data', 'response', 'result', 'payload'):
+            if key in value:
+                servers = extract_gameservers(value.get(key), depth - 1)
+                if servers:
+                    return servers
+        for child in value.values():
+            servers = extract_gameservers(child, depth - 1)
+            if servers:
+                return servers
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            servers = extract_gameservers(child, depth - 1)
+            if servers:
+                return servers
+    else:
+        attrs = getattr(value, '__dict__', None)
+        if isinstance(attrs, dict):
+            return extract_gameservers(attrs, depth - 1)
+    return None
+
+def likely_game_server_list(value):
+    return bool(normalize_servers(value))
+
+def record_servers(module, result, value, source):
+    servers = extract_gameservers(value)
+    if not servers:
+        return None
+    state = steering_state(module)
+    selected_index = state.get('selectedIndex')
+    selected_url = servers[selected_index] if isinstance(selected_index, int) and selected_index < len(servers) else None
+    state['servers'] = list(servers)
+    state['selectedServerUrl'] = selected_url
+    state['serversSource'] = source
+    result['serverCount'] = len(servers)
+    result['serversSource'] = source
+    if selected_url:
+        result['selectedServerUrl'] = selected_url
+    return servers
+
+def collect_server_manager_classes(module):
+    classes = []
+    seen_classes = set()
+
+    def add_class(candidate):
+        if candidate is None or not isinstance(candidate, type):
+            return
+        ident = id(candidate)
+        if ident not in seen_classes and callable(getattr(candidate, 'get_gameservers', None)):
+            seen_classes.add(ident)
+            classes.append(candidate)
+
+    add_class(getattr(module, 'ServerManager', None))
+    for value in list(vars(module).values()):
+        if type(value).__name__ == 'ServerManager':
+            add_class(type(value))
+    for value in gc.get_objects():
+        try:
+            if type(value).__name__ == 'ServerManager':
+                add_class(type(value))
+        except Exception:
+            pass
+    return classes
+
+def patch_server_manager_classes(module, classes, result):
+    def make_wrapper(cls, original):
+        def get_gameservers(self, *args, **kwargs):
+            value = original(self, *args, **kwargs)
+            record_servers(module, result, value, '%s.get_gameservers' % getattr(cls, '__name__', 'ServerManager'))
+            return value
+        setattr(get_gameservers, '_codex_region_steering_wrapper', True)
+        return get_gameservers
+
+    for cls in classes:
+        try:
+            current = getattr(cls, 'get_gameservers', None)
+            original = getattr(cls, GET_GAMESERVERS_ORIGINAL, None)
+            if original is None:
+                original = current
+                if original is not None:
+                    setattr(cls, GET_GAMESERVERS_ORIGINAL, original)
+            if callable(original):
+                setattr(cls, 'get_gameservers', make_wrapper(cls, original))
+                result['patchedServerManager'] = True
+                result['patchedServerManagerClasses'].append(getattr(cls, '__name__', 'ServerManager'))
+            else:
+                result['notes'].append('ServerManager.get_gameservers was not callable.')
+            result['patchedClasses'].append('%s.get_gameservers' % getattr(cls, '__name__', 'ServerManager'))
+        except Exception as exc:
+            result['notes'].append('Could not patch %s.get_gameservers: %r' % (getattr(cls, '__name__', 'ServerManager'), exc))
+
+def in_latency_measurement():
+    frame = inspect.currentframe()
+    while frame is not None:
+        if frame.f_code.co_name == 'measure_ws_latency':
+            return True
+        frame = frame.f_back
+    return False
+
+def connection_url(args, kwargs):
+    if args:
+        return args[0]
+    return kwargs.get('url')
+
+def websocket_exception_class():
+    for module_name in ('websocket', 'websocket._exceptions'):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        for name in ('WebSocketException', 'WebSocketConnectionClosedException', 'WebSocketTimeoutException'):
+            candidate = getattr(module, name, None)
+            if isinstance(candidate, type):
+                return candidate
+    return RuntimeError
+
+def should_shape_latency(module, url):
+    if not isinstance(url, str) or not in_latency_measurement():
+        return False
+    state = steering_state(module)
+    servers = state.get('servers') or []
+    selected = state.get('selectedServerUrl')
+    if not selected or url not in servers:
+        return False
+    return url != selected
+
+def make_create_connection_wrapper(module, result, original, label):
+    def create_connection(*args, **kwargs):
+        url = connection_url(args, kwargs)
+        if should_shape_latency(module, url):
+            state = steering_state(module)
+            if url not in state['blockedLatencyUrls']:
+                state['blockedLatencyUrls'].append(url)
+            result['blockedLatencyUrls'] = list(state['blockedLatencyUrls'])
+            time.sleep(0.25)
+            raise websocket_exception_class()('Region steering made this latency probe unreachable.')
+        return original(*args, **kwargs)
+    setattr(create_connection, '_codex_region_steering_wrapper', True)
+    setattr(create_connection, '_codex_region_steering_label', label)
+    return create_connection
+
+def patch_create_connection_owner(module, result, owner, attr, label):
+    if owner is None:
+        return
+    try:
+        current = getattr(owner, attr, None)
+        if not callable(current):
+            return
+        original = getattr(owner, CREATE_CONNECTION_ORIGINAL, None)
+        if original is None:
+            original = current
+            setattr(owner, CREATE_CONNECTION_ORIGINAL, original)
+        if not callable(original):
+            return
+        setattr(owner, attr, make_create_connection_wrapper(module, result, original, label))
+        result['patchedCreateConnection'] = True
+        result['patchedCreateConnectionTargets'].append(label)
+    except Exception as exc:
+        result['notes'].append('Could not patch %s: %r' % (label, exc))
+
+def patch_create_connection(module, result):
+    patch_create_connection_owner(module, result, module, 'create_connection', '__main__.create_connection')
+    websocket_module = sys.modules.get('websocket')
+    patch_create_connection_owner(module, result, websocket_module, 'create_connection', 'websocket.create_connection')
+    websocket_core = sys.modules.get('websocket._core')
+    patch_create_connection_owner(module, result, websocket_core, 'create_connection', 'websocket._core.create_connection')
+
+def main():
+    module = sys.modules.get('__main__')
+    result = {
+        'status': 'armed',
+        'selectedRegion': REGION,
+        'patchedClasses': [],
+        'patchedServerManager': False,
+        'patchedServerManagerClasses': [],
+        'patchedCreateConnection': False,
+        'patchedCreateConnectionTargets': [],
+        'blockedLatencyUrls': [],
+        'notes': [],
+    }
+    if module is None:
+        result['status'] = 'failed'
+        result['notes'].append('__main__ module was not available')
+        write_result(result)
+        return
+    if REGION not in REGION_NAMES:
+        result['status'] = 'invalid_region'
+        result['notes'].append('Region must be NA, EU, or ASIA.')
+        write_result(result)
+        return
+
+    state = steering_state(module)
+    result['selectedIndex'] = state.get('selectedIndex')
+    result['selectedServerUrl'] = state.get('selectedServerUrl')
+    result['serverCount'] = len(state.get('servers') or [])
+    result['serversSource'] = state.get('serversSource')
+
+    classes = collect_server_manager_classes(module)
+    result['serverManagerClassCount'] = len(classes)
+    patch_server_manager_classes(module, classes, result)
+    patch_create_connection(module, result)
+    result['message'] = 'Region steering active. Queue normally.'
+    write_result(result)
+
+try:
+    main()
+except Exception as exc:
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH + '.error.txt', 'w', encoding='utf-8') as handle:
+        handle.write(repr(exc) + '\n' + traceback.format_exc())
+"#
+    .replace("__OUTPUT_PATH__", &escaped_output)
+    .replace("__REGION__", &escaped_region)
+}
+
 fn user_data_export_payload(output_path: &Path) -> String {
-    let escaped_output = output_path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'");
+    let escaped_output = python_raw_string(&output_path.to_string_lossy());
     format!(
         r#"
 import gc
@@ -1610,19 +2486,7 @@ fn run_user_data_flow(
     let mut received_messages = Vec::new();
 
     for frame in frames {
-        let json = serde_json::to_vec(frame).map_err(|error| error.to_string())?;
-        match frame_format {
-            UserDataFrameFormat::Wrapped => {
-                let payload = bake_cake(&json, random)?;
-                send_ws_frame(&mut stream, 0x2, &payload, random)?;
-            }
-            UserDataFrameFormat::Binary => {
-                send_ws_frame(&mut stream, 0x2, &json, random)?;
-            }
-            UserDataFrameFormat::Text => {
-                send_ws_frame(&mut stream, 0x1, &json, random)?;
-            }
-        }
+        send_user_data_value(&mut stream, frame, frame_format, random)?;
 
         for message in receive_user_data_messages(&mut stream, USER_DATA_WAIT, random)? {
             if let Some(score) = find_user_score(&message) {
@@ -1635,6 +2499,23 @@ fn run_user_data_flow(
     }
 
     Ok(None)
+}
+
+fn send_user_data_value(
+    stream: &mut TcpStream,
+    value: &Value,
+    frame_format: UserDataFrameFormat,
+    random: &mut PseudoRandom,
+) -> Result<(), String> {
+    let json = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    match frame_format {
+        UserDataFrameFormat::Wrapped => {
+            let payload = bake_cake(&json, random)?;
+            send_ws_frame(stream, 0x2, &payload, random)
+        }
+        UserDataFrameFormat::Binary => send_ws_frame(stream, 0x2, &json, random),
+        UserDataFrameFormat::Text => send_ws_frame(stream, 0x1, &json, random),
+    }
 }
 
 fn value_as_i64(value: &Value) -> Option<i64> {
@@ -1693,6 +2574,18 @@ fn find_user_data_value(value: &Value) -> Option<Value> {
     }
 }
 
+fn region_index(region: &str) -> Option<usize> {
+    REGION_NAMES
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(region.trim()))
+}
+
+fn normalize_region(region: &str) -> Result<&'static str, String> {
+    region_index(region)
+        .map(|index| REGION_NAMES[index])
+        .ok_or_else(|| "Region must be NA, EU, or ASIA.".to_string())
+}
+
 fn fetch_current_user_score_from_socket() -> Result<UserScoreLookup, String> {
     let login = game_login();
     if login.username.is_none() || login.password.is_none() {
@@ -1745,6 +2638,124 @@ fn fetch_current_user_score_from_socket() -> Result<UserScoreLookup, String> {
     }
 
     Err(last_error.unwrap_or_else(|| "User-data lookup returned no score.".to_string()))
+}
+
+fn inject_region_selection_into_game(app: &AppHandle, region: &str) -> Result<Value, String> {
+    let process = real_game_processes()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "War of Dots is not running.".to_string())?;
+    let process_id = process
+        .process_id
+        .ok_or_else(|| "War of Dots process id was unavailable.".to_string())?;
+
+    let source_dll = find_python_probe_dll(app).ok_or_else(|| {
+        "Python probe DLL is missing; build tools\\python-probe-dll first.".to_string()
+    })?;
+    let injector = find_python_probe_injector(app)
+        .ok_or_else(|| "Python probe injector script is missing.".to_string())?;
+
+    let probe_root = app_runtime_dir(app)?
+        .join("probes")
+        .join("region-selection");
+    fs::create_dir_all(&probe_root).map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let probe_dll = probe_root.join(format!("wod_python_probe_{unique}.dll"));
+    let payload_path = probe_root.join("wod_python_probe_payload.py");
+    let output_path = probe_root.join("region-selection-result.json");
+    let status_path = probe_root.join("wod_python_probe.status.json");
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(output_path.with_extension("json.error.txt"));
+    let _ = fs::remove_file(&status_path);
+    fs::copy(&source_dll, &probe_dll).map_err(|error| {
+        format!(
+            "Could not stage Python probe DLL {} to {}: {error}",
+            source_dll.display(),
+            probe_dll.display()
+        )
+    })?;
+    fs::write(
+        &payload_path,
+        region_selection_payload(&output_path, region),
+    )
+    .map_err(|error| format!("Could not write {}: {error}", payload_path.display()))?;
+
+    let script = format!(
+        "& {} -ProcessId {} -ProbeDll {} -TimeoutSeconds 10",
+        quote_ps_arg(&injector),
+        process_id,
+        quote_ps_arg(&probe_dll)
+    );
+    let output = run_hidden_powershell(&script)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "Region selection probe injection failed: {}",
+            if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            }
+        ));
+    }
+
+    let deadline = Instant::now() + REGION_SELECTION_WAIT;
+    while Instant::now() < deadline {
+        if output_path.is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let value = read_json_file(&output_path).ok_or_else(|| {
+        let status = read_json_file(&status_path)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "no probe status".to_string());
+        format!("Region selection probe did not produce a result ({status}).")
+    })?;
+    match value.get("status").and_then(Value::as_str) {
+        Some("armed") => {}
+        Some("invalid_region") => {
+            return Err("Region must be NA, EU, or ASIA.".to_string());
+        }
+        Some("failed") => {
+            return Err(value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Region steering probe could not be armed.")
+                .to_string());
+        }
+        _ => {
+            return Err("Region steering probe returned an unexpected result.".to_string());
+        }
+    }
+    Ok(value)
+}
+
+fn region_status_value(app: &AppHandle) -> Result<Value, String> {
+    let game_running = real_game_is_running();
+    let selection_path = region_selection_path(app)?;
+    let selected = if game_running {
+        load_region_selection(&selection_path)
+    } else {
+        None
+    };
+    let message = if game_running {
+        "War of Dots detected. Choose a region to apply it live."
+    } else {
+        "Start War of Dots to apply a region."
+    };
+
+    Ok(json!({
+        "gameRunning": game_running,
+        "selectedRegion": selected.as_ref().map(|selection| selection.region.clone()),
+        "selectedAt": selected.as_ref().map(|selection| selection.selected_at),
+        "message": message,
+    }))
 }
 
 fn sample_delta_max_bytes() -> usize {
@@ -1829,6 +2840,239 @@ fn discover_replay_dirs() -> Vec<PathBuf> {
         push_unique_path(&mut replay_dirs, configured_replay_dir);
     }
     replay_dirs
+}
+
+fn discover_map_editor_dirs() -> Vec<PathBuf> {
+    let mut map_dirs = discover_steamapps_dirs()
+        .into_iter()
+        .map(|steamapps| {
+            steamapps
+                .join("common")
+                .join(GAME_DIR_NAME)
+                .join("map_editor")
+        })
+        .filter(|path| path.is_dir())
+        .fold(Vec::new(), |mut map_dirs, path| {
+            push_unique_path(&mut map_dirs, path);
+            map_dirs
+        });
+    let configured_map_dir = steam_game_dir().join("map_editor");
+    if configured_map_dir.is_dir() {
+        push_unique_path(&mut map_dirs, configured_map_dir);
+    }
+    map_dirs
+}
+
+fn primary_map_editor_dir() -> Result<PathBuf, String> {
+    discover_map_editor_dirs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "War of Dots map_editor folder was not found.".to_string())
+}
+
+fn safe_map_file_name(file_name: &str) -> Result<String, String> {
+    let name = file_name.trim();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+        || !name.to_ascii_lowercase().ends_with(".txt")
+    {
+        return Err("Map filename must be a .txt file in War of Dots map_editor.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn read_gzip_json_file(path: &Path) -> Result<Value, String> {
+    let file =
+        File::open(path).map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+    let mut decoder = GzDecoder::new(file);
+    let mut text = String::new();
+    decoder
+        .read_to_string(&mut text)
+        .map_err(|error| format!("Could not decompress {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("Map JSON is invalid in {}: {error}", path.display()))
+}
+
+fn write_gzip_json_file(path: &Path, value: &Value) -> Result<(), String> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let text = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    encoder
+        .write_all(&text)
+        .map_err(|error| format!("Could not compress map JSON: {error}"))?;
+    let bytes = encoder
+        .finish()
+        .map_err(|error| format!("Could not finish map gzip stream: {error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+fn map_file_path(file_name: &str) -> Result<PathBuf, String> {
+    let file_name = safe_map_file_name(file_name)?;
+    Ok(primary_map_editor_dir()?.join(file_name))
+}
+
+fn png_dimensions_from_base64(base64_png: &str) -> Option<(u32, u32)> {
+    let bytes = BASE64.decode(base64_png.trim().as_bytes()).ok()?;
+    if bytes.len() < 24 || bytes.get(0..8)? != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn map_team_count(data: &Value) -> usize {
+    let infantry = data
+        .get("infantry")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let tanks = data
+        .get("tanks")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    infantry.max(tanks).clamp(2, 4)
+}
+
+fn map_dimensions(data: &Value) -> (u32, u32) {
+    data.get("map_surface")
+        .and_then(Value::as_str)
+        .and_then(png_dimensions_from_base64)
+        .unwrap_or((960, 540))
+}
+
+fn mode_team_count(mode: &str) -> usize {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "v3" | "3pffa" | "3p ffa" => 3,
+        "v4" | "4pffa" | "4p ffa" | "ffa" => 4,
+        _ => 2,
+    }
+}
+
+fn solid_map_surface_base64(width: u32, height: u32) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("Could not create default map PNG: {error}"))?;
+        let mut pixels = vec![0u8; (width as usize) * (height as usize) * 3];
+        for chunk in pixels.chunks_exact_mut(3) {
+            chunk[0] = 0xA1;
+            chunk[1] = 0xC2;
+            chunk[2] = 0x46;
+        }
+        writer
+            .write_image_data(&pixels)
+            .map_err(|error| format!("Could not write default map PNG: {error}"))?;
+    }
+    Ok(BASE64.encode(bytes))
+}
+
+fn default_game_map_value(mode: &str) -> Result<Value, String> {
+    let mode = match mode.trim().to_ascii_lowercase().as_str() {
+        "v3" => "v3",
+        "v4" => "v4",
+        _ => "1v1",
+    };
+    let team_count = mode_team_count(mode);
+    Ok(json!({
+        "map_surface": solid_map_surface_base64(960, 540)?,
+        "mode": mode,
+        "infantry": vec![Vec::<Value>::new(); team_count],
+        "tanks": vec![Vec::<Value>::new(); team_count],
+        "cities": Vec::<Value>::new(),
+        "capitals": Vec::<Value>::new(),
+        "bridges": Vec::<Value>::new(),
+    }))
+}
+
+fn display_name_for_map_file(file_name: &str) -> String {
+    file_name
+        .strip_suffix(".txt")
+        .unwrap_or(file_name)
+        .replace('_', " ")
+}
+
+fn safe_map_name_slug(name: &str) -> String {
+    let slug = name
+        .trim()
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if matches!(character, ' ' | '-' | '_') {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    slug.trim_matches('_').chars().take(32).collect()
+}
+
+fn validate_game_map_value(value: &Value) -> Result<(), String> {
+    if !value.is_object() {
+        return Err("Map data must be a JSON object.".to_string());
+    }
+    for key in ["map_surface", "mode"] {
+        if value.get(key).and_then(Value::as_str).is_none() {
+            return Err(format!("Map data is missing string field {key}."));
+        }
+    }
+    for key in ["infantry", "tanks", "cities", "capitals", "bridges"] {
+        if value.get(key).and_then(Value::as_array).is_none() {
+            return Err(format!("Map data is missing array field {key}."));
+        }
+    }
+    if value
+        .get("map_surface")
+        .and_then(Value::as_str)
+        .and_then(png_dimensions_from_base64)
+        .is_none()
+    {
+        return Err("Map surface must be a base64 PNG image.".to_string());
+    }
+    Ok(())
+}
+
+fn map_record_from_path(path: &Path) -> Result<GameMapRecord, String> {
+    let file_name = candidate_file_name(path);
+    let data = read_gzip_json_file(path)?;
+    if validate_game_map_value(&data).is_err() {
+        return Err(format!("{} is not a War of Dots map file.", path.display()));
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Could not stat {}: {error}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_secs)
+        .unwrap_or(0);
+    let created = metadata
+        .created()
+        .ok()
+        .and_then(system_time_to_secs)
+        .unwrap_or(modified);
+    let (width, height) = map_dimensions(&data);
+    let team_count = map_team_count(&data);
+    Ok(GameMapRecord {
+        id: file_name.clone(),
+        file_name: file_name.clone(),
+        file_path: path.to_string_lossy().to_string(),
+        name: display_name_for_map_file(&file_name),
+        data,
+        created_at: created.saturating_mul(1000),
+        updated_at: modified.saturating_mul(1000),
+        width,
+        height,
+        team_count,
+    })
 }
 
 fn discover_steamapps_dirs() -> Vec<PathBuf> {
@@ -2132,10 +3376,15 @@ fn flatten_name(value: &Value) -> String {
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(" / "),
+        Value::Object(object) => ["username", "name", "display_name", "displayName"]
+            .iter()
+            .find_map(|key| object.get(*key).map(flatten_name))
+            .filter(|part| !part.is_empty())
+            .unwrap_or_default(),
         Value::String(text) => text.trim().to_string(),
         Value::Number(number) => number.to_string(),
         Value::Bool(flag) => flag.to_string(),
-        Value::Null | Value::Object(_) => String::new(),
+        Value::Null => String::new(),
     }
 }
 
@@ -2414,6 +3663,7 @@ fn replay_map_id(raw: &Value) -> Option<String> {
 
 fn custom_map_surface(raw: &Value) -> Option<String> {
     raw.get("custom_map")
+        .or_else(|| raw.get("map").filter(|map| map.is_object()))
         .and_then(|custom_map| custom_map.get("map_surface"))
         .and_then(Value::as_str)
         .map(str::trim)
@@ -2456,8 +3706,16 @@ fn map_image_data_url(game_root: &Path, map_id: &str) -> Option<String> {
     }
 
     let file_name = format!("map{safe_map_id}.png");
-    let path = game_root.join("assets").join("fahero_maps").join(file_name);
-    png_data_url(&path)
+    let assets_root = game_root.join("assets");
+    [
+        assets_root.join("fahero_maps").join(&file_name),
+        assets_root.join("zolamare_maps").join(&file_name),
+        game_root
+            .join("map_editor")
+            .join(format!("generated_map{safe_map_id}.png")),
+    ]
+    .into_iter()
+    .find_map(|path| png_data_url(&path))
 }
 
 fn system_time_to_secs(time: SystemTime) -> Option<u64> {
@@ -2583,36 +3841,76 @@ async fn release_job_artifacts(app: AppHandle, job_id: String) -> Result<Value, 
     .await
 }
 
-fn list_replays_impl(app: &AppHandle) -> Result<Vec<ReplaySummary>, String> {
+fn list_replays_impl(
+    app: &AppHandle,
+    offset: usize,
+    limit: usize,
+) -> Result<ReplayListPayload, String> {
     let candidates = collect_replay_candidates(&app)?;
+    let (candidates, dedupe_errors) = dedupe_replay_candidates_by_hash(candidates);
+    for error in dedupe_errors {
+        eprintln!("{error}");
+    }
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ReplayListPayload {
+            replays: Vec::new(),
+            total_candidates: 0,
+            has_more: false,
+            next_offset: None,
+        });
     }
 
+    let backup_dir = replay_backup_dir(app)?;
+    let index_path = replay_index_path(app)?;
+    let mut index = load_replay_index(&index_path);
     let mut map_cache = HashMap::new();
     let mut parsed_replays = Vec::new();
+    let mut index_changed = false;
+    let offset = offset.min(candidates.len());
+    let limit = if limit == 0 {
+        // Frontend sends 0 for the "All" items-per-page option.
+        candidates.len().saturating_sub(offset)
+    } else {
+        limit.clamp(1, MAX_REPLAY_PAGE_SIZE)
+    };
+    let page_end = offset.saturating_add(limit).min(candidates.len());
 
-    for candidate in &candidates {
-        match parse_replay(&candidate.path) {
-            Ok(mut parsed) => {
-                parsed.summary.file_name = candidate.file_name.clone();
-                parsed.summary.modified = candidate.modified;
-                parsed.summary.score_delta = None;
-                parsed.summary.file_path = candidate.path.to_string_lossy().to_string();
-                if let Some(replay_dir) = candidate.thumbnail_replay_dir.as_deref() {
-                    parsed.summary.thumbnail_data_url =
-                        thumbnail_for_replay(replay_dir, &parsed, &mut map_cache);
+    for candidate in &candidates[offset..page_end] {
+        let key = path_key(&candidate.original_path);
+        let cached = index
+            .entries
+            .get(&key)
+            .and_then(|entry| parsed_replay_from_index(entry, candidate));
+
+        let mut parsed = match cached {
+            Some(parsed) => parsed,
+            None => match parse_replay_candidate(candidate, &backup_dir) {
+                Ok((parsed, entry)) => {
+                    index.entries.insert(key, entry);
+                    index_changed = true;
+                    parsed
                 }
-                parsed_replays.push(parsed);
-            }
-            Err(error) => {
-                eprintln!("Skipping {}: {error}", candidate.path.display());
-            }
+                Err(error) => {
+                    eprintln!("Skipping {}: {error}", candidate.path.display());
+                    continue;
+                }
+            },
+        };
+
+        parsed.summary.score_delta = None;
+        if let Some(replay_dir) = candidate.thumbnail_replay_dir.as_deref() {
+            parsed.summary.thumbnail_data_url =
+                thumbnail_for_replay(replay_dir, &parsed, &mut map_cache);
         }
+        parsed_replays.push(parsed);
+    }
+
+    if index_changed {
+        write_replay_index(&index_path, &index)?;
     }
 
     let home_player = detect_home_player(&parsed_replays);
-    let mut replays = parsed_replays
+    let replays = parsed_replays
         .into_iter()
         .map(|mut parsed| {
             let winner_index = replay_winner_index(
@@ -2626,28 +3924,142 @@ fn list_replays_impl(app: &AppHandle) -> Result<Vec<ReplaySummary>, String> {
             if let Some(home_player) = home_player.as_deref() {
                 put_home_player_first(&mut parsed.summary.players, home_player);
             }
+
             parsed.summary
         })
         .collect::<Vec<_>>();
 
-    replays.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
-            .then_with(|| a.file_name.cmp(&b.file_name))
-    });
-
-    Ok(replays)
+    Ok(ReplayListPayload {
+        replays,
+        total_candidates: candidates.len(),
+        has_more: page_end < candidates.len(),
+        next_offset: (page_end < candidates.len()).then_some(page_end),
+    })
 }
 
 #[tauri::command]
-async fn list_replays(app: AppHandle) -> Result<Vec<ReplaySummary>, String> {
-    tauri::async_runtime::spawn_blocking(move || list_replays_impl(&app))
+async fn list_replays(
+    app: AppHandle,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ReplayListPayload, String> {
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(DEFAULT_REPLAY_PAGE_SIZE);
+    tauri::async_runtime::spawn_blocking(move || list_replays_impl(&app, offset, limit))
         .await
         .map_err(|error| format!("Replay loading task failed: {error}"))?
 }
 
+fn list_maps_impl() -> Result<Vec<GameMapRecord>, String> {
+    let mut maps = Vec::new();
+    for map_dir in discover_map_editor_dirs() {
+        let entries = fs::read_dir(&map_dir)
+            .map_err(|error| format!("Could not read map folder {}: {error}", map_dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file()
+                || path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map_or(true, |extension| !extension.eq_ignore_ascii_case("txt"))
+            {
+                continue;
+            }
+            match map_record_from_path(&path) {
+                Ok(map) => maps.push(map),
+                Err(error) => eprintln!("Skipping map {}: {error}", path.display()),
+            }
+        }
+    }
+    maps.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
+    Ok(maps)
+}
+
 #[tauri::command]
-fn fetch_user_data(app: AppHandle) -> Result<Value, String> {
+async fn list_maps() -> Result<Vec<GameMapRecord>, String> {
+    tauri::async_runtime::spawn_blocking(list_maps_impl)
+        .await
+        .map_err(|error| format!("Map loading task failed: {error}"))?
+}
+
+#[tauri::command]
+fn read_map(file_name: String) -> Result<GameMapRecord, String> {
+    let path = map_file_path(&file_name)?;
+    if !path.is_file() {
+        return Err(format!("Map file does not exist: {}", path.display()));
+    }
+    map_record_from_path(&path)
+}
+
+#[tauri::command]
+fn save_map(file_name: String, data: Value) -> Result<GameMapRecord, String> {
+    validate_game_map_value(&data)?;
+    let path = map_file_path(&file_name)?;
+    let mut next = if path.exists() {
+        match read_gzip_json_file(&path) {
+            Ok(Value::Object(existing)) => Value::Object(existing),
+            _ => json!({}),
+        }
+    } else {
+        json!({})
+    };
+    if let (Some(existing), Some(incoming)) = (next.as_object_mut(), data.as_object()) {
+        for (key, value) in incoming {
+            existing.insert(key.clone(), value.clone());
+        }
+    } else {
+        next = data;
+    }
+    validate_game_map_value(&next)?;
+    write_gzip_json_file(&path, &next)?;
+    map_record_from_path(&path)
+}
+
+#[tauri::command]
+fn create_map(name: String, mode: String) -> Result<GameMapRecord, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let slug = safe_map_name_slug(&name);
+    let file_name = if slug.is_empty() {
+        format!("map_{timestamp}.txt")
+    } else {
+        format!("map_{slug}_{timestamp}.txt")
+    };
+    let path = map_file_path(&file_name)?;
+    let data = default_game_map_value(&mode)?;
+    write_gzip_json_file(&path, &data)?;
+    map_record_from_path(&path)
+}
+
+#[tauri::command]
+fn delete_maps(file_names: Vec<String>) -> Result<Vec<String>, String> {
+    let mut targets = Vec::new();
+    for file_name in &file_names {
+        let safe_file_name = safe_map_file_name(&file_name)?;
+        let path = map_file_path(&safe_file_name)?;
+        if !path.is_file() {
+            return Err(format!("Map file does not exist: {}", path.display()));
+        }
+        targets.push((safe_file_name, path));
+    }
+
+    let mut deleted = Vec::new();
+    for (safe_file_name, path) in targets {
+        fs::remove_file(&path)
+            .map_err(|error| format!("Could not delete {}: {error}", path.display()))?;
+        deleted.push(safe_file_name);
+    }
+    Ok(deleted)
+}
+
+fn fetch_user_data_impl(app: &AppHandle) -> Result<Value, String> {
     let checkpoint_path = user_data_checkpoint_path(&app)?;
     let mut store = load_user_data_checkpoint_store(&checkpoint_path);
     let fetched_at = now_unix_secs();
@@ -2703,6 +4115,61 @@ fn fetch_user_data(app: AppHandle) -> Result<Value, String> {
         "messages": messages,
         "checkpoints": checkpoints,
         "checkpointFile": checkpoint_path.to_string_lossy(),
+    }))
+}
+
+#[tauri::command]
+async fn fetch_user_data(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_user_data_impl(&app))
+        .await
+        .map_err(|error| format!("User data task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn leaderboard_status(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || leaderboard_status_value(&app))
+        .await
+        .map_err(|error| format!("Leaderboard status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn leaderboard_submit(app: AppHandle) -> Result<Value, String> {
+    post_leaderboard_snapshot(&app).await
+}
+
+#[tauri::command]
+async fn leaderboard_list() -> Result<Value, String> {
+    fetch_leaderboard_rows().await
+}
+
+#[tauri::command]
+fn region_status(app: AppHandle) -> Result<Value, String> {
+    region_status_value(&app)
+}
+
+#[tauri::command]
+fn select_region(app: AppHandle, region: String) -> Result<Value, String> {
+    if !real_game_is_running() {
+        return Err("War of Dots is not running.".to_string());
+    }
+    let region = normalize_region(&region)?;
+    let apply_result = inject_region_selection_into_game(&app, region)?;
+    let selection = RegionSelection {
+        region: region.to_string(),
+        selected_at: now_unix_secs(),
+    };
+    write_region_selection(&region_selection_path(&app)?, &selection)?;
+    let message = apply_result
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| "Region steering active. Queue normally.");
+
+    Ok(json!({
+        "gameRunning": true,
+        "selectedRegion": selection.region,
+        "selectedAt": selection.selected_at,
+        "message": message,
+        "applyResult": apply_result,
     }))
 }
 
@@ -3183,7 +4650,17 @@ pub fn run() {
             stage_game,
             list_jobs,
             list_replays,
+            list_maps,
+            read_map,
+            save_map,
+            create_map,
+            delete_maps,
             fetch_user_data,
+            leaderboard_status,
+            leaderboard_submit,
+            leaderboard_list,
+            region_status,
+            select_region,
             get_job,
             capture_replay,
             capture_replay_path,
@@ -3197,4 +4674,327 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatten_name_reads_new_player_objects() {
+        let value = json!([
+            [
+                {
+                    "username": "thesavvyy",
+                    "title": "Veteran"
+                }
+            ],
+            [
+                {
+                    "username": "aexer0e",
+                    "title": "Friend"
+                }
+            ]
+        ]);
+
+        let names = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, name)| clean_player_name(&flatten_name(name), index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["thesavvyy", "aexer0e"]);
+    }
+
+    #[test]
+    fn custom_map_surface_reads_new_map_location() {
+        let raw = json!({
+            "map": {
+                "version": null,
+                "map_surface": "iVBORw0KGgo="
+            },
+            "player_usernames": []
+        });
+
+        assert_eq!(custom_map_surface(&raw), Some("iVBORw0KGgo=".to_string()));
+        assert_eq!(replay_map_id(&raw), None);
+    }
+
+    #[test]
+    fn leaderboard_token_does_not_expose_raw_password() {
+        let token = leaderboard_token("Savvy", "hunter2");
+
+        assert_eq!(token.len(), 64);
+        assert!(!token.contains("hunter2"));
+        assert_eq!(token, leaderboard_token("savvy", "hunter2"));
+        assert_ne!(token, leaderboard_token("savvy", "different-password"));
+    }
+
+    #[test]
+    fn leaderboard_public_stats_are_minimal_and_sanitized() {
+        let mut fields = BTreeMap::new();
+        fields.insert("score".to_string(), json!(1510));
+        fields.insert("profile.game_count".to_string(), json!(12));
+        fields.insert("number_of_wins".to_string(), json!(7));
+        fields.insert("password".to_string(), json!("secret"));
+        fields.insert("session.token".to_string(), json!("token-value"));
+        let checkpoint = UserDataCheckpoint {
+            fetched_at: 123,
+            username: Some("Savvy".to_string()),
+            source: "game-json".to_string(),
+            fields,
+        };
+
+        let stats =
+            leaderboard_public_stats_from_checkpoint(&checkpoint, None, Some("NA".to_string()))
+                .unwrap();
+        let serialized = serde_json::to_string(&stats).unwrap();
+
+        assert_eq!(stats.normalized_username, "savvy");
+        assert_eq!(stats.score, 1510);
+        assert_eq!(stats.games, Some(12));
+        assert_eq!(stats.wins, Some(7));
+        assert_eq!(stats.losses, Some(5));
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("token-value"));
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("session"));
+    }
+
+    #[test]
+    fn leaderboard_status_reports_missing_password_as_view_only() {
+        let source = include_str!("lib.rs");
+
+        assert!(source.contains("War of Dots config login password is missing."));
+        assert!(source.contains("\"hasPassword\""));
+        assert!(source.contains("\"canSubmit\""));
+    }
+
+    #[test]
+    fn map_filename_validation_stays_inside_map_editor() {
+        assert_eq!(
+            safe_map_file_name("generated_map1.txt").unwrap(),
+            "generated_map1.txt"
+        );
+        assert!(safe_map_file_name("../config.txt").is_err());
+        assert!(safe_map_file_name(r"..\config.txt").is_err());
+        assert!(safe_map_file_name("map.json").is_err());
+    }
+
+    #[test]
+    fn default_map_surface_is_current_png_shape() {
+        let data = default_game_map_value("v4").unwrap();
+
+        assert_eq!(map_team_count(&data), 4);
+        assert_eq!(map_dimensions(&data), (960, 540));
+        validate_game_map_value(&data).unwrap();
+    }
+
+    #[test]
+    fn gzip_map_roundtrip_preserves_unknown_fields() {
+        let root = env::temp_dir().join(format!(
+            "more-of-dots-map-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("map_test.txt");
+        let mut data = default_game_map_value("1v1").unwrap();
+        data.as_object_mut()
+            .unwrap()
+            .insert("version".to_string(), Value::Null);
+        data.as_object_mut()
+            .unwrap()
+            .insert("custom_unknown".to_string(), json!({"kept": true}));
+
+        write_gzip_json_file(&path, &data).unwrap();
+        let read = read_gzip_json_file(&path).unwrap();
+
+        assert_eq!(read.get("version"), Some(&Value::Null));
+        assert_eq!(
+            read.pointer("/custom_unknown/kept"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(map_dimensions(&read), (960, 540));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&root);
+    }
+
+    #[test]
+    fn replay_index_entry_invalidates_on_path_size_or_mtime_change() {
+        let path = PathBuf::from(r"C:\replays\match.rep");
+        let candidate = ReplayCandidate {
+            path: path.clone(),
+            original_path: path.clone(),
+            file_name: "match.rep".to_string(),
+            modified: 123,
+            size: 456,
+            known_hash: None,
+            is_backup: false,
+            thumbnail_replay_dir: None,
+        };
+        let parsed = ParsedReplay {
+            summary: ReplaySummary {
+                file_name: "match.rep".to_string(),
+                file_path: path.to_string_lossy().to_string(),
+                players: Vec::new(),
+                length: "0:00".to_string(),
+                duration_seconds: 0,
+                thumbnail_data_url: None,
+                modified: 123,
+                score_delta: None,
+            },
+            result: None,
+            event_winner_index: None,
+            map_id: None,
+            custom_map_surface: None,
+        };
+        let entry = ReplayIndexEntry {
+            path_key: path_key(&path),
+            original_path: path.to_string_lossy().to_string(),
+            backup_path: path.to_string_lossy().to_string(),
+            file_name: "match.rep".to_string(),
+            modified: 123,
+            size: 456,
+            hash: "abc".to_string(),
+            parsed: Some(parsed),
+        };
+
+        assert!(replay_index_entry_matches(&entry, &candidate));
+
+        let mut changed = candidate.clone();
+        changed.size += 1;
+        assert!(!replay_index_entry_matches(&entry, &changed));
+
+        let mut changed = candidate.clone();
+        changed.modified += 1;
+        assert!(!replay_index_entry_matches(&entry, &changed));
+
+        let mut changed = candidate;
+        changed.original_path = PathBuf::from(r"C:\replays\other.rep");
+        assert!(!replay_index_entry_matches(&entry, &changed));
+    }
+
+    #[test]
+    fn map_image_lookup_falls_back_to_zolamare_maps() {
+        let root = env::temp_dir().join(format!(
+            "more-of-dots-zolamare-map-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let map_dir = root.join("assets").join("zolamare_maps");
+        fs::create_dir_all(&map_dir).unwrap();
+        fs::write(map_dir.join("map33.png"), b"not-a-real-png-but-good-enough").unwrap();
+
+        let data_url = map_image_data_url(&root, "33").unwrap();
+
+        assert!(data_url.starts_with("data:image/png;base64,"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replay_candidate_merge_prefers_live_file_for_same_hash() {
+        let mut candidates = BTreeMap::new();
+        let backup = ReplayCandidate {
+            path: PathBuf::from(r"C:\runtime\replay-backups\abc.rep"),
+            original_path: PathBuf::from(r"C:\runtime\replay-backups\abc.rep"),
+            file_name: "abc.rep".to_string(),
+            modified: 200,
+            size: 10,
+            known_hash: Some("abc".to_string()),
+            is_backup: true,
+            thumbnail_replay_dir: None,
+        };
+        let live = ReplayCandidate {
+            path: PathBuf::from(r"C:\game\replays\replay.rep"),
+            original_path: PathBuf::from(r"C:\game\replays\replay.rep"),
+            file_name: "replay.rep".to_string(),
+            modified: 100,
+            size: 10,
+            known_hash: Some("abc".to_string()),
+            is_backup: false,
+            thumbnail_replay_dir: Some(PathBuf::from(r"C:\game\replays")),
+        };
+
+        insert_candidate(&mut candidates, backup);
+        insert_candidate(&mut candidates, live);
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.values().next().unwrap();
+        assert!(!candidate.is_backup);
+        assert_eq!(candidate.file_name, "replay.rep");
+        assert!(candidate.thumbnail_replay_dir.is_some());
+    }
+
+    #[test]
+    fn replay_candidate_hash_dedupe_collapses_duplicate_files() {
+        let root = env::temp_dir().join(format!(
+            "more-of-dots-replay-dedupe-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.rep");
+        let second_path = root.join("second.rep");
+        let unique_path = root.join("unique.rep");
+        fs::write(&first_path, b"same replay bytes").unwrap();
+        fs::write(&second_path, b"same replay bytes").unwrap();
+        fs::write(&unique_path, b"different replay bytes").unwrap();
+
+        let candidates = vec![
+            ReplayCandidate {
+                path: first_path.clone(),
+                original_path: first_path,
+                file_name: "first.rep".to_string(),
+                modified: 100,
+                size: 17,
+                known_hash: None,
+                is_backup: false,
+                thumbnail_replay_dir: None,
+            },
+            ReplayCandidate {
+                path: second_path.clone(),
+                original_path: second_path,
+                file_name: "second.rep".to_string(),
+                modified: 200,
+                size: 17,
+                known_hash: None,
+                is_backup: false,
+                thumbnail_replay_dir: None,
+            },
+            ReplayCandidate {
+                path: unique_path.clone(),
+                original_path: unique_path,
+                file_name: "unique.rep".to_string(),
+                modified: 150,
+                size: 22,
+                known_hash: None,
+                is_backup: false,
+                thumbnail_replay_dir: None,
+            },
+        ];
+
+        let (deduped, errors) = dedupe_replay_candidates_by_hash(candidates);
+
+        assert!(errors.is_empty());
+        assert_eq!(deduped.len(), 2);
+        assert!(deduped
+            .iter()
+            .any(|candidate| candidate.file_name == "second.rep"));
+        assert!(deduped
+            .iter()
+            .any(|candidate| candidate.file_name == "unique.rep"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -1,7 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import MapEditorApp from "./map-editor/App";
 import "./styles.css";
+
+declare global {
+  interface Window {
+    __mapEditorConfirmLeave?: () => Promise<boolean>;
+  }
+}
 
 type RunnerState = {
   available: boolean;
@@ -266,6 +275,11 @@ type ReplayBrowserItem = {
   scoreDelta?: number | null;
 };
 
+type ReplayBrowserPayload = {
+  replays: ReplayBrowserItem[];
+  totalCandidates: number;
+};
+
 type BrowserSuggestion = {
   name: string;
   normalizedName: string;
@@ -293,7 +307,8 @@ type BrowserRenderedCard = {
   winnerNameElement: HTMLElement | null;
   visible: boolean;
 };
-type BrowserPage = "replays" | "userData";
+type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";
+type BrowserReplayPageSizeOption = 20 | 50 | 100 | "all";
 type UserCheckpoint = {
   fetchedAt: number;
   source?: string | null;
@@ -312,10 +327,71 @@ type UserDataPayload = {
   checkpoints: UserCheckpoint[];
   checkpointFile?: string;
 };
+type ScorePoint = {
+  time: number;
+  score: number;
+  label: string;
+};
+type LeaderboardLocalStats = {
+  username: string;
+  normalizedUsername: string;
+  score: number;
+  officialRank?: number | null;
+  games?: number | null;
+  wins?: number | null;
+  losses?: number | null;
+  region?: string | null;
+  source?: string | null;
+  fetchedAt?: number | null;
+};
+type LeaderboardSyncState = {
+  status: "synced" | "not-submitted" | "sync-failed" | string;
+  syncedAt?: number | null;
+  username?: string | null;
+  publicRank?: number | null;
+  publicScore?: number | null;
+  message?: string | null;
+  error?: string | null;
+};
+type LeaderboardStatusPayload = {
+  configured: boolean;
+  canSubmit: boolean;
+  submitReason: string;
+  hasPassword: boolean;
+  loginUsername?: string | null;
+  local?: LeaderboardLocalStats | null;
+  lastSync?: LeaderboardSyncState | null;
+};
+type LeaderboardRow = {
+  rank: number;
+  username: string;
+  normalizedUsername?: string | null;
+  score: number;
+  officialRank?: number | null;
+  games?: number | null;
+  wins?: number | null;
+  losses?: number | null;
+  region?: string | null;
+  updatedAt?: number | null;
+  lastSeen?: number | null;
+};
+type LeaderboardListPayload = {
+  configured: boolean;
+  rows: LeaderboardRow[];
+  message?: string | null;
+};
 type UserField = {
   key: string;
   label: string;
   value: unknown;
+};
+type RegionName = "NA" | "EU" | "ASIA";
+type RegionStatusPayload = {
+  gameRunning: boolean;
+  selectedRegion?: RegionName | null;
+  selectedAt?: number | null;
+  message?: string | null;
+  applyResult?: unknown;
 };
 
 const foundAppRoot = document.querySelector<HTMLDivElement>("#app");
@@ -380,6 +456,16 @@ const GRAPH_MIN_SIZE = { width: 170, height: 96 };
 const DURATION_SLIDER_STEPS = 1000;
 const DURATION_SLIDER_MIDPOINT_SECONDS = 5 * 60;
 const SUGGESTION_LIMIT = 8;
+const BROWSER_REPLAY_PAGE_SIZE_STORAGE_KEY = "wodReplayBrowserPageSize";
+const BROWSER_REPLAY_PAGE_SIZE_OPTIONS: BrowserReplayPageSizeOption[] = [20, 50, 100, "all"];
+const DEFAULT_BROWSER_REPLAY_PAGE_SIZE: BrowserReplayPageSizeOption = 100;
+const BROWSER_REPLAY_PLAYBACK_ENABLED = false;
+const REGION_NAMES: RegionName[] = ["NA", "EU", "ASIA"];
+const REGION_LABELS: Record<RegionName, string> = {
+  NA: "North America",
+  EU: "Europe",
+  ASIA: "Asia",
+};
 const FALLBACK_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(`
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">
   <rect width="640" height="360" fill="#9fbd42"/>
@@ -448,6 +534,8 @@ let graphZCounter = 20;
 let browserReplays: ReplayBrowserItem[] = [];
 let browserLoading = false;
 let browserError = "";
+let browserReplayTotal = 0;
+let browserReplayPage = 0;
 let browserSearch = "";
 let browserHideUnmatched = true;
 let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
@@ -459,14 +547,27 @@ let browserSuggestionItems: BrowserSuggestion[] = [];
 let browserRenderedCards: BrowserRenderedCard[] = [];
 let pendingBrowserSearchFrame = 0;
 let browserOpeningPaths = new Set<string>();
+let browserReplayPageSize: BrowserReplayPageSizeOption = loadBrowserReplayPageSize();
 let browserReplaySignature = "";
 let browserReplayPollTimer = 0;
 let browserDocumentEventsBound = false;
 let currentLaunchSignature = "";
 let browserPage: BrowserPage = "replays";
+let mapEditorRoot: Root | null = null;
 let userDataPayload: UserDataPayload | null = null;
 let userDataLoading = false;
 let userDataError = "";
+let leaderboardStatusPayload: LeaderboardStatusPayload | null = null;
+let leaderboardRows: LeaderboardRow[] = [];
+let leaderboardLoading = false;
+let leaderboardSubmitting = false;
+let leaderboardError = "";
+let leaderboardDetailsOpen = false;
+let regionStatusPayload: RegionStatusPayload | null = null;
+let regionLoading = false;
+let regionApplying: RegionName | "" = "";
+let regionError = "";
+let regionPollTimer = 0;
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -506,6 +607,52 @@ function formatDurationSeconds(seconds: unknown): string {
   const minutes = Math.floor(safeSeconds / 60);
   const remainder = safeSeconds % 60;
   return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function parseBrowserReplayPageSizeOption(value: unknown): BrowserReplayPageSizeOption {
+  if (value === "all") return "all";
+  const numericValue = Number(value);
+  if (numericValue === 20 || numericValue === 50 || numericValue === 100) return numericValue;
+  return DEFAULT_BROWSER_REPLAY_PAGE_SIZE;
+}
+
+function loadBrowserReplayPageSize(): BrowserReplayPageSizeOption {
+  try {
+    const rawValue = window.localStorage.getItem(BROWSER_REPLAY_PAGE_SIZE_STORAGE_KEY);
+    if (!rawValue) return DEFAULT_BROWSER_REPLAY_PAGE_SIZE;
+
+    let parsedValue: unknown = rawValue;
+    try {
+      parsedValue = JSON.parse(rawValue);
+    } catch {
+      parsedValue = rawValue;
+    }
+    return parseBrowserReplayPageSizeOption(parsedValue);
+  } catch {
+    return DEFAULT_BROWSER_REPLAY_PAGE_SIZE;
+  }
+}
+
+function saveBrowserReplayPageSize(value: BrowserReplayPageSizeOption) {
+  try {
+    window.localStorage.setItem(BROWSER_REPLAY_PAGE_SIZE_STORAGE_KEY, JSON.stringify(value));
+  } catch {
+    // The browser can still function if persistence is unavailable.
+  }
+}
+
+function browserReplayPageSizeValue(total = browserReplayTotal): number {
+  if (browserReplayPageSize === "all") return Math.max(1, total, browserReplays.length);
+  return browserReplayPageSize;
+}
+
+function browserReplayRequestLimit(): number {
+  return browserReplayPageSize === "all" ? 0 : browserReplayPageSize;
+}
+
+function browserReplayPageCount(total = browserReplayTotal): number {
+  if (browserReplayPageSize === "all") return 1;
+  return Math.max(1, Math.ceil(total / browserReplayPageSize));
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -624,7 +771,160 @@ function formatUserDate(seconds: unknown): string {
   });
 }
 
-function userScorePoints(payload: UserDataPayload | null): Array<{ time: number; score: number; label: string }> {
+function formatScoreChartDate(seconds: number, spanSeconds: number): string {
+  const date = new Date(seconds * 1000);
+  if (spanSeconds <= 26 * 60 * 60) {
+    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+  const options: Intl.DateTimeFormatOptions = {
+    month: "short",
+    day: "numeric",
+  };
+  if (spanSeconds > 300 * 24 * 60 * 60) options.year = "2-digit";
+  return date.toLocaleDateString(undefined, options);
+}
+
+function formatCompactScore(value: number): string {
+  const absolute = Math.abs(value);
+  if (absolute >= 1_000_000) {
+    const divisor = 1_000_000;
+    return `${(value / divisor).toFixed(absolute >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`;
+  }
+  if (absolute >= 10_000) {
+    return `${Math.round(value / 1_000).toLocaleString()}K`;
+  }
+  if (absolute >= 1_000) {
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K`;
+  }
+  return Math.round(value).toLocaleString();
+}
+
+function formatChartRange(seconds: number): string {
+  if (seconds >= 2 * 24 * 60 * 60) return `${Math.round(seconds / (24 * 60 * 60)).toLocaleString()} days`;
+  if (seconds >= 24 * 60 * 60) return "1 day";
+  if (seconds >= 2 * 60 * 60) return `${Math.round(seconds / (60 * 60)).toLocaleString()} hours`;
+  if (seconds >= 60 * 60) return "1 hour";
+  if (seconds < 60) return "<1 min";
+  return `${Math.max(1, Math.round(seconds / 60)).toLocaleString()} min`;
+}
+
+function normalizeLeaderboardName(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9_.-]/g, "");
+}
+
+function leaderboardStatsFromUserData(payload: UserDataPayload | null): LeaderboardLocalStats | null {
+  const fields = userDataFields(payload);
+  const score = Number(payload?.score ?? fieldNumber(fields, [/(^|\.)(score|elo|rating)$/i]));
+  const username =
+    payload?.username ||
+    fieldText(fields, [/(^|\.)(username|userName|name|displayName|playerName)$/i]) ||
+    leaderboardStatusPayload?.local?.username ||
+    "";
+  const normalizedUsername = normalizeLeaderboardName(username);
+  if (!Number.isFinite(score) || !username || !normalizedUsername) return leaderboardStatusPayload?.local ?? null;
+
+  const officialRank = fieldNumber(fields, [/(^|\.)(rank|ratingRank|leaderboardRank|officialRank|position|place)$/i]);
+  const wins = fieldNumber(fields, [/number[_\s-]*of[_\s-]*wins/i, /(^|\.)(wins|winCount|win_count|victories)$/i]);
+  const total = fieldNumber(fields, [
+    /number[_\s-]*of[_\s-]*games/i,
+    /games[_\s-]*played/i,
+    /(^|\.)(games|matches|played|gameCount|game_count|matchCount|match_count|totalGames|total_games|gamesPlayed|games_played)$/i,
+  ]);
+  const losses = total !== null && wins !== null ? Math.max(0, total - wins) : fieldNumber(fields, [/(^|\.)(losses|lossCount|defeats)$/i]);
+  return {
+    username,
+    normalizedUsername,
+    score,
+    officialRank,
+    games: total,
+    wins,
+    losses,
+    region: regionStatusPayload?.selectedRegion ?? leaderboardStatusPayload?.local?.region ?? null,
+    source: payload?.source ?? leaderboardStatusPayload?.local?.source ?? null,
+    fetchedAt: payload?.fetchedAt ?? leaderboardStatusPayload?.local?.fetchedAt ?? null,
+  };
+}
+
+function currentLeaderboardStats(): LeaderboardLocalStats | null {
+  return leaderboardStatsFromUserData(userDataPayload) ?? leaderboardStatusPayload?.local ?? null;
+}
+
+function formatOptionalNumber(value: unknown): string {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString() : "-";
+}
+
+function leaderboardRowTime(row: LeaderboardRow): number | null {
+  const time = Number(row.updatedAt ?? row.lastSeen);
+  return Number.isFinite(time) && time > 0 ? time : null;
+}
+
+function leaderboardSyncLabel(status: LeaderboardStatusPayload | null): { label: string; tone: string; detail: string } {
+  if (leaderboardSubmitting) return { label: "Syncing", tone: "info", detail: "Submitting the latest score snapshot." };
+  if (!status?.configured) return { label: "Not submitted", tone: "warn", detail: status?.submitReason || "Set WOD_LEADERBOARD_URL to publish rankings." };
+  if (!status.hasPassword) return { label: "Missing login", tone: "warn", detail: status.submitReason };
+  if (status.lastSync?.status === "synced") {
+    return { label: "Synced", tone: "good", detail: status.lastSync.syncedAt ? `Updated ${formatUserDate(status.lastSync.syncedAt)}` : "Latest score submitted." };
+  }
+  if (status.lastSync?.status === "sync-failed") {
+    return { label: "Sync failed", tone: "bad", detail: status.lastSync.error || status.submitReason };
+  }
+  return { label: status.canSubmit ? "Not submitted" : "Not submitted", tone: status.canSubmit ? "info" : "warn", detail: status.submitReason };
+}
+
+function renderLeaderboardRows(currentName: string): string {
+  if (leaderboardLoading && !leaderboardRows.length) {
+    return `<div class="leaderboard-state">Loading public leaderboard...</div>`;
+  }
+  if (leaderboardError) {
+    return `<div class="leaderboard-state is-error">${escapeHtml(leaderboardError)}</div>`;
+  }
+  if (!leaderboardRows.length) {
+    const message = leaderboardStatusPayload?.configured
+      ? "No public scores have been submitted yet."
+      : "Leaderboard backend is not configured yet.";
+    return `<div class="leaderboard-state">${escapeHtml(message)}</div>`;
+  }
+
+  return `
+    <div class="leaderboard-table" role="table" aria-label="Public leaderboard">
+      <div class="leaderboard-table-head" role="row">
+        <span>Rank</span>
+        <span>Player</span>
+        <span>Score</span>
+        <span>Games</span>
+        <span>Wins</span>
+        <span>Region</span>
+        <span>Updated</span>
+      </div>
+      ${leaderboardRows
+        .map((row) => {
+          const normalized = normalizeLeaderboardName(row.normalizedUsername || row.username);
+          const isCurrent = Boolean(currentName && normalized === currentName);
+          const rank = Number(row.officialRank ?? row.rank);
+          const hasRank = Number.isFinite(rank) && rank > 0;
+          const topClass = hasRank && rank <= 3 ? ` is-top-${rank}` : "";
+          return `
+            <div class="leaderboard-row${topClass}${isCurrent ? " is-current" : ""}" role="row">
+              <span class="leaderboard-rank" data-label="Rank">${hasRank ? `#${escapeHtml(rank.toLocaleString())}` : "-"}</span>
+              <strong class="leaderboard-player" data-label="Player">${escapeHtml(row.username || "Unknown")}</strong>
+              <span class="leaderboard-score" data-label="Score">${escapeHtml(formatOptionalNumber(row.score))}</span>
+              <span data-label="Games">${escapeHtml(formatOptionalNumber(row.games))}</span>
+              <span data-label="Wins">${escapeHtml(formatOptionalNumber(row.wins))}</span>
+              <span data-label="Region">${escapeHtml(row.region || "-")}</span>
+              <span data-label="Updated">${escapeHtml(formatUserDate(leaderboardRowTime(row)))}</span>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function userScorePoints(payload: UserDataPayload | null): ScorePoint[] {
   if (!payload) return [];
   const points = payload.checkpoints
     .map((checkpoint) => ({
@@ -650,46 +950,138 @@ function renderScoreChart(payload: UserDataPayload | null): string {
     return `<div class="score-chart-empty">Score history will appear after at least two scored checkpoints.</div>`;
   }
 
-  const width = 720;
-  const height = 230;
-  const padding = { left: 56, right: 20, top: 20, bottom: 36 };
+  const width = 760;
+  const height = 292;
+  const padding = { left: 68, right: 34, top: 28, bottom: 52 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
   const minTime = Math.min(...points.map((point) => point.time));
   const maxTime = Math.max(...points.map((point) => point.time));
   const minScore = Math.min(...points.map((point) => point.score));
   const maxScore = Math.max(...points.map((point) => point.score));
   const timeSpan = Math.max(1, maxTime - minTime);
-  const scorePadding = Math.max(12, Math.round((maxScore - minScore) * 0.12));
+  const scoreSpread = Math.max(0, maxScore - minScore);
+  const scorePadding = Math.max(12, Math.round(scoreSpread * 0.18), scoreSpread === 0 ? 24 : 0);
   const lowScore = minScore - scorePadding;
   const highScore = maxScore + scorePadding;
   const scoreSpan = Math.max(1, highScore - lowScore);
-  const x = (time: number) => padding.left + ((time - minTime) / timeSpan) * (width - padding.left - padding.right);
-  const y = (score: number) => padding.top + (1 - (score - lowScore) / scoreSpan) * (height - padding.top - padding.bottom);
-  const path = points.map((point, index) => `${index === 0 ? "M" : "L"}${x(point.time).toFixed(1)} ${y(point.score).toFixed(1)}`).join(" ");
+  const x = (time: number) => padding.left + ((time - minTime) / timeSpan) * plotWidth;
+  const y = (score: number) => padding.top + (1 - (score - lowScore) / scoreSpan) * plotHeight;
+  const plotted = points.map((point) => ({
+    ...point,
+    x: x(point.time),
+    y: y(point.score),
+  }));
+  const path = plotted.map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
   const last = points.at(-1)!;
   const first = points[0]!;
   const delta = last.score - first.score;
+  const best = points.reduce((winner, point) => (point.score > winner.score ? point : winner), points[0]!);
+  const range = Math.max(0, maxTime - minTime);
+  const chartBottom = height - padding.bottom;
+  const areaPath = `${path} L${plotted.at(-1)!.x.toFixed(1)} ${chartBottom} L${plotted[0]!.x.toFixed(1)} ${chartBottom} Z`;
+  const horizontalTicks = Array.from({ length: 5 }, (_, index) => lowScore + (scoreSpan * index) / 4);
+  const timeTickCount = range > 4 * 24 * 60 * 60 ? 4 : 3;
+  const timeTicks =
+    maxTime > minTime
+      ? Array.from({ length: timeTickCount }, (_, index) => minTime + ((maxTime - minTime) * index) / (timeTickCount - 1))
+      : [minTime];
+  const sparsePoints =
+    plotted.length > 80
+      ? plotted.filter((_, index) => index === 0 || index === plotted.length - 1 || index % Math.ceil(plotted.length / 60) === 0)
+      : plotted;
+  const lastX = x(last.time);
+  const lastY = y(last.score);
+  const calloutWidth = 118;
+  const calloutHeight = 34;
+  const calloutX = clamp(lastX + 14, padding.left + 6, width - padding.right - calloutWidth - 6);
+  const calloutY = clamp(lastY - calloutHeight - 14, padding.top + 4, chartBottom - calloutHeight - 4);
+  const deltaLabel = delta > 0 ? `+${delta.toLocaleString()}` : delta.toLocaleString();
 
   return `
     <div class="score-chart-meta">
-      <span>${escapeHtml(formatUserDate(first.time))}</span>
-      <strong class="${delta >= 0 ? "is-gain" : "is-loss"}">${escapeHtml(delta >= 0 ? `+${delta.toLocaleString()}` : delta.toLocaleString())}</strong>
-      <span>${escapeHtml(formatUserDate(last.time))}</span>
+      <div>
+        <span>Current</span>
+        <strong>${escapeHtml(last.score.toLocaleString())}</strong>
+      </div>
+      <div>
+        <span>Change</span>
+        <strong class="${delta >= 0 ? "is-gain" : "is-loss"}">${escapeHtml(deltaLabel)}</strong>
+      </div>
+      <div>
+        <span>Best</span>
+        <strong>${escapeHtml(best.score.toLocaleString())}</strong>
+      </div>
+      <div>
+        <span>Range</span>
+        <strong>${escapeHtml(formatChartRange(range || timeSpan))}</strong>
+      </div>
     </div>
-    <svg class="score-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Score over time">
-      <line x1="${padding.left}" y1="${y(lowScore).toFixed(1)}" x2="${width - padding.right}" y2="${y(lowScore).toFixed(1)}" />
-      <line x1="${padding.left}" y1="${y(highScore).toFixed(1)}" x2="${width - padding.right}" y2="${y(highScore).toFixed(1)}" />
-      <text x="12" y="${y(highScore).toFixed(1)}">${escapeHtml(Math.round(highScore).toLocaleString())}</text>
-      <text x="12" y="${y(lowScore).toFixed(1)}">${escapeHtml(Math.round(lowScore).toLocaleString())}</text>
-      <path d="${path}" />
-      ${points
-        .map(
-          (point) =>
-            `<circle cx="${x(point.time).toFixed(1)}" cy="${y(point.score).toFixed(1)}" r="4"><title>${escapeHtml(
-              `${point.label}: ${point.score.toLocaleString()} on ${formatUserDate(point.time)}`,
-            )}</title></circle>`,
-        )
-        .join("")}
-    </svg>
+    <div class="score-chart-wrap">
+      <svg class="score-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Score over time">
+        <defs>
+          <linearGradient id="scoreChartLine" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="#67b7ff" />
+            <stop offset="100%" stop-color="#72ef97" />
+          </linearGradient>
+          <linearGradient id="scoreChartArea" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#67b7ff" stop-opacity="0.34" />
+            <stop offset="100%" stop-color="#67b7ff" stop-opacity="0.02" />
+          </linearGradient>
+        </defs>
+        <g class="score-chart-grid">
+          ${horizontalTicks
+            .map(
+              (tick) =>
+                `<line x1="${padding.left}" y1="${y(tick).toFixed(1)}" x2="${width - padding.right}" y2="${y(tick).toFixed(1)}" />`,
+            )
+            .join("")}
+          ${timeTicks
+            .map((tick) => `<line x1="${x(tick).toFixed(1)}" y1="${padding.top}" x2="${x(tick).toFixed(1)}" y2="${chartBottom}" />`)
+            .join("")}
+        </g>
+        <g class="score-chart-axis">
+          <line x1="${padding.left}" y1="${chartBottom}" x2="${width - padding.right}" y2="${chartBottom}" />
+          <line x1="${padding.left}" y1="${padding.top}" x2="${padding.left}" y2="${chartBottom}" />
+          ${horizontalTicks
+            .map(
+              (tick) =>
+                `<text x="${padding.left - 12}" y="${(y(tick) + 4).toFixed(1)}" text-anchor="end">${escapeHtml(formatCompactScore(tick))}</text>`,
+            )
+            .join("")}
+          ${timeTicks
+            .map(
+              (tick, index) =>
+                `<text x="${x(tick).toFixed(1)}" y="${height - 18}" text-anchor="${index === 0 ? "start" : index === timeTicks.length - 1 ? "end" : "middle"}">${escapeHtml(formatScoreChartDate(tick, range || timeSpan))}</text>`,
+            )
+            .join("")}
+        </g>
+        <path class="score-chart-area" d="${areaPath}" />
+        <path class="score-chart-line" d="${path}" />
+        <g class="score-chart-points">
+          ${sparsePoints
+            .map(
+              (point) =>
+                `<circle class="score-chart-point" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="3"><title>${escapeHtml(
+                  `${point.label}: ${point.score.toLocaleString()} on ${formatUserDate(point.time)}`,
+                )}</title></circle>`,
+            )
+            .join("")}
+        </g>
+        <circle class="score-chart-highlight is-best" cx="${x(best.time).toFixed(1)}" cy="${y(best.score).toFixed(1)}" r="6">
+          <title>${escapeHtml(`Best: ${best.score.toLocaleString()} on ${formatUserDate(best.time)}`)}</title>
+        </circle>
+        <line class="score-chart-callout-line" x1="${lastX.toFixed(1)}" y1="${lastY.toFixed(1)}" x2="${calloutX.toFixed(1)}" y2="${(calloutY + calloutHeight / 2).toFixed(1)}" />
+        <circle class="score-chart-highlight is-current" cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="7">
+          <title>${escapeHtml(`Current: ${last.score.toLocaleString()} on ${formatUserDate(last.time)}`)}</title>
+        </circle>
+        <g class="score-chart-callout">
+          <rect class="score-chart-callout-box" x="${calloutX.toFixed(1)}" y="${calloutY.toFixed(1)}" width="${calloutWidth}" height="${calloutHeight}" rx="8" />
+          <text class="score-chart-callout-label" x="${(calloutX + 10).toFixed(1)}" y="${(calloutY + 13).toFixed(1)}">Current</text>
+          <text class="score-chart-callout-value" x="${(calloutX + 10).toFixed(1)}" y="${(calloutY + 27).toFixed(1)}">${escapeHtml(last.score.toLocaleString())}</text>
+        </g>
+      </svg>
+    </div>
   `;
 }
 
@@ -994,6 +1386,16 @@ function clearBrowserSearch() {
   searchInput?.focus();
 }
 
+function renderReplayPlayButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
+  if (!BROWSER_REPLAY_PLAYBACK_ENABLED) return "";
+  const isOpening = browserOpeningPaths.has(replay.filePath);
+  return `
+    <button class="replay-play-button" type="button" data-replay-index="${replayIndex}" ${isOpening ? "disabled" : ""} aria-label="Play ${escapeHtml(label)}">
+      <span class="play-glyph"></span>
+    </button>
+  `;
+}
+
 function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): string {
   const winnerIndex = replay.players.findIndex((player) => player.winner);
   const winner = winnerIndex >= 0 ? replay.players[winnerIndex] : null;
@@ -1013,7 +1415,6 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
     ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, winnerIndex)}" data-winner-name>${escapeHtml(winner.name)}</span></div>`
     : "";
   const label = replay.players.map((player) => player.name).join(" versus ");
-  const isOpening = browserOpeningPaths.has(replay.filePath);
   return `
     <article class="replay-card" data-card-index="${replayIndex}" aria-label="${escapeHtml(label)}">
       <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
@@ -1025,9 +1426,7 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
         </div>
         <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
       </div>
-      <button class="replay-play-button" type="button" data-replay-index="${replayIndex}" ${isOpening ? "disabled" : ""} aria-label="Play ${escapeHtml(label)}">
-        <span class="play-glyph"></span>
-      </button>
+      ${renderReplayPlayButton(replay, label, replayIndex)}
       <div class="replay-meta">
         <div class="players">
           <div class="matchup player-count-${replay.players.length}">${names}</div>
@@ -1047,7 +1446,9 @@ function renderBrowserGrid(): string {
     return `<section id="replayGrid" class="replay-grid is-error"><div class="state-message">${escapeHtml(browserError)}</div></section>`;
   }
   if (!browserReplays.length) {
-    return `<section id="replayGrid" class="replay-grid is-empty"><div class="state-message">No replays found.</div></section>`;
+    return `
+      <section id="replayGrid" class="replay-grid is-empty"><div class="state-message">No replays found.</div></section>
+    `;
   }
 
   return `
@@ -1058,30 +1459,79 @@ function renderBrowserGrid(): string {
   `;
 }
 
-function renderBrowserNav(): string {
+function renderBrowserPager(): string {
+  const pageSize = browserReplayPageSizeValue();
+  if (browserReplayTotal <= pageSize && browserReplayPage === 0) return "";
+  const pageCount = browserReplayPageCount();
+  const page = Math.min(browserReplayPage, pageCount - 1);
+  const start = browserReplayTotal ? page * pageSize + 1 : 0;
+  const end = Math.min(browserReplayTotal, (page + 1) * pageSize);
   return `
-    <nav class="browser-nav" aria-label="Main navigation">
-      <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
-      <button class="browser-nav-button ${browserPage === "userData" ? "is-active" : ""}" type="button" data-browser-page="userData">User data</button>
+    <nav class="replay-pager" aria-label="Replay pages">
+      <button id="prevReplayPage" class="replay-page-button" type="button" aria-label="Previous replay page" title="Previous page" ${page <= 0 || browserLoading ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24">
+          <path d="m15 18-6-6 6-6" />
+        </svg>
+      </button>
+      <span class="replay-page-status">
+        <strong>${escapeHtml(String(page + 1))} / ${escapeHtml(String(pageCount))}</strong>
+        <em>${escapeHtml(String(start))}-${escapeHtml(String(end))} of ${escapeHtml(String(browserReplayTotal))}</em>
+      </span>
+      <button id="nextReplayPage" class="replay-page-button" type="button" aria-label="Next replay page" title="Next page" ${page >= pageCount - 1 || browserLoading ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24">
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+      </button>
     </nav>
   `;
 }
 
-function renderUserDataPage(): string {
+function renderBrowserPageSizeControl(): string {
+  const options = BROWSER_REPLAY_PAGE_SIZE_OPTIONS.map(
+    (option) => `
+      <option value="${escapeHtml(String(option))}" ${browserReplayPageSize === option ? "selected" : ""}>
+        ${option === "all" ? "All" : escapeHtml(String(option))}
+      </option>
+    `,
+  ).join("");
+  return `
+    <label class="replay-page-size-control" title="Items per page">
+      <span>Items</span>
+      <select id="replayPageSize" class="replay-page-size-select" aria-label="Items per page" ${browserLoading ? "disabled" : ""}>
+        ${options}
+      </select>
+    </label>
+  `;
+}
+
+function renderBrowserNav(): string {
+  return `
+    <nav class="browser-nav" aria-label="Main navigation">
+      <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
+      <button class="browser-nav-button ${browserPage === "leaderboard" ? "is-active" : ""}" type="button" data-browser-page="leaderboard">Leaderboard</button>
+      <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
+      <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
+    </nav>
+  `;
+}
+
+function renderLeaderboardPage(): string {
   const fields = userDataFields(userDataPayload);
-  const score = Number(userDataPayload?.score ?? fieldNumber(fields, [/(^|\.)(score|elo)$/i]));
-  const username =
-    userDataPayload?.username ||
-    fieldText(fields, [/(^|\.)(username|userName|name|displayName|playerName)$/i]) ||
-    "Unknown user";
-  const rank = fieldNumber(fields, [/(^|\.)(rank|ratingRank|leaderboardRank|position|place)$/i]);
-  const wins = fieldNumber(fields, [/number\s*of\s*wins/i, /(^|\.)(wins|winCount|victories)$/i]);
-  const totalFromFields = fieldNumber(fields, [/number\s*of\s*games/i, /(^|\.)(games|matches|played|gameCount|matchCount|totalGames)$/i]);
-  const total = totalFromFields ?? null;
-  const losses = total !== null && wins !== null ? Math.max(0, total - wins) : fieldNumber(fields, [/(^|\.)(losses|lossCount|defeats)$/i]);
-  const winRatio = total && wins !== null ? clamp((wins / total) * 100, 0, 100) : 0;
-  const lossRatio = total && losses !== null ? clamp((losses / total) * 100, 0, 100) : 0;
-  const winPercent = total && wins !== null ? `${Math.round(winRatio)}%` : "-";
+  const stats = currentLeaderboardStats();
+  const score = Number(stats?.score);
+  const username = stats?.username || "Unknown user";
+  const currentName = normalizeLeaderboardName(stats?.normalizedUsername || stats?.username);
+  const officialRank = stats?.officialRank ?? null;
+  const winsNumber = Number(stats?.wins);
+  const gamesNumber = Number(stats?.games);
+  const winRate =
+    Number.isFinite(winsNumber) && Number.isFinite(gamesNumber) && gamesNumber > 0
+      ? clamp((winsNumber / gamesNumber) * 100, 0, 100)
+      : null;
+  const winRateValue = winRate === null ? "0" : winRate.toFixed(2);
+  const winRateLabel = winRate === null ? "-" : `${Math.round(winRate)}%`;
+  const winsLabel = Number.isFinite(winsNumber) ? winsNumber.toLocaleString() : "-";
+  const sync = leaderboardSyncLabel(leaderboardStatusPayload);
   const fieldRows = fields.length
     ? fields
         .map(
@@ -1096,13 +1546,13 @@ function renderUserDataPage(): string {
     : `<div class="state-message">No user fields returned yet.</div>`;
 
   return `
-    <section class="user-data-page" aria-label="User data">
-      <div class="user-data-actions">
+    <section class="leaderboard-page" aria-label="Leaderboard">
+      <div class="leaderboard-actions">
         <div>
-          <h1>User data</h1>
-          <p>${userDataPayload ? `Fetched ${escapeHtml(formatUserDate(userDataPayload.fetchedAt))}` : "Fetching account data from War of Dots."}</p>
+          <h1>Leaderboard</h1>
+          <p>${userDataPayload ? `Local score fetched ${escapeHtml(formatUserDate(userDataPayload.fetchedAt))}` : "Fetching your War of Dots standing."}</p>
         </div>
-        <button id="refreshUserData" class="refresh-user-button ${userDataLoading ? "is-loading" : ""}" type="button" ${userDataLoading ? "disabled" : ""}>
+        <button id="refreshUserData" class="refresh-user-button ${userDataLoading || leaderboardLoading || leaderboardSubmitting ? "is-loading" : ""}" type="button" ${userDataLoading || leaderboardSubmitting ? "disabled" : ""}>
           <svg aria-hidden="true" viewBox="0 0 24 24">
             <path d="M20 12a8 8 0 0 1-13.7 5.7" />
             <path d="M4 12A8 8 0 0 1 17.7 6.3" />
@@ -1111,6 +1561,10 @@ function renderUserDataPage(): string {
           </svg>
           <span>Refresh</span>
         </button>
+      </div>
+      <div class="leaderboard-sync is-${escapeHtml(sync.tone)}">
+        <span>${escapeHtml(sync.label)}</span>
+        <strong>${escapeHtml(sync.detail)}</strong>
       </div>
       ${
         userDataError
@@ -1121,49 +1575,44 @@ function renderUserDataPage(): string {
         userDataLoading && !userDataPayload
           ? `<div class="state-message">Fetching user data...</div>`
           : `
-            <div class="profile-board">
-              <div class="profile-hero">
-                <div class="profile-name">
-                  <span>Player</span>
+            <div class="leaderboard-standing">
+              <div class="standing-hero">
+                <div class="standing-name">
+                  <span>My standing</span>
                   <strong>${escapeHtml(username)}</strong>
+                  <em>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `Rank #${escapeHtml(Number(officialRank).toLocaleString())}` : "Rank pending"}</em>
                 </div>
-                <div class="profile-metrics">
-                  <div class="profile-metric is-score">
+                <div class="standing-metrics">
+                  <div class="standing-metric is-score">
                     <span>Score</span>
                     <strong>${Number.isFinite(score) ? escapeHtml(score.toLocaleString()) : "-"}</strong>
                   </div>
-                  <div class="profile-metric">
+                  <div class="standing-metric">
                     <span>Rank</span>
-                    <strong>${rank !== null ? `Top ${escapeHtml(rank.toLocaleString())}` : "-"}</strong>
-                  </div>
-                  <div class="profile-metric">
-                    <span>Games</span>
-                    <strong>${total !== null ? escapeHtml(total.toLocaleString()) : "-"}</strong>
-                  </div>
-                  <div class="profile-metric">
-                    <span>Wins</span>
-                    <strong>${wins !== null ? escapeHtml(wins.toLocaleString()) : "-"}</strong>
+                    <strong>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `#${escapeHtml(Number(officialRank).toLocaleString())}` : "-"}</strong>
                   </div>
                 </div>
               </div>
-              <div class="profile-pie-panel">
-                <div class="pie-title">
-                  <span>Win rate</span>
-                  <strong>${escapeHtml(winPercent)}</strong>
+              <div class="standing-win-card" style="--win-rate:${escapeHtml(winRateValue)}">
+                <div class="win-card-heading">
+                  <span>WIN RATE</span>
+                  <strong>${escapeHtml(winRateLabel)}</strong>
                 </div>
-                <div class="profile-pie" style="--win-ratio:${winRatio.toFixed(2)}">
+                <div class="win-rate-ring" aria-label="Win rate ${escapeHtml(winRateLabel)}">
                   <div>
-                    <strong>${wins !== null ? escapeHtml(wins.toLocaleString()) : "-"}</strong>
-                    <span>wins</span>
+                    <strong>${escapeHtml(winsLabel)}</strong>
+                    <span>WINS</span>
                   </div>
-                </div>
-                <div class="profile-record">
-                  <span><i class="is-win"></i>${wins !== null ? escapeHtml(wins.toLocaleString()) : "-"} wins</span>
-                  <span><i class="is-loss"></i>${losses !== null ? escapeHtml(losses.toLocaleString()) : "-"} losses</span>
-                  <span>${total !== null ? escapeHtml(total.toLocaleString()) : "-"} games</span>
                 </div>
               </div>
             </div>
+            <section class="public-leaderboard">
+              <div class="section-heading">
+                <h2>Leaderboard</h2>
+                <span>${leaderboardRows.length ? `${escapeHtml(String(leaderboardRows.length))} players` : "Global board"}</span>
+              </div>
+              ${renderLeaderboardRows(currentName)}
+            </section>
             <section class="score-history">
               <div class="section-heading">
                 <h2>Score over time</h2>
@@ -1171,15 +1620,69 @@ function renderUserDataPage(): string {
               </div>
               ${renderScoreChart(userDataPayload)}
             </section>
-            <section class="user-fields-section">
-              <div class="section-heading">
-                <h2>Returned fields</h2>
-                <span>${escapeHtml(String(fields.length))} fields</span>
-              </div>
+            <details class="user-fields-section" ${leaderboardDetailsOpen ? "open" : ""}>
+              <summary>
+                <span>Details</span>
+                <strong>${escapeHtml(String(fields.length))} fields</strong>
+              </summary>
               <dl class="user-fields">${fieldRows}</dl>
-            </section>
+            </details>
           `
       }
+    </section>
+  `;
+}
+
+function renderRegionPage(): string {
+  const gameRunning = Boolean(regionStatusPayload?.gameRunning);
+  const canSelect = gameRunning && !regionLoading && !regionApplying;
+  const selectedRegion = gameRunning ? regionStatusPayload?.selectedRegion ?? null : null;
+  const statusText = gameRunning
+    ? regionStatusPayload?.message || "War of Dots detected. Choose a region to apply it live."
+    : regionStatusPayload?.message || "Start War of Dots to apply a region.";
+  const regionCards = REGION_NAMES.map((region) => {
+    const isSelected = selectedRegion === region;
+    const isApplying = regionApplying === region;
+    const disabled = !canSelect || isSelected;
+    return `
+      <button
+        class="region-card ${isSelected ? "is-selected" : ""} ${isApplying ? "is-loading" : ""}"
+        type="button"
+        data-region="${region}"
+        ${disabled ? "disabled" : ""}
+      >
+        <span>${escapeHtml(region)}</span>
+        <strong>${escapeHtml(REGION_LABELS[region])}</strong>
+        <em>${isApplying ? "Applying" : isSelected ? "Selected" : gameRunning ? "Apply" : "Unavailable"}</em>
+      </button>
+    `;
+  }).join("");
+
+  return `
+    <section class="region-page" aria-label="Region selector">
+      <div class="region-actions">
+        <div>
+          <h1>Region</h1>
+          <p>${escapeHtml(statusText)}</p>
+        </div>
+        <button id="refreshRegion" class="refresh-user-button ${regionLoading ? "is-loading" : ""}" type="button" ${regionLoading || Boolean(regionApplying) ? "disabled" : ""}>
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M20 12a8 8 0 0 1-13.7 5.7" />
+            <path d="M4 12A8 8 0 0 1 17.7 6.3" />
+            <path d="M17.7 2.7v3.6h-3.6" />
+            <path d="M6.3 21.3v-3.6h3.6" />
+          </svg>
+          <span>Refresh</span>
+        </button>
+      </div>
+      ${regionError ? `<div class="state-message region-error">${escapeHtml(regionError)}</div>` : ""}
+      <div class="region-status ${gameRunning ? "is-online" : "is-offline"}">
+        <span>${gameRunning ? "Game running" : "Game offline"}</span>
+        <strong>${selectedRegion ? `Selected ${escapeHtml(selectedRegion)}` : "No region selected"}</strong>
+      </div>
+      <div class="region-grid">
+        ${regionCards}
+      </div>
     </section>
   `;
 }
@@ -1239,16 +1742,52 @@ function scheduleBrowserSearch() {
   pendingBrowserSearchFrame = window.requestAnimationFrame(applyBrowserSearch);
 }
 
+function unmountMapEditor() {
+  if (!mapEditorRoot) return;
+  mapEditorRoot.unmount();
+  mapEditorRoot = null;
+}
+
+function mountMapEditor() {
+  const host = document.querySelector<HTMLElement>("#mapEditorRoot");
+  if (!host) return;
+  unmountMapEditor();
+  mapEditorRoot = createRoot(host);
+  mapEditorRoot.render(createElement(MapEditorApp));
+}
+
 function renderReplayBrowser() {
   const minPosition = secondsToDurationPosition(browserDurationRange.min);
   const maxPosition = secondsToDurationPosition(browserDurationRange.max);
   const fillLeft = (minPosition / DURATION_SLIDER_STEPS) * 100;
   const fillRight = ((DURATION_SLIDER_STEPS - maxPosition) / DURATION_SLIDER_STEPS) * 100;
-  if (browserPage === "userData") {
+  if (browserPage === "mapEditor") {
     appRoot.innerHTML = `
-      <main class="replay-browser" aria-label="War of Dots user data">
+      <main class="replay-browser map-editor-page" aria-label="War of Dots map editor">
         ${renderBrowserNav()}
-        ${renderUserDataPage()}
+        <section id="mapEditorRoot" class="map-editor-host" aria-label="Map editor"></section>
+      </main>
+    `;
+    bindBrowserEvents();
+    mountMapEditor();
+    return;
+  }
+  unmountMapEditor();
+  if (browserPage === "leaderboard") {
+    appRoot.innerHTML = `
+      <main class="replay-browser" aria-label="War of Dots leaderboard">
+        ${renderBrowserNav()}
+        ${renderLeaderboardPage()}
+      </main>
+    `;
+    bindBrowserEvents();
+    return;
+  }
+  if (browserPage === "region") {
+    appRoot.innerHTML = `
+      <main class="replay-browser" aria-label="War of Dots region selector">
+        ${renderBrowserNav()}
+        ${renderRegionPage()}
       </main>
     `;
     bindBrowserEvents();
@@ -1279,7 +1818,7 @@ function renderReplayBrowser() {
               autocomplete="off"
               spellcheck="false"
               value="${escapeHtml(browserSearch)}"
-              ${browserLoading || browserError || !browserReplays.length ? "disabled" : ""}
+              ${(browserLoading && !browserReplays.length) || browserError || !browserReplays.length ? "disabled" : ""}
             >
             <button id="clearPlayerSearch" class="search-clear" type="button" aria-label="Clear search" ${browserSearch ? "" : "hidden"}>x</button>
             <div id="playerSuggestionPanel" class="player-suggestion-panel" hidden>
@@ -1314,14 +1853,21 @@ function renderReplayBrowser() {
         </div>
       </div>
       ${renderBrowserGrid()}
-      <button id="refreshReplays" class="refresh-button ${browserLoading ? "is-loading" : ""}" type="button" aria-label="Refresh replays" title="Refresh replays" ${browserLoading ? "disabled" : ""}>
-        <svg aria-hidden="true" viewBox="0 0 24 24">
-          <path d="M20 12a8 8 0 0 1-13.7 5.7" />
-          <path d="M4 12A8 8 0 0 1 17.7 6.3" />
-          <path d="M17.7 2.7v3.6h-3.6" />
-          <path d="M6.3 21.3v-3.6h3.6" />
-        </svg>
-      </button>
+      <div class="replay-action-dock">
+        <div class="replay-action-group" role="group" aria-label="Replay browser actions">
+          ${renderBrowserPageSizeControl()}
+          ${renderBrowserPager()}
+          <button id="refreshReplays" class="refresh-button ${browserLoading ? "is-loading" : ""}" type="button" aria-label="Refresh replays" title="Refresh replays" ${browserLoading && !browserReplays.length ? "disabled" : ""}>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M20 12a8 8 0 0 1-13.7 5.7" />
+              <path d="M4 12A8 8 0 0 1 17.7 6.3" />
+              <path d="M17.7 2.7v3.6h-3.6" />
+              <path d="M6.3 21.3v-3.6h3.6" />
+            </svg>
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
     </main>
   `;
   hydrateBrowserCards();
@@ -1344,18 +1890,43 @@ function handleBrowserOutsidePointerDown(event: PointerEvent) {
   closeBrowserSuggestions();
 }
 
+async function confirmMapEditorLeave() {
+  if (browserPage !== "mapEditor") return true;
+  return window.__mapEditorConfirmLeave ? window.__mapEditorConfirmLeave() : true;
+}
+
+async function switchBrowserPage(nextPage: BrowserPage) {
+  if (browserPage === nextPage) return;
+  if (!(await confirmMapEditorLeave())) return;
+  browserPage = nextPage;
+  renderReplayBrowser();
+  if (browserPage === "leaderboard") void ensureLeaderboardLoaded();
+  if (browserPage === "region" && !regionStatusPayload && !regionLoading) void loadRegionStatus();
+}
+
 function bindBrowserEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
-      const nextPage = button.dataset.browserPage === "userData" ? "userData" : "replays";
-      if (browserPage === nextPage) return;
-      browserPage = nextPage;
-      renderReplayBrowser();
-      if (browserPage === "userData" && !userDataPayload && !userDataLoading) void loadUserData();
+      const page = button.dataset.browserPage;
+      const nextPage: BrowserPage =
+        page === "leaderboard" ? "leaderboard" : page === "region" ? "region" : page === "mapEditor" ? "mapEditor" : "replays";
+      void switchBrowserPage(nextPage);
     });
   });
   document.querySelector<HTMLButtonElement>("#refreshUserData")?.addEventListener("click", () => {
-    void loadUserData();
+    void refreshLeaderboard();
+  });
+  document.querySelector<HTMLDetailsElement>(".user-fields-section")?.addEventListener("toggle", (event) => {
+    leaderboardDetailsOpen = (event.currentTarget as HTMLDetailsElement).open;
+  });
+  document.querySelector<HTMLButtonElement>("#refreshRegion")?.addEventListener("click", () => {
+    void loadRegionStatus();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-region]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const region = button.dataset.region as RegionName | undefined;
+      if (region && REGION_NAMES.includes(region)) void selectRegion(region);
+    });
   });
   document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("input", (event) => {
     browserSearch = (event.target as HTMLInputElement).value;
@@ -1443,12 +2014,32 @@ function bindBrowserEvents() {
   document.querySelector<HTMLButtonElement>("#refreshReplays")?.addEventListener("click", () => {
     void loadBrowserReplays(true);
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-replay-index]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const replay = browserReplays[Number(button.dataset.replayIndex)];
-      if (replay) void openReplayFromBrowser(replay);
-    });
+  document.querySelector<HTMLSelectElement>("#replayPageSize")?.addEventListener("change", (event) => {
+    const nextPageSize = parseBrowserReplayPageSizeOption((event.target as HTMLSelectElement).value);
+    if (nextPageSize === browserReplayPageSize) return;
+    browserReplayPageSize = nextPageSize;
+    browserReplayPage = 0;
+    browserReplaySignature = "";
+    saveBrowserReplayPageSize(nextPageSize);
+    void loadBrowserReplays(true, { page: 0 });
   });
+  document.querySelector<HTMLButtonElement>("#prevReplayPage")?.addEventListener("click", () => {
+    if (browserReplayPage <= 0) return;
+    void loadBrowserReplays(true, { page: browserReplayPage - 1 });
+  });
+  document.querySelector<HTMLButtonElement>("#nextReplayPage")?.addEventListener("click", () => {
+    const pageCount = browserReplayPageCount();
+    if (browserReplayPage >= pageCount - 1) return;
+    void loadBrowserReplays(true, { page: browserReplayPage + 1 });
+  });
+  if (BROWSER_REPLAY_PLAYBACK_ENABLED) {
+    document.querySelectorAll<HTMLButtonElement>("[data-replay-index]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const replay = browserReplays[Number(button.dataset.replayIndex)];
+        if (replay) void openReplayFromBrowser(replay);
+      });
+    });
+  }
   if (!browserDocumentEventsBound) {
     document.addEventListener("pointerdown", handleBrowserOutsidePointerDown);
     browserDocumentEventsBound = true;
@@ -1459,14 +2050,116 @@ async function loadUserData(options: { quiet?: boolean } = {}) {
   if (userDataLoading) return;
   userDataLoading = true;
   userDataError = "";
-  if (!options.quiet && browserPage === "userData") renderReplayBrowser();
+  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
   try {
     userDataPayload = await invoke<UserDataPayload>("fetch_user_data");
   } catch (error) {
     userDataError = error instanceof Error ? error.message : String(error || "Could not fetch user data.");
   } finally {
     userDataLoading = false;
-    if (browserPage === "userData") renderReplayBrowser();
+    if (browserPage === "leaderboard") renderReplayBrowser();
+  }
+}
+
+async function loadLeaderboardStatus(options: { quiet?: boolean } = {}) {
+  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
+  try {
+    leaderboardStatusPayload = await invoke<LeaderboardStatusPayload>("leaderboard_status");
+  } catch (error) {
+    leaderboardError = error instanceof Error ? error.message : String(error || "Could not read leaderboard status.");
+  } finally {
+    if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
+  }
+}
+
+async function loadLeaderboardRows(options: { quiet?: boolean } = {}) {
+  if (leaderboardLoading) return;
+  leaderboardLoading = true;
+  if (!options.quiet) leaderboardError = "";
+  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
+  try {
+    const payload = await invoke<LeaderboardListPayload>("leaderboard_list");
+    leaderboardRows = payload.rows ?? [];
+    if (!payload.configured && payload.message) leaderboardError = payload.message;
+  } catch (error) {
+    leaderboardError = error instanceof Error ? error.message : String(error || "Could not load leaderboard.");
+  } finally {
+    leaderboardLoading = false;
+    if (browserPage === "leaderboard") renderReplayBrowser();
+  }
+}
+
+async function submitLeaderboardSnapshot(options: { quiet?: boolean } = {}) {
+  if (leaderboardSubmitting) return;
+  leaderboardSubmitting = true;
+  if (!options.quiet) leaderboardError = "";
+  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
+  try {
+    await invoke("leaderboard_submit");
+  } catch (error) {
+    leaderboardError = error instanceof Error ? error.message : String(error || "Could not submit leaderboard score.");
+  } finally {
+    leaderboardSubmitting = false;
+    await loadLeaderboardStatus({ quiet: true });
+    if (browserPage === "leaderboard") renderReplayBrowser();
+  }
+}
+
+async function refreshLeaderboard() {
+  const userDataTask = loadUserData();
+  const statusTask = loadLeaderboardStatus({ quiet: true });
+  const rowsTask = loadLeaderboardRows({ quiet: true });
+  await Promise.allSettled([userDataTask, statusTask]);
+  await loadLeaderboardStatus({ quiet: true });
+  if (leaderboardStatusPayload?.canSubmit) {
+    await submitLeaderboardSnapshot({ quiet: true });
+  }
+  await rowsTask;
+  if (browserPage === "leaderboard") renderReplayBrowser();
+}
+
+function ensureLeaderboardLoaded() {
+  if (!leaderboardStatusPayload) {
+    void loadLeaderboardStatus({ quiet: true });
+  }
+  if (!userDataPayload && !userDataLoading) {
+    void loadUserData({ quiet: true }).then(() => {
+      void loadLeaderboardStatus({ quiet: true });
+    });
+  }
+  if (!leaderboardRows.length && !leaderboardLoading) {
+    void loadLeaderboardRows({ quiet: true });
+  }
+  if (browserPage === "leaderboard") renderReplayBrowser();
+}
+
+async function loadRegionStatus(options: { quiet?: boolean } = {}) {
+  if (regionLoading) return;
+  regionLoading = true;
+  if (!options.quiet) regionError = "";
+  if (!options.quiet && browserPage === "region") renderReplayBrowser();
+  try {
+    regionStatusPayload = await invoke<RegionStatusPayload>("region_status");
+  } catch (error) {
+    if (!options.quiet) regionError = error instanceof Error ? error.message : String(error || "Could not load region status.");
+  } finally {
+    regionLoading = false;
+    if (browserPage === "region") renderReplayBrowser();
+  }
+}
+
+async function selectRegion(region: RegionName) {
+  if (regionApplying) return;
+  regionApplying = region;
+  regionError = "";
+  renderReplayBrowser();
+  try {
+    regionStatusPayload = await invoke<RegionStatusPayload>("select_region", { region });
+  } catch (error) {
+    regionError = error instanceof Error ? error.message : String(error || "Could not apply region.");
+  } finally {
+    regionApplying = "";
+    if (browserPage === "region") renderReplayBrowser();
   }
 }
 
@@ -1498,23 +2191,31 @@ function replayListSignature(replays: ReplayBrowserItem[]): string {
     .join("\n");
 }
 
-async function loadBrowserReplays(preserveControls = false, options: { quiet?: boolean } = {}) {
+async function loadBrowserReplays(
+  preserveControls = false,
+  options: { quiet?: boolean; page?: number } = {},
+) {
   if (browserLoading) return;
+  const requestLimit = browserReplayRequestLimit();
+  const page = requestLimit === 0 ? 0 : Math.max(0, Math.floor(options.page ?? browserReplayPage));
   let shouldRender = !options.quiet;
   browserLoading = true;
   browserError = "";
   if (!options.quiet) renderReplayBrowser();
   try {
-    const replays = await invoke<ReplayBrowserItem[]>("list_replays");
+    const payload = await invoke<ReplayBrowserPayload>("list_replays", {
+      offset: page * requestLimit,
+      limit: requestLimit,
+    });
+    const replays = payload.replays;
     const nextSignature = replayListSignature(replays);
-    const changed = nextSignature !== browserReplaySignature;
+    const changed = nextSignature !== browserReplaySignature || page !== browserReplayPage || payload.totalCandidates !== browserReplayTotal;
     browserReplays = replays;
+    browserReplayTotal = payload.totalCandidates;
+    browserReplayPage = Math.min(page, browserReplayPageCount(payload.totalCandidates) - 1);
     browserReplaySignature = nextSignature;
     setupBrowserDuration(replays, preserveControls);
     shouldRender = shouldRender || changed;
-    if (changed && replays.length && !userDataLoading) {
-      window.setTimeout(() => void loadUserData({ quiet: true }), 0);
-    }
   } catch (error) {
     if (!options.quiet) {
       browserError = error instanceof Error ? error.message : String(error || "Could not load replays.");
@@ -1528,9 +2229,14 @@ async function loadBrowserReplays(preserveControls = false, options: { quiet?: b
 
 function startBrowserReplayPolling() {
   window.clearInterval(browserReplayPollTimer);
-  browserReplayPollTimer = window.setInterval(() => {
-    if (browserOpeningPaths.size > 0 || browserLoading) return;
-    void loadBrowserReplays(true, { quiet: true });
+  browserReplayPollTimer = 0;
+}
+
+function startRegionPolling() {
+  window.clearInterval(regionPollTimer);
+  regionPollTimer = window.setInterval(() => {
+    if (browserPage !== "region" || regionLoading || regionApplying) return;
+    void loadRegionStatus({ quiet: true });
   }, 5000);
 }
 
@@ -1581,6 +2287,10 @@ async function loadUnitAssets() {
 
 function flattenPlayerName(value: unknown): string {
   if (Array.isArray(value)) return value.map(flattenPlayerName).filter(Boolean).join(" ");
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return flattenPlayerName(record.username ?? record.name ?? record.displayName ?? record.display_name);
+  }
   return String(value ?? "").trim();
 }
 
@@ -4340,6 +5050,7 @@ if (appMode === "browser") {
   renderReplayBrowser();
   void loadBrowserReplays();
   startBrowserReplayPolling();
+  startRegionPolling();
   window.addEventListener("keydown", (event) => {
     const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";
     if (!wantsSearch) return;

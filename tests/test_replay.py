@@ -48,6 +48,46 @@ def test_validate_custom_map_marks_custom_present() -> None:
     assert replay.metadata["custom_map_present"] is True
 
 
+def test_validate_replay_accepts_new_format_without_custom_map_key() -> None:
+    payload = valid_payload()
+    del payload["custom_map"]
+    payload["player_usernames"] = [
+        [{"username": "thesavvyy", "title": "Veteran"}],
+        [{"username": "aexer0e", "title": "Friend"}],
+    ]
+
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+
+    assert replay.metadata["map"] == "6"
+    assert replay.metadata["custom_map_present"] is False
+    assert replay.metadata["player_usernames"] == payload["player_usernames"]
+
+
+def test_validate_replay_accepts_new_custom_map_location() -> None:
+    payload = valid_payload()
+    del payload["custom_map"]
+    payload["map"] = {
+        "version": None,
+        "map_surface": "iVBORw0KGgo=",
+        "cities": [],
+        "bridges": [],
+    }
+
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+
+    assert replay.metadata["map"] == "custom"
+    assert replay.metadata["custom_map_present"] is True
+
+
+def test_validate_replay_derives_missing_end_from_max_tick() -> None:
+    payload = valid_payload()
+    del payload["end"]
+
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+
+    assert replay.metadata["end"] == 240
+
+
 def test_rejects_non_gzip_data() -> None:
     with pytest.raises(ReplayValidationError, match="gzip"):
         validate_replay(b"not gzip", max_json_bytes=1_000_000)

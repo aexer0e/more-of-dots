@@ -5,7 +5,7 @@
   "identifier": "local.more-of-dots",
   "build": {
     "beforeDevCommand": "npm run dev:web",
-    "beforeBuildCommand": "npm run build:web",
+    "beforeBuildCommand": "npm run build:web && npm run build:sidecar",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, UTC
+import heapq
 import json
 from pathlib import Path
 import shutil
@@ -136,16 +137,22 @@ class JobStore:
         return paths
 
     def list_jobs(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        job_paths: list[tuple[float, Path]] = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job_paths.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+
         jobs: list[dict[str, Any]] = []
-        for path in sorted(self.jobs_dir.glob("*/job.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        for _, path in heapq.nlargest(limit, job_paths, key=lambda item: item[0]):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(data, dict):
                 jobs.append(data)
-            if len(jobs) >= limit:
-                break
         return jobs
 
     def jobs_size_bytes(self) -> int:

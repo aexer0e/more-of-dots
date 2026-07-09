@@ -9,13 +9,19 @@
     "build:web": "tsc && vite build",
     "build:sidecar": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1",
     "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
-    "build": "npm run build:sidecar && tauri build && npm run size:audit"
+    "build": "tauri build && npm run size:audit"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^1.23.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
     "typescript": "^5.8.0",
     "vite": "^8.0.16"
   }

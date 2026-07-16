@@ -119,7 +119,7 @@ def test_packaged_python_probe_resources_are_discoverable() -> None:
     assert "../tools/python-probe-dll/target/release/wod_python_probe.dll" in tauri_config["bundle"]["resources"]
     assert "../scripts/invoke-python-probe.ps1" in tauri_config["bundle"]["resources"]
     assert "npm run build:sidecar" in tauri_config["build"]["beforeBuildCommand"]
-    assert package["scripts"]["build"] == "tauri build && npm run size:audit"
+    assert package["scripts"]["build"] == "node scripts/version.mjs tauri build && npm run size:audit"
 
 
 def test_frontend_has_region_browser_page() -> None:
@@ -128,7 +128,7 @@ def test_frontend_has_region_browser_page() -> None:
     assert 'type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";' in frontend
     assert 'data-browser-page="leaderboard">Leaderboard' in frontend
     assert 'invoke<LeaderboardStatusPayload>("leaderboard_status")' in frontend
-    assert 'invoke("leaderboard_submit")' in frontend
+    assert 'invoke<{ lastSync?: LeaderboardSyncState }>("leaderboard_submit")' in frontend
     assert 'invoke<LeaderboardListPayload>("leaderboard_list")' in frontend
     assert "renderLeaderboardRows" in frontend
     assert "score-chart-area" in frontend
@@ -137,6 +137,8 @@ def test_frontend_has_region_browser_page() -> None:
     assert "<span>Rank</span>" in frontend
     assert "<span>WIN RATE</span>" in frontend
     assert "win-rate-ring" in frontend
+    assert "leaderboardSubmitError" in frontend
+    assert "War of Dots is probably still running in another installation or session" in frontend
     assert "Public rank" not in frontend
     assert 'data-browser-page="region"' in frontend
     assert 'invoke<RegionStatusPayload>("region_status")' in frontend

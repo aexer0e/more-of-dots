@@ -884,10 +884,7 @@
     align-items: stretch;
   }.map-editor-scope .library-toolbar-actions{
     justify-content: flex-start;
-  }.map-editor-scope .editor-shell{
-    grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr;
-  }.map-editor-scope .editor-sidebar{ max-height: 40vh; }.map-editor-scope .stage-map-live-summary{
+  }.map-editor-scope .stage-map-live-summary{
     right: 14px;
     bottom: 14px;
     max-width: min(420px, calc(100% - 28px));

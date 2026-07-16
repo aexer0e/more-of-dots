@@ -135,7 +135,13 @@ async function submitSnapshot(request: Request, env: Env) {
     .bind(normalizedUsername)
     .first<{ tokenVerifier: string }>();
   if (existing && existing.tokenVerifier !== verifier) {
-    return jsonResponse({ error: "This player name is already claimed by another install." }, { status: 409 });
+    return jsonResponse(
+      {
+        error:
+          "This player name is active elsewhere. War of Dots is probably still running in another installation or session. Close the other game, then try again.",
+      },
+      { status: 409 },
+    );
   }
 
   const latestSnapshot = await env.DB.prepare(

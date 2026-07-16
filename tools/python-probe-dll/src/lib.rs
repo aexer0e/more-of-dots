@@ -78,24 +78,31 @@ unsafe extern "system" fn worker(parameter: *mut c_void) -> DWord {
     let payload = match fs::read_to_string(&payload_path) {
         Ok(value) => value,
         Err(error) => {
-            write_status(module, "failed", &format!("Could not read payload: {error}"));
+            write_status(
+                module,
+                "failed",
+                &format!("Could not read payload: {error}"),
+            );
             return 1;
         }
     };
 
     let python_name = CString::new("python312.dll").expect("static string has no nul");
-    let python = (0..80)
-        .find_map(|_| {
-            let handle = GetModuleHandleA(python_name.as_ptr());
-            if handle.is_null() {
-                thread::sleep(Duration::from_millis(250));
-                None
-            } else {
-                Some(handle)
-            }
-        });
+    let python = (0..80).find_map(|_| {
+        let handle = GetModuleHandleA(python_name.as_ptr());
+        if handle.is_null() {
+            thread::sleep(Duration::from_millis(250));
+            None
+        } else {
+            Some(handle)
+        }
+    });
     let Some(python) = python else {
-        write_status(module, "failed", "python312.dll is not loaded in the target process.");
+        write_status(
+            module,
+            "failed",
+            "python312.dll is not loaded in the target process.",
+        );
         return 1;
     };
 
@@ -137,7 +144,11 @@ unsafe extern "system" fn worker(parameter: *mut c_void) -> DWord {
         write_status(module, "succeeded", "Payload completed.");
         0
     } else {
-        write_status(module, "failed", &format!("PyRun_SimpleString returned {rc}."));
+        write_status(
+            module,
+            "failed",
+            &format!("PyRun_SimpleString returned {rc}."),
+        );
         1
     }
 }

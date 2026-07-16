@@ -1,6 +1,9 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import MapEditorApp from "./map-editor/App";
@@ -273,11 +276,11 @@ type ReplayBrowserItem = {
   thumbnailDataUrl?: string | null;
   modified: number;
   scoreDelta?: number | null;
+  eventLabel?: string | null;
 };
 
 type ReplayBrowserPayload = {
   replays: ReplayBrowserItem[];
-  totalCandidates: number;
 };
 
 type BrowserSuggestion = {
@@ -292,12 +295,14 @@ type BrowserFilterState = {
   query: string;
   enabledTypes: Set<string>;
   durationRange: { min: number; max: number };
+  nationGamesOnly: boolean;
 };
 type BrowserRenderedCard = {
   element: HTMLElement;
   searchText: string;
   matchType: string;
   durationSeconds: number;
+  isNationGame: boolean;
   modified: number;
   names: string[];
   normalizedNames: string[];
@@ -308,7 +313,6 @@ type BrowserRenderedCard = {
   visible: boolean;
 };
 type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";
-type BrowserReplayPageSizeOption = 20 | 50 | 100 | "all";
 type UserCheckpoint = {
   fetchedAt: number;
   source?: string | null;
@@ -393,6 +397,11 @@ type RegionStatusPayload = {
   message?: string | null;
   applyResult?: unknown;
 };
+type AppUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "current" | "error";
+type AppUpdateSnooze = {
+  version: string;
+  until: number;
+};
 
 const foundAppRoot = document.querySelector<HTMLDivElement>("#app");
 if (!foundAppRoot) {
@@ -456,9 +465,16 @@ const GRAPH_MIN_SIZE = { width: 170, height: 96 };
 const DURATION_SLIDER_STEPS = 1000;
 const DURATION_SLIDER_MIDPOINT_SECONDS = 5 * 60;
 const SUGGESTION_LIMIT = 8;
-const BROWSER_REPLAY_PAGE_SIZE_STORAGE_KEY = "wodReplayBrowserPageSize";
-const BROWSER_REPLAY_PAGE_SIZE_OPTIONS: BrowserReplayPageSizeOption[] = [20, 50, 100, "all"];
-const DEFAULT_BROWSER_REPLAY_PAGE_SIZE: BrowserReplayPageSizeOption = 100;
+const UPDATE_CHECK_DELAY_MS = 2500;
+const UPDATE_CHECK_TIMEOUT_MS = 10_000;
+const UPDATE_SNOOZE_MS = 24 * 60 * 60 * 1000;
+const UPDATE_SNOOZE_STORAGE_KEY = "moreOfDotsUpdateSnooze";
+const BROWSER_GRID_CAPPED_STORAGE_KEY = "wodReplayBrowserGridCapped";
+const BROWSER_GRID_CARD_SIZE_STORAGE_KEY = "wodReplayBrowserGridCardSize";
+const BROWSER_GRID_CARD_SIZE_MIN = 120;
+const BROWSER_GRID_CARD_SIZE_MAX = 480;
+const BROWSER_GRID_CARD_SIZE_DEFAULT = 300;
+const BROWSER_GRID_CARD_SIZE_STEP = 10;
 const BROWSER_REPLAY_PLAYBACK_ENABLED = false;
 const REGION_NAMES: RegionName[] = ["NA", "EU", "ASIA"];
 const REGION_LABELS: Record<RegionName, string> = {
@@ -533,11 +549,15 @@ let graphResize: GraphResizeState | null = null;
 let graphZCounter = 20;
 let browserReplays: ReplayBrowserItem[] = [];
 let browserLoading = false;
+let browserUploading = false;
+let browserUploadLabel = "Upload";
+let browserDeleteCandidate: ReplayBrowserItem | null = null;
+let browserDeleteInFlight = false;
+let browserDeleteError = "";
 let browserError = "";
-let browserReplayTotal = 0;
-let browserReplayPage = 0;
 let browserSearch = "";
 let browserHideUnmatched = true;
+let browserNationGamesOnly = false;
 let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
 let browserDurationBounds = { min: 0, max: 0 };
 let browserDurationRange = { min: 0, max: 0 };
@@ -547,9 +567,11 @@ let browserSuggestionItems: BrowserSuggestion[] = [];
 let browserRenderedCards: BrowserRenderedCard[] = [];
 let pendingBrowserSearchFrame = 0;
 let browserOpeningPaths = new Set<string>();
-let browserReplayPageSize: BrowserReplayPageSizeOption = loadBrowserReplayPageSize();
+let browserDownloadingPaths = new Set<string>();
+let browserGridCapped = loadBrowserGridCapped();
+let browserGridCardSize = loadBrowserGridCardSize();
 let browserReplaySignature = "";
-let browserReplayPollTimer = 0;
+let browserRelativeTimeTimer = 0;
 let browserDocumentEventsBound = false;
 let currentLaunchSignature = "";
 let browserPage: BrowserPage = "replays";
@@ -562,12 +584,23 @@ let leaderboardRows: LeaderboardRow[] = [];
 let leaderboardLoading = false;
 let leaderboardSubmitting = false;
 let leaderboardError = "";
+let leaderboardSubmitError = "";
 let leaderboardDetailsOpen = false;
 let regionStatusPayload: RegionStatusPayload | null = null;
 let regionLoading = false;
 let regionApplying: RegionName | "" = "";
 let regionError = "";
 let regionPollTimer = 0;
+let appVersion = "";
+let appUpdateStatus: AppUpdateStatus = "idle";
+let appUpdateManual = false;
+let appUpdateVersion = "";
+let appUpdateMessage = "";
+let appUpdateDownloaded = 0;
+let appUpdateTotal: number | null = null;
+let pendingAppUpdate: Awaited<ReturnType<typeof check>> = null;
+let appUpdateRoot: HTMLDivElement | null = null;
+let appUpdateCurrentTimer = 0;
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -609,50 +642,268 @@ function formatDurationSeconds(seconds: unknown): string {
   return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
 }
 
-function parseBrowserReplayPageSizeOption(value: unknown): BrowserReplayPageSizeOption {
-  if (value === "all") return "all";
-  const numericValue = Number(value);
-  if (numericValue === 20 || numericValue === 50 || numericValue === 100) return numericValue;
-  return DEFAULT_BROWSER_REPLAY_PAGE_SIZE;
+function appVersionLabel(): string {
+  return appVersion ? `v${appVersion}` : "Version";
 }
 
-function loadBrowserReplayPageSize(): BrowserReplayPageSizeOption {
+function readAppUpdateSnooze(): AppUpdateSnooze | null {
   try {
-    const rawValue = window.localStorage.getItem(BROWSER_REPLAY_PAGE_SIZE_STORAGE_KEY);
-    if (!rawValue) return DEFAULT_BROWSER_REPLAY_PAGE_SIZE;
-
-    let parsedValue: unknown = rawValue;
-    try {
-      parsedValue = JSON.parse(rawValue);
-    } catch {
-      parsedValue = rawValue;
-    }
-    return parseBrowserReplayPageSizeOption(parsedValue);
+    const value = JSON.parse(window.localStorage.getItem(UPDATE_SNOOZE_STORAGE_KEY) || "null") as Partial<AppUpdateSnooze> | null;
+    if (!value || typeof value.version !== "string" || !Number.isFinite(value.until)) return null;
+    return { version: value.version, until: Number(value.until) };
   } catch {
-    return DEFAULT_BROWSER_REPLAY_PAGE_SIZE;
+    return null;
   }
 }
 
-function saveBrowserReplayPageSize(value: BrowserReplayPageSizeOption) {
+function isAppUpdateSnoozed(version: string): boolean {
+  const snooze = readAppUpdateSnooze();
+  return Boolean(snooze && snooze.version === version && snooze.until > Date.now());
+}
+
+function snoozeAppUpdate(version: string) {
   try {
-    window.localStorage.setItem(BROWSER_REPLAY_PAGE_SIZE_STORAGE_KEY, JSON.stringify(value));
+    window.localStorage.setItem(
+      UPDATE_SNOOZE_STORAGE_KEY,
+      JSON.stringify({ version, until: Date.now() + UPDATE_SNOOZE_MS } satisfies AppUpdateSnooze),
+    );
+  } catch {
+    // A failed preference write should not prevent dismissing the prompt.
+  }
+}
+
+function ensureAppUpdateRoot(): HTMLDivElement {
+  if (appUpdateRoot) return appUpdateRoot;
+  appUpdateRoot = document.createElement("div");
+  appUpdateRoot.id = "appUpdateRoot";
+  document.body.appendChild(appUpdateRoot);
+  return appUpdateRoot;
+}
+
+function updateAppVersionControls() {
+  document.querySelectorAll<HTMLButtonElement>("[data-app-version]").forEach((button) => {
+    button.textContent = appVersionLabel();
+    button.title = appUpdateStatus === "checking" ? "Checking for updates" : `More of Dots ${appVersionLabel()} - check for updates`;
+    button.setAttribute("aria-label", button.title);
+    button.disabled = appUpdateStatus === "checking" || appUpdateStatus === "downloading" || appUpdateStatus === "installing";
+    button.classList.toggle("is-checking", appUpdateStatus === "checking");
+  });
+}
+
+function appUpdateProgressPercent(): number | null {
+  if (!appUpdateTotal || appUpdateTotal <= 0) return null;
+  return clamp((appUpdateDownloaded / appUpdateTotal) * 100, 0, 100);
+}
+
+function renderAppUpdateUi() {
+  updateAppVersionControls();
+  const root = ensureAppUpdateRoot();
+  const visible =
+    appUpdateStatus === "available" ||
+    appUpdateStatus === "downloading" ||
+    appUpdateStatus === "installing" ||
+    appUpdateStatus === "error" ||
+    appUpdateStatus === "current" ||
+    (appUpdateStatus === "checking" && appUpdateManual);
+  if (!visible) {
+    root.replaceChildren();
+    return;
+  }
+
+  const progress = appUpdateProgressPercent();
+  const busy = appUpdateStatus === "downloading" || appUpdateStatus === "installing";
+  const title =
+    appUpdateStatus === "available"
+      ? `Version ${appUpdateVersion} is ready`
+      : appUpdateStatus === "checking"
+        ? "Checking for updates"
+        : appUpdateStatus === "downloading"
+          ? "Downloading update"
+          : appUpdateStatus === "installing"
+            ? "Installing update"
+            : appUpdateStatus === "current"
+              ? "You're up to date"
+              : "Update failed";
+  const detail =
+    appUpdateMessage ||
+    (appUpdateStatus === "available"
+      ? "Install when you're ready. More of Dots will restart to finish."
+      : appUpdateStatus === "checking"
+        ? "Looking for the latest signed release."
+        : appUpdateStatus === "downloading"
+          ? progress === null
+            ? "Downloading the signed installer."
+            : `${Math.round(progress)}% downloaded`
+          : appUpdateStatus === "installing"
+            ? "The app will restart automatically."
+            : appUpdateStatus === "current"
+              ? `${appVersionLabel()} is the latest version.`
+              : "The app is still usable. You can try again.");
+  const progressMarkup = busy
+    ? `<div class="app-update-progress ${progress === null ? "is-indeterminate" : ""}" role="progressbar" ${
+        progress === null ? "" : `aria-valuenow="${Math.round(progress)}" aria-valuemin="0" aria-valuemax="100"`
+      }><span style="${progress === null ? "" : `width:${progress}%`}"></span></div>`
+    : "";
+  const actions =
+    appUpdateStatus === "available"
+      ? `<button class="app-update-primary" type="button" data-update-install>Update</button><button type="button" data-update-later>Later</button>`
+      : appUpdateStatus === "error"
+        ? `<button class="app-update-primary" type="button" data-update-retry>Retry</button><button type="button" data-update-close>Close</button>`
+        : appUpdateStatus === "current"
+          ? `<button type="button" data-update-close>Close</button>`
+          : "";
+
+  root.innerHTML = `
+    <aside class="app-update-toast is-${appUpdateStatus}" role="${appUpdateStatus === "error" ? "alert" : "status"}" aria-live="polite" aria-atomic="true">
+      <span class="app-update-icon" aria-hidden="true"></span>
+      <span class="app-update-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small>${progressMarkup}</span>
+      ${actions ? `<span class="app-update-actions">${actions}</span>` : ""}
+    </aside>
+  `;
+  root.querySelector<HTMLButtonElement>("[data-update-install]")?.addEventListener("click", () => void installAppUpdate());
+  root.querySelector<HTMLButtonElement>("[data-update-later]")?.addEventListener("click", dismissAppUpdate);
+  root.querySelector<HTMLButtonElement>("[data-update-retry]")?.addEventListener("click", () => void checkForAppUpdate(true));
+  root.querySelector<HTMLButtonElement>("[data-update-close]")?.addEventListener("click", closeAppUpdateUi);
+}
+
+function closeAppUpdateUi() {
+  window.clearTimeout(appUpdateCurrentTimer);
+  appUpdateStatus = "idle";
+  appUpdateManual = false;
+  appUpdateMessage = "";
+  renderAppUpdateUi();
+}
+
+function dismissAppUpdate() {
+  if (appUpdateVersion) snoozeAppUpdate(appUpdateVersion);
+  pendingAppUpdate = null;
+  closeAppUpdateUi();
+}
+
+async function checkForAppUpdate(manual = false) {
+  if (appUpdateStatus === "checking" || appUpdateStatus === "downloading" || appUpdateStatus === "installing") return;
+  window.clearTimeout(appUpdateCurrentTimer);
+  appUpdateManual = manual;
+  appUpdateStatus = "checking";
+  appUpdateMessage = "";
+  renderAppUpdateUi();
+  try {
+    const update = await check({ timeout: UPDATE_CHECK_TIMEOUT_MS });
+    if (!update) {
+      pendingAppUpdate = null;
+      appUpdateStatus = manual ? "current" : "idle";
+      renderAppUpdateUi();
+      if (manual) appUpdateCurrentTimer = window.setTimeout(closeAppUpdateUi, 4000);
+      return;
+    }
+    if (!manual && isAppUpdateSnoozed(update.version)) {
+      pendingAppUpdate = null;
+      appUpdateStatus = "idle";
+      renderAppUpdateUi();
+      return;
+    }
+    pendingAppUpdate = update;
+    appUpdateVersion = update.version;
+    appUpdateStatus = "available";
+    renderAppUpdateUi();
+  } catch (error) {
+    pendingAppUpdate = null;
+    appUpdateStatus = manual ? "error" : "idle";
+    appUpdateMessage = manual ? (error instanceof Error ? error.message : String(error || "Could not check for updates.")) : "";
+    renderAppUpdateUi();
+  }
+}
+
+async function installAppUpdate() {
+  const update = pendingAppUpdate;
+  if (!update || appUpdateStatus !== "available") return;
+  appUpdateStatus = "downloading";
+  appUpdateMessage = "";
+  appUpdateDownloaded = 0;
+  appUpdateTotal = null;
+  renderAppUpdateUi();
+  try {
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        appUpdateTotal = event.data.contentLength ?? null;
+      } else if (event.event === "Progress") {
+        appUpdateDownloaded += event.data.chunkLength;
+      } else if (event.event === "Finished") {
+        appUpdateStatus = "installing";
+      }
+      renderAppUpdateUi();
+    });
+    appUpdateStatus = "installing";
+    renderAppUpdateUi();
+    await relaunch();
+  } catch (error) {
+    appUpdateStatus = "error";
+    appUpdateMessage = error instanceof Error ? error.message : String(error || "Could not install the update.");
+    renderAppUpdateUi();
+  }
+}
+
+async function initializeAppUpdater() {
+  try {
+    appVersion = await getVersion();
+  } catch {
+    appVersion = "";
+  }
+  renderAppUpdateUi();
+  window.setTimeout(() => void checkForAppUpdate(false), UPDATE_CHECK_DELAY_MS);
+}
+
+function formatReplayAge(modifiedSeconds: unknown, now = Date.now()): string {
+  const modified = Number(modifiedSeconds);
+  const ageMinutes = Math.max(1, Math.floor((now - modified * 1000) / 60_000));
+  if (!Number.isFinite(modified) || modified <= 0) return "1m ago";
+  if (ageMinutes < 60) return `${ageMinutes}m ago`;
+
+  const ageHours = Math.floor(ageMinutes / 60);
+  if (ageHours < 24) return `${ageHours}h ago`;
+
+  const ageDays = Math.floor(ageHours / 24);
+  if (ageDays <= 7) return `${ageDays}d ago`;
+  return `${Math.floor(ageDays / 7)}w ago`;
+}
+
+function browserGridCardScale(): number {
+  return browserGridCapped ? 1 : clamp(browserGridCardSize / BROWSER_GRID_CARD_SIZE_DEFAULT, 0.4, 1.6);
+}
+
+function loadBrowserGridCapped(): boolean {
+  try {
+    const rawValue = window.localStorage.getItem(BROWSER_GRID_CAPPED_STORAGE_KEY);
+    return rawValue === null ? true : rawValue !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveBrowserGridCapped(value: boolean) {
+  try {
+    window.localStorage.setItem(BROWSER_GRID_CAPPED_STORAGE_KEY, String(value));
   } catch {
     // The browser can still function if persistence is unavailable.
   }
 }
 
-function browserReplayPageSizeValue(total = browserReplayTotal): number {
-  if (browserReplayPageSize === "all") return Math.max(1, total, browserReplays.length);
-  return browserReplayPageSize;
+function loadBrowserGridCardSize(): number {
+  try {
+    const value = Number(window.localStorage.getItem(BROWSER_GRID_CARD_SIZE_STORAGE_KEY));
+    if (!Number.isFinite(value) || value <= 0) return BROWSER_GRID_CARD_SIZE_DEFAULT;
+    return clamp(value, BROWSER_GRID_CARD_SIZE_MIN, BROWSER_GRID_CARD_SIZE_MAX);
+  } catch {
+    return BROWSER_GRID_CARD_SIZE_DEFAULT;
+  }
 }
 
-function browserReplayRequestLimit(): number {
-  return browserReplayPageSize === "all" ? 0 : browserReplayPageSize;
-}
-
-function browserReplayPageCount(total = browserReplayTotal): number {
-  if (browserReplayPageSize === "all") return 1;
-  return Math.max(1, Math.ceil(total / browserReplayPageSize));
+function saveBrowserGridCardSize(value: number) {
+  try {
+    window.localStorage.setItem(BROWSER_GRID_CARD_SIZE_STORAGE_KEY, String(value));
+  } catch {
+    // The browser can still function if persistence is unavailable.
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -862,15 +1113,24 @@ function leaderboardRowTime(row: LeaderboardRow): number | null {
   return Number.isFinite(time) && time > 0 ? time : null;
 }
 
+function friendlyLeaderboardError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || "Leaderboard sync failed.");
+  if (message.toLocaleLowerCase().includes("already claimed by another install")) {
+    return "This player name is active elsewhere. War of Dots is probably still running in another installation or session. Close the other game, then press Refresh to try again.";
+  }
+  return message;
+}
+
 function leaderboardSyncLabel(status: LeaderboardStatusPayload | null): { label: string; tone: string; detail: string } {
   if (leaderboardSubmitting) return { label: "Syncing", tone: "info", detail: "Submitting the latest score snapshot." };
+  if (leaderboardSubmitError) return { label: "Could not sync", tone: "bad", detail: leaderboardSubmitError };
   if (!status?.configured) return { label: "Not submitted", tone: "warn", detail: status?.submitReason || "Set WOD_LEADERBOARD_URL to publish rankings." };
   if (!status.hasPassword) return { label: "Missing login", tone: "warn", detail: status.submitReason };
   if (status.lastSync?.status === "synced") {
     return { label: "Synced", tone: "good", detail: status.lastSync.syncedAt ? `Updated ${formatUserDate(status.lastSync.syncedAt)}` : "Latest score submitted." };
   }
   if (status.lastSync?.status === "sync-failed") {
-    return { label: "Sync failed", tone: "bad", detail: status.lastSync.error || status.submitReason };
+    return { label: "Could not sync", tone: "bad", detail: friendlyLeaderboardError(status.lastSync.error || status.submitReason) };
   }
   return { label: status.canSubmit ? "Not submitted" : "Not submitted", tone: status.canSubmit ? "info" : "warn", detail: status.submitReason };
 }
@@ -1137,12 +1397,14 @@ function currentBrowserFilterState(): BrowserFilterState {
     query: normalizeSearchText(browserSearchValue()),
     enabledTypes: selectedBrowserMatchTypes(),
     durationRange: currentBrowserDurationRange(),
+    nationGamesOnly: document.querySelector<HTMLInputElement>("#nationGamesToggle")?.checked ?? browserNationGamesOnly,
   };
 }
 
 function cardMatchesNonSearchFilters(card: BrowserRenderedCard, filterState: BrowserFilterState): boolean {
   return (
     filterState.enabledTypes.has(card.matchType) &&
+    (!filterState.nationGamesOnly || card.isNationGame) &&
     card.durationSeconds >= filterState.durationRange.min &&
     card.durationSeconds <= filterState.durationRange.max
   );
@@ -1396,6 +1658,51 @@ function renderReplayPlayButton(replay: ReplayBrowserItem, label: string, replay
   `;
 }
 
+function replayDownloadFileName(replay: ReplayBrowserItem): string {
+  const playerNames = replay.players
+    .map((player) => player.name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "").trim() || "player")
+    .join("-vs-");
+  return `${playerNames || "replay"}.rep`;
+}
+
+function renderReplayDownloadButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
+  const isDownloading = browserDownloadingPaths.has(replay.filePath);
+  const action = isDownloading ? "Saving replay" : "Download replay";
+  return `
+    <button
+      class="replay-download-button ${isDownloading ? "is-downloading" : ""}"
+      type="button"
+      data-replay-download-index="${replayIndex}"
+      ${isDownloading ? "disabled" : ""}
+      aria-label="${escapeHtml(`${action}: ${label}`)}"
+      title="${escapeHtml(action)}"
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" />
+      </svg>
+    </button>
+  `;
+}
+
+function renderReplayDeleteButton(label: string, replayIndex: number): string {
+  return `
+    <button
+      class="replay-delete-button"
+      type="button"
+      data-replay-delete-index="${replayIndex}"
+      aria-label="${escapeHtml(`Delete replay: ${label}`)}"
+      title="Delete replay"
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path d="M4 7h16" />
+        <path d="M9 7V4h6v3" />
+        <path d="m7 7 1 13h8l1-13" />
+        <path d="M10 11v5M14 11v5" />
+      </svg>
+    </button>
+  `;
+}
+
 function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): string {
   const winnerIndex = replay.players.findIndex((player) => player.winner);
   const winner = winnerIndex >= 0 ? replay.players[winnerIndex] : null;
@@ -1405,6 +1712,9 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
     scoreDelta === null
       ? ""
       : `<div class="replay-label elo-delta ${scoreDelta > 0 ? "is-gain" : "is-loss"}">${escapeHtml(formatScoreDelta(scoreDelta))}</div>`;
+  const eventLabel = replay.eventLabel
+    ? `<div class="replay-label event-label replay-event-label">${escapeHtml(replay.eventLabel)}</div>`
+    : "";
   const names = replay.players
     .map((player, index) => {
       const separator = index > 0 ? `<span class="matchup-separator"> vs </span>` : "";
@@ -1415,8 +1725,9 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
     ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, winnerIndex)}" data-winner-name>${escapeHtml(winner.name)}</span></div>`
     : "";
   const label = replay.players.map((player) => player.name).join(" versus ");
+  const accessibleLabel = replay.eventLabel ? `${label}, ${replay.eventLabel}` : label;
   return `
-    <article class="replay-card" data-card-index="${replayIndex}" aria-label="${escapeHtml(label)}">
+    <article class="replay-card" data-card-index="${replayIndex}" aria-label="${escapeHtml(accessibleLabel)}">
       <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
       <div class="replay-shade"></div>
       <div class="replay-labels">
@@ -1426,7 +1737,11 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
         </div>
         <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
       </div>
+      ${eventLabel}
       ${renderReplayPlayButton(replay, label, replayIndex)}
+      ${renderReplayDownloadButton(replay, label, replayIndex)}
+      ${renderReplayDeleteButton(label, replayIndex)}
+      <time class="replay-age" data-replay-modified="${replay.modified}" datetime="${new Date(replay.modified * 1000).toISOString()}" aria-live="off">${formatReplayAge(replay.modified)}</time>
       <div class="replay-meta">
         <div class="players">
           <div class="matchup player-count-${replay.players.length}">${names}</div>
@@ -1452,54 +1767,103 @@ function renderBrowserGrid(): string {
   }
 
   return `
-    <section id="replayGrid" class="replay-grid" aria-live="polite">
+    <section
+      id="replayGrid"
+      class="replay-grid ${browserGridCapped ? "" : "is-unlocked"}"
+      style="--replay-card-min-width:${browserGridCardSize}px;--replay-card-scale:${browserGridCardScale()}"
+      aria-live="polite"
+    >
       ${browserReplays.map((replay, index) => renderReplayCard(replay, index)).join("")}
     </section>
     <div id="searchEmpty" class="state-message search-empty" hidden>No matching replays.</div>
   `;
 }
 
-function renderBrowserPager(): string {
-  const pageSize = browserReplayPageSizeValue();
-  if (browserReplayTotal <= pageSize && browserReplayPage === 0) return "";
-  const pageCount = browserReplayPageCount();
-  const page = Math.min(browserReplayPage, pageCount - 1);
-  const start = browserReplayTotal ? page * pageSize + 1 : 0;
-  const end = Math.min(browserReplayTotal, (page + 1) * pageSize);
+function renderReplayDeleteDialog(): string {
+  const replay = browserDeleteCandidate;
+  if (!replay) return "";
+  const matchup = replay.players.map((player) => player.name).join(" vs ") || replay.fileName || "this replay";
   return `
-    <nav class="replay-pager" aria-label="Replay pages">
-      <button id="prevReplayPage" class="replay-page-button" type="button" aria-label="Previous replay page" title="Previous page" ${page <= 0 || browserLoading ? "disabled" : ""}>
-        <svg aria-hidden="true" viewBox="0 0 24 24">
-          <path d="m15 18-6-6 6-6" />
-        </svg>
-      </button>
-      <span class="replay-page-status">
-        <strong>${escapeHtml(String(page + 1))} / ${escapeHtml(String(pageCount))}</strong>
-        <em>${escapeHtml(String(start))}-${escapeHtml(String(end))} of ${escapeHtml(String(browserReplayTotal))}</em>
-      </span>
-      <button id="nextReplayPage" class="replay-page-button" type="button" aria-label="Next replay page" title="Next page" ${page >= pageCount - 1 || browserLoading ? "disabled" : ""}>
-        <svg aria-hidden="true" viewBox="0 0 24 24">
-          <path d="m9 18 6-6-6-6" />
-        </svg>
-      </button>
-    </nav>
+    <div id="replayDeleteModal" class="replay-delete-backdrop" role="presentation">
+      <section class="replay-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="replayDeleteTitle" aria-describedby="replayDeleteDescription">
+        <div class="replay-delete-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M4 7h16" />
+            <path d="M9 7V4h6v3" />
+            <path d="m7 7 1 13h8l1-13" />
+            <path d="M10 11v5M14 11v5" />
+          </svg>
+        </div>
+        <div class="replay-delete-copy">
+          <span class="replay-delete-eyebrow">Delete replay</span>
+          <h2 id="replayDeleteTitle">Remove this replay?</h2>
+          <p id="replayDeleteDescription"><strong>${escapeHtml(matchup)}</strong> will be permanently removed from War of Dots and the backup library.</p>
+          ${browserDeleteError ? `<div class="replay-delete-error" role="alert">${escapeHtml(browserDeleteError)}</div>` : ""}
+        </div>
+        <div class="replay-delete-actions">
+          <button id="cancelReplayDelete" class="replay-delete-cancel" type="button" ${browserDeleteInFlight ? "disabled" : ""}>Cancel</button>
+          <button id="confirmReplayDelete" class="replay-delete-confirm ${browserDeleteInFlight ? "is-deleting" : ""}" type="button" ${browserDeleteInFlight ? "disabled" : ""}>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13" />
+            </svg>
+            <span>${browserDeleteInFlight ? "Deleting..." : "Delete replay"}</span>
+          </button>
+        </div>
+      </section>
+    </div>
   `;
 }
 
-function renderBrowserPageSizeControl(): string {
-  const options = BROWSER_REPLAY_PAGE_SIZE_OPTIONS.map(
-    (option) => `
-      <option value="${escapeHtml(String(option))}" ${browserReplayPageSize === option ? "selected" : ""}>
-        ${option === "all" ? "All" : escapeHtml(String(option))}
-      </option>
-    `,
-  ).join("");
+function renderBrowserGridWidthToggle(): string {
+  const label = browserGridCapped ? "3 max" : "Manual";
+  const title = browserGridCapped
+    ? "Grid capped at 3 columns. Click to size replay cards manually."
+    : "Manual replay card sizing is on. Click to cap the grid at 3 columns.";
   return `
-    <label class="replay-page-size-control" title="Items per page">
-      <span>Items</span>
-      <select id="replayPageSize" class="replay-page-size-select" aria-label="Items per page" ${browserLoading ? "disabled" : ""}>
-        ${options}
-      </select>
+    <button
+      id="gridWidthToggle"
+      class="grid-width-toggle ${browserGridCapped ? "is-active" : ""}"
+      type="button"
+      aria-pressed="${browserGridCapped}"
+      aria-label="${escapeHtml(title)}"
+      title="${escapeHtml(title)}"
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <rect x="3" y="5" width="4" height="14" rx="1" />
+        <rect x="10" y="5" width="4" height="14" rx="1" />
+        <rect x="17" y="5" width="4" height="14" rx="1" />
+      </svg>
+      <span>${label}</span>
+    </button>
+  `;
+}
+
+function renderBrowserGridSizeControl(): string {
+  return `
+    <label
+      id="gridSizeControl"
+      class="grid-size-control ${browserGridCapped ? "" : "is-visible"}"
+      aria-hidden="${browserGridCapped}"
+      title="Replay card size"
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <rect x="4" y="4" width="6" height="6" rx="1" />
+        <rect x="14" y="4" width="6" height="6" rx="1" />
+        <rect x="4" y="14" width="6" height="6" rx="1" />
+        <rect x="14" y="14" width="6" height="6" rx="1" />
+      </svg>
+      <input
+        id="gridCardSize"
+        type="range"
+        min="${BROWSER_GRID_CARD_SIZE_MIN}"
+        max="${BROWSER_GRID_CARD_SIZE_MAX}"
+        step="${BROWSER_GRID_CARD_SIZE_STEP}"
+        value="${browserGridCardSize}"
+        aria-label="Replay card size"
+        aria-valuetext="${browserGridCardSize} pixels wide"
+        ${browserGridCapped ? "disabled" : ""}
+      >
+      <output id="gridCardSizeValue" for="gridCardSize">${browserGridCardSize}</output>
     </label>
   `;
 }
@@ -1508,9 +1872,10 @@ function renderBrowserNav(): string {
   return `
     <nav class="browser-nav" aria-label="Main navigation">
       <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
-      <button class="browser-nav-button ${browserPage === "leaderboard" ? "is-active" : ""}" type="button" data-browser-page="leaderboard">Leaderboard</button>
+      <button class="browser-nav-button is-locked" type="button" disabled aria-disabled="true" aria-label="Leaderboard (work in progress)" data-wip="WIP" data-browser-page="leaderboard">Leaderboard</button>
       <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
       <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
+      <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
     </nav>
   `;
 }
@@ -1531,7 +1896,15 @@ function renderLeaderboardPage(): string {
   const winRateValue = winRate === null ? "0" : winRate.toFixed(2);
   const winRateLabel = winRate === null ? "-" : `${Math.round(winRate)}%`;
   const winsLabel = Number.isFinite(winsNumber) ? winsNumber.toLocaleString() : "-";
+  const gamesLabel = Number.isFinite(gamesNumber) ? gamesNumber.toLocaleString() : "-";
+  const lossesNumber = Number(stats?.losses);
+  const lossesLabel = Number.isFinite(lossesNumber) ? lossesNumber.toLocaleString() : "-";
   const sync = leaderboardSyncLabel(leaderboardStatusPayload);
+  const syncIcon = sync.tone === "good"
+    ? `<path d="m5 12 4 4L19 6" />`
+    : sync.tone === "bad"
+      ? `<path d="M12 8v5m0 4h.01" /><path d="M10.3 3.7 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z" />`
+      : `<path d="M12 7v5l3 2" /><circle cx="12" cy="12" r="9" />`;
   const fieldRows = fields.length
     ? fields
         .map(
@@ -1548,11 +1921,12 @@ function renderLeaderboardPage(): string {
   return `
     <section class="leaderboard-page" aria-label="Leaderboard">
       <div class="leaderboard-actions">
-        <div>
-          <h1>Leaderboard</h1>
-          <p>${userDataPayload ? `Local score fetched ${escapeHtml(formatUserDate(userDataPayload.fetchedAt))}` : "Fetching your War of Dots standing."}</p>
+        <div class="leaderboard-heading">
+          <span class="leaderboard-eyebrow">Competitive profile</span>
+          <h1>Your standing</h1>
+          <p>Track your War of Dots performance and see where you rank worldwide.</p>
         </div>
-        <button id="refreshUserData" class="refresh-user-button ${userDataLoading || leaderboardLoading || leaderboardSubmitting ? "is-loading" : ""}" type="button" ${userDataLoading || leaderboardSubmitting ? "disabled" : ""}>
+        <button id="refreshUserData" class="refresh-user-button leaderboard-refresh ${userDataLoading || leaderboardLoading || leaderboardSubmitting ? "is-loading" : ""}" type="button" aria-label="Refresh player stats and leaderboard" ${userDataLoading || leaderboardSubmitting ? "disabled" : ""}>
           <svg aria-hidden="true" viewBox="0 0 24 24">
             <path d="M20 12a8 8 0 0 1-13.7 5.7" />
             <path d="M4 12A8 8 0 0 1 17.7 6.3" />
@@ -1562,9 +1936,15 @@ function renderLeaderboardPage(): string {
           <span>Refresh</span>
         </button>
       </div>
-      <div class="leaderboard-sync is-${escapeHtml(sync.tone)}">
-        <span>${escapeHtml(sync.label)}</span>
-        <strong>${escapeHtml(sync.detail)}</strong>
+      <div class="leaderboard-sync is-${escapeHtml(sync.tone)}" role="${sync.tone === "bad" ? "alert" : "status"}" aria-live="polite">
+        <span class="leaderboard-sync-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">${syncIcon}</svg>
+        </span>
+        <span class="leaderboard-sync-copy">
+          <strong>${escapeHtml(sync.label)}</strong>
+          <small>${escapeHtml(sync.detail)}</small>
+        </span>
+        <em>${userDataPayload ? `Stats read ${escapeHtml(formatUserDate(userDataPayload.fetchedAt))}` : "Waiting for player data"}</em>
       </div>
       ${
         userDataError
@@ -1578,18 +1958,28 @@ function renderLeaderboardPage(): string {
             <div class="leaderboard-standing">
               <div class="standing-hero">
                 <div class="standing-name">
-                  <span>My standing</span>
-                  <strong>${escapeHtml(username)}</strong>
-                  <em>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `Rank #${escapeHtml(Number(officialRank).toLocaleString())}` : "Rank pending"}</em>
+                  <span class="standing-avatar" aria-hidden="true">${escapeHtml(username.trim().slice(0, 1).toLocaleUpperCase() || "?")}</span>
+                  <span class="standing-identity">
+                    <small>Player profile</small>
+                    <strong>${escapeHtml(username)}</strong>
+                    <em>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `Global rank #${escapeHtml(Number(officialRank).toLocaleString())}` : "Global rank pending"}</em>
+                  </span>
                 </div>
                 <div class="standing-metrics">
                   <div class="standing-metric is-score">
                     <span>Score</span>
                     <strong>${Number.isFinite(score) ? escapeHtml(score.toLocaleString()) : "-"}</strong>
+                    <small>Current rating</small>
                   </div>
                   <div class="standing-metric">
                     <span>Rank</span>
                     <strong>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `#${escapeHtml(Number(officialRank).toLocaleString())}` : "-"}</strong>
+                    <small>Worldwide</small>
+                  </div>
+                  <div class="standing-metric">
+                    <span>Games</span>
+                    <strong>${escapeHtml(gamesLabel)}</strong>
+                    <small>${escapeHtml(`${winsLabel} wins · ${lossesLabel} losses`)}</small>
                   </div>
                 </div>
               </div>
@@ -1601,22 +1991,29 @@ function renderLeaderboardPage(): string {
                 <div class="win-rate-ring" aria-label="Win rate ${escapeHtml(winRateLabel)}">
                   <div>
                     <strong>${escapeHtml(winsLabel)}</strong>
-                    <span>WINS</span>
+                    <span>Wins</span>
                   </div>
                 </div>
+                <p>${winRate === null ? "Play more matches to unlock your win-rate breakdown." : `${escapeHtml(winsLabel)} wins across ${escapeHtml(gamesLabel)} recorded games.`}</p>
               </div>
             </div>
             <section class="public-leaderboard">
               <div class="section-heading">
-                <h2>Leaderboard</h2>
-                <span>${leaderboardRows.length ? `${escapeHtml(String(leaderboardRows.length))} players` : "Global board"}</span>
+                <div>
+                  <span>Global rankings</span>
+                  <h2>Top players</h2>
+                </div>
+                <strong>${leaderboardRows.length ? `${escapeHtml(String(leaderboardRows.length))} players` : "Global board"}</strong>
               </div>
               ${renderLeaderboardRows(currentName)}
             </section>
             <section class="score-history">
               <div class="section-heading">
-                <h2>Score over time</h2>
-                <span>${escapeHtml(String(userScorePoints(userDataPayload).length))} points</span>
+                <div>
+                  <span>Performance</span>
+                  <h2>Score over time</h2>
+                </div>
+                <strong>${escapeHtml(String(userScorePoints(userDataPayload).length))} checkpoints</strong>
               </div>
               ${renderScoreChart(userDataPayload)}
             </section>
@@ -1638,22 +2035,27 @@ function renderRegionPage(): string {
   const canSelect = gameRunning && !regionLoading && !regionApplying;
   const selectedRegion = gameRunning ? regionStatusPayload?.selectedRegion ?? null : null;
   const statusText = gameRunning
-    ? regionStatusPayload?.message || "War of Dots detected. Choose a region to apply it live."
-    : regionStatusPayload?.message || "Start War of Dots to apply a region.";
+    ? regionStatusPayload?.message || "War of Dots is running."
+    : regionStatusPayload?.message || "Start War of Dots to change region.";
   const regionCards = REGION_NAMES.map((region) => {
     const isSelected = selectedRegion === region;
     const isApplying = regionApplying === region;
     const disabled = !canSelect || isSelected;
+    const actionLabel = isApplying ? "Applying..." : isSelected ? "Selected" : gameRunning ? "Select" : "Unavailable";
     return `
       <button
-        class="region-card ${isSelected ? "is-selected" : ""} ${isApplying ? "is-loading" : ""}"
+        class="region-option ${isSelected ? "is-selected" : ""} ${isApplying ? "is-loading" : ""}"
         type="button"
         data-region="${region}"
+        aria-pressed="${isSelected}"
+        aria-label="${escapeHtml(`${actionLabel} ${REGION_LABELS[region]}`)}"
         ${disabled ? "disabled" : ""}
       >
-        <span>${escapeHtml(region)}</span>
-        <strong>${escapeHtml(REGION_LABELS[region])}</strong>
-        <em>${isApplying ? "Applying" : isSelected ? "Selected" : gameRunning ? "Apply" : "Unavailable"}</em>
+        <span class="region-option-copy">
+          <strong>${escapeHtml(REGION_LABELS[region])}</strong>
+          <small>${escapeHtml(region)}</small>
+        </span>
+        <span class="region-option-action">${escapeHtml(actionLabel)}</span>
       </button>
     `;
   }).join("");
@@ -1663,25 +2065,31 @@ function renderRegionPage(): string {
       <div class="region-actions">
         <div>
           <h1>Region</h1>
-          <p>${escapeHtml(statusText)}</p>
+          <p>Select the region used by the running game.</p>
         </div>
-        <button id="refreshRegion" class="refresh-user-button ${regionLoading ? "is-loading" : ""}" type="button" ${regionLoading || Boolean(regionApplying) ? "disabled" : ""}>
-          <svg aria-hidden="true" viewBox="0 0 24 24">
-            <path d="M20 12a8 8 0 0 1-13.7 5.7" />
-            <path d="M4 12A8 8 0 0 1 17.7 6.3" />
-            <path d="M17.7 2.7v3.6h-3.6" />
-            <path d="M6.3 21.3v-3.6h3.6" />
-          </svg>
-          <span>Refresh</span>
+        <button id="refreshRegion" class="refresh-user-button region-refresh ${regionLoading ? "is-loading" : ""}" type="button" ${regionLoading || Boolean(regionApplying) ? "disabled" : ""}>
+          ${regionLoading ? "Refreshing..." : "Refresh"}
         </button>
       </div>
-      ${regionError ? `<div class="state-message region-error">${escapeHtml(regionError)}</div>` : ""}
-      <div class="region-status ${gameRunning ? "is-online" : "is-offline"}">
-        <span>${gameRunning ? "Game running" : "Game offline"}</span>
-        <strong>${selectedRegion ? `Selected ${escapeHtml(selectedRegion)}` : "No region selected"}</strong>
+      ${regionError ? `<div class="region-error" role="alert">${escapeHtml(regionError)}</div>` : ""}
+      <div class="region-status ${gameRunning ? "is-online" : "is-offline"}" aria-live="polite">
+        <span class="region-status-copy">
+          <span>
+            <strong>${gameRunning ? "Game running" : "Game offline"}</strong>
+            <small>${escapeHtml(statusText)}</small>
+          </span>
+        </span>
+        <span class="region-current">
+          <small>Current region</small>
+          <strong>${selectedRegion ? escapeHtml(REGION_LABELS[selectedRegion]) : "None"}</strong>
+        </span>
       </div>
-      <div class="region-grid">
+      <div class="region-grid" role="group" aria-label="Available regions">
         ${regionCards}
+      </div>
+      <div class="region-help">
+        <strong>How it works</strong>
+        <span>Start War of Dots, then select a region. The change is applied immediately.</span>
       </div>
     </section>
   `;
@@ -1701,6 +2109,7 @@ function hydrateBrowserCards() {
       searchText: normalizeSearchText(replay.players.map((player) => player.name).join(" ")),
       matchType: replayMatchType(replay),
       durationSeconds: Number(replay.durationSeconds) || 0,
+      isNationGame: Boolean(replay.eventLabel),
       modified: Number(replay.modified) || 0,
       names: replay.players.map((player) => player.name),
       normalizedNames: replay.players.map((player) => normalizeSearchText(player.name)),
@@ -1710,6 +2119,14 @@ function hydrateBrowserCards() {
       winnerNameElement: element.querySelector<HTMLElement>("[data-winner-name]"),
       visible: true,
     });
+  });
+}
+
+function updateReplayAgeLabels() {
+  const now = Date.now();
+  document.querySelectorAll<HTMLTimeElement>("#replayGrid [data-replay-modified]").forEach((element) => {
+    const nextLabel = formatReplayAge(element.dataset.replayModified, now);
+    if (element.textContent !== nextLabel) element.textContent = nextLabel;
   });
 }
 
@@ -1829,6 +2246,10 @@ function renderReplayBrowser() {
             <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
             <span aria-hidden="true">&#128123;&#65039;</span>
           </label>
+          <label class="match-mode-toggle nation-mode-toggle" title="World games only">
+            <input id="nationGamesToggle" type="checkbox" aria-label="World games only" ${browserNationGamesOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
+            <span aria-hidden="true">&#127760;</span>
+          </label>
         </div>
         <div class="filter-controls">
           <div class="type-filters" role="group" aria-label="Match type filters">
@@ -1853,10 +2274,23 @@ function renderReplayBrowser() {
         </div>
       </div>
       ${renderBrowserGrid()}
+      <div class="replay-upload-dock">
+        <input id="replayUploadInput" type="file" accept=".rep" multiple hidden>
+        <div class="replay-action-group">
+          <button id="uploadReplays" class="refresh-button upload-button ${browserUploading ? "is-loading" : ""}" type="button" aria-label="Upload replays" title="Upload replays to War of Dots" ${browserUploading || browserLoading ? "disabled" : ""}>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M12 16V4" />
+              <path d="m7.5 8.5 4.5-4.5 4.5 4.5" />
+              <path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
+            </svg>
+            <span aria-live="polite">${escapeHtml(browserUploadLabel)}</span>
+          </button>
+        </div>
+      </div>
       <div class="replay-action-dock">
         <div class="replay-action-group" role="group" aria-label="Replay browser actions">
-          ${renderBrowserPageSizeControl()}
-          ${renderBrowserPager()}
+          ${renderBrowserGridWidthToggle()}
+          ${renderBrowserGridSizeControl()}
           <button id="refreshReplays" class="refresh-button ${browserLoading ? "is-loading" : ""}" type="button" aria-label="Refresh replays" title="Refresh replays" ${browserLoading && !browserReplays.length ? "disabled" : ""}>
             <svg aria-hidden="true" viewBox="0 0 24 24">
               <path d="M20 12a8 8 0 0 1-13.7 5.7" />
@@ -1868,6 +2302,7 @@ function renderReplayBrowser() {
           </button>
         </div>
       </div>
+      ${renderReplayDeleteDialog()}
     </main>
   `;
   hydrateBrowserCards();
@@ -1896,15 +2331,19 @@ async function confirmMapEditorLeave() {
 }
 
 async function switchBrowserPage(nextPage: BrowserPage) {
+  if (nextPage === "leaderboard") return;
   if (browserPage === nextPage) return;
   if (!(await confirmMapEditorLeave())) return;
   browserPage = nextPage;
   renderReplayBrowser();
-  if (browserPage === "leaderboard") void ensureLeaderboardLoaded();
   if (browserPage === "region" && !regionStatusPayload && !regionLoading) void loadRegionStatus();
 }
 
 function bindBrowserEvents() {
+  updateAppVersionControls();
+  document.querySelector<HTMLButtonElement>("[data-app-version]")?.addEventListener("click", () => {
+    void checkForAppUpdate(true);
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const page = button.dataset.browserPage;
@@ -1969,6 +2408,11 @@ function bindBrowserEvents() {
     browserHideUnmatched = !(event.target as HTMLInputElement).checked;
     scheduleBrowserSearch();
   });
+  document.querySelector<HTMLInputElement>("#nationGamesToggle")?.addEventListener("change", (event) => {
+    browserNationGamesOnly = (event.target as HTMLInputElement).checked;
+    refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
+    scheduleBrowserSearch();
+  });
   document.querySelectorAll<HTMLInputElement>(".type-filter").forEach((input) => {
     input.addEventListener("change", () => {
       if (input.checked) browserSelectedTypes.add(input.value);
@@ -2014,32 +2458,102 @@ function bindBrowserEvents() {
   document.querySelector<HTMLButtonElement>("#refreshReplays")?.addEventListener("click", () => {
     void loadBrowserReplays(true);
   });
-  document.querySelector<HTMLSelectElement>("#replayPageSize")?.addEventListener("change", (event) => {
-    const nextPageSize = parseBrowserReplayPageSizeOption((event.target as HTMLSelectElement).value);
-    if (nextPageSize === browserReplayPageSize) return;
-    browserReplayPageSize = nextPageSize;
-    browserReplayPage = 0;
-    browserReplaySignature = "";
-    saveBrowserReplayPageSize(nextPageSize);
-    void loadBrowserReplays(true, { page: 0 });
+  const replayUploadInput = document.querySelector<HTMLInputElement>("#replayUploadInput");
+  document.querySelector<HTMLButtonElement>("#uploadReplays")?.addEventListener("click", () => {
+    replayUploadInput?.click();
   });
-  document.querySelector<HTMLButtonElement>("#prevReplayPage")?.addEventListener("click", () => {
-    if (browserReplayPage <= 0) return;
-    void loadBrowserReplays(true, { page: browserReplayPage - 1 });
+  replayUploadInput?.addEventListener("change", () => {
+    const files = Array.from(replayUploadInput.files ?? []);
+    replayUploadInput.value = "";
+    if (files.length) void uploadBrowserReplays(files);
   });
-  document.querySelector<HTMLButtonElement>("#nextReplayPage")?.addEventListener("click", () => {
-    const pageCount = browserReplayPageCount();
-    if (browserReplayPage >= pageCount - 1) return;
-    void loadBrowserReplays(true, { page: browserReplayPage + 1 });
+  document.querySelector<HTMLButtonElement>("#gridWidthToggle")?.addEventListener("click", () => {
+    browserGridCapped = !browserGridCapped;
+    saveBrowserGridCapped(browserGridCapped);
+    const grid = document.querySelector<HTMLElement>("#replayGrid");
+    grid?.classList.toggle("is-unlocked", !browserGridCapped);
+    grid?.style.setProperty("--replay-card-scale", String(browserGridCardScale()));
+
+    const sizeControl = document.querySelector<HTMLElement>("#gridSizeControl");
+    sizeControl?.classList.toggle("is-visible", !browserGridCapped);
+    sizeControl?.setAttribute("aria-hidden", String(browserGridCapped));
+    const sizeInput = document.querySelector<HTMLInputElement>("#gridCardSize");
+    if (sizeInput) sizeInput.disabled = browserGridCapped;
+
+    const button = document.querySelector<HTMLButtonElement>("#gridWidthToggle");
+    if (!button) return;
+    const title = browserGridCapped
+      ? "Grid capped at 3 columns. Click to size replay cards manually."
+      : "Manual replay card sizing is on. Click to cap the grid at 3 columns.";
+    button.classList.toggle("is-active", browserGridCapped);
+    button.setAttribute("aria-pressed", String(browserGridCapped));
+    button.setAttribute("aria-label", title);
+    button.title = title;
+    const label = button.querySelector<HTMLElement>("span");
+    if (label) label.textContent = browserGridCapped ? "3 max" : "Manual";
   });
-  if (BROWSER_REPLAY_PLAYBACK_ENABLED) {
-    document.querySelectorAll<HTMLButtonElement>("[data-replay-index]").forEach((button) => {
-      button.addEventListener("click", () => {
-        const replay = browserReplays[Number(button.dataset.replayIndex)];
-        if (replay) void openReplayFromBrowser(replay);
-      });
-    });
-  }
+  document.querySelector<HTMLInputElement>("#gridCardSize")?.addEventListener("input", (event) => {
+    const input = event.target as HTMLInputElement;
+    browserGridCardSize = clamp(Number(input.value), BROWSER_GRID_CARD_SIZE_MIN, BROWSER_GRID_CARD_SIZE_MAX);
+    input.setAttribute("aria-valuetext", `${browserGridCardSize} pixels wide`);
+    const grid = document.querySelector<HTMLElement>("#replayGrid");
+    grid?.style.setProperty("--replay-card-min-width", `${browserGridCardSize}px`);
+    grid?.style.setProperty("--replay-card-scale", String(browserGridCardScale()));
+    const value = document.querySelector<HTMLOutputElement>("#gridCardSizeValue");
+    if (value) value.value = String(browserGridCardSize);
+    saveBrowserGridCardSize(browserGridCardSize);
+  });
+  document.querySelector<HTMLElement>("#replayGrid")?.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+
+    const deleteButton = target.closest<HTMLButtonElement>("[data-replay-delete-index]");
+    if (deleteButton) {
+      const replay = browserReplays[Number(deleteButton.dataset.replayDeleteIndex)];
+      if (replay) openReplayDeleteDialog(replay);
+      return;
+    }
+
+    const downloadButton = target.closest<HTMLButtonElement>("[data-replay-download-index]");
+    if (downloadButton) {
+      const replay = browserReplays[Number(downloadButton.dataset.replayDownloadIndex)];
+      if (replay) void downloadReplayFromBrowser(replay);
+      return;
+    }
+
+    if (!BROWSER_REPLAY_PLAYBACK_ENABLED) return;
+    const playButton = target.closest<HTMLButtonElement>("[data-replay-index]");
+    const replay = playButton ? browserReplays[Number(playButton.dataset.replayIndex)] : null;
+    if (replay) void openReplayFromBrowser(replay);
+  });
+  const deleteModal = document.querySelector<HTMLElement>("#replayDeleteModal");
+  deleteModal?.addEventListener("click", (event) => {
+    if (event.target === deleteModal && !browserDeleteInFlight) closeReplayDeleteDialog();
+  });
+  deleteModal?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !browserDeleteInFlight) {
+      event.preventDefault();
+      closeReplayDeleteDialog();
+      return;
+    }
+    if (event.key === "Tab") {
+      const buttons = Array.from(deleteModal.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+      if (!buttons.length) return;
+      const first = buttons[0];
+      const last = buttons[buttons.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#cancelReplayDelete")?.addEventListener("click", closeReplayDeleteDialog);
+  document.querySelector<HTMLButtonElement>("#confirmReplayDelete")?.addEventListener("click", () => {
+    void deleteReplayFromBrowser();
+  });
   if (!browserDocumentEventsBound) {
     document.addEventListener("pointerdown", handleBrowserOutsidePointerDown);
     browserDocumentEventsBound = true;
@@ -2092,12 +2606,16 @@ async function loadLeaderboardRows(options: { quiet?: boolean } = {}) {
 async function submitLeaderboardSnapshot(options: { quiet?: boolean } = {}) {
   if (leaderboardSubmitting) return;
   leaderboardSubmitting = true;
-  if (!options.quiet) leaderboardError = "";
+  leaderboardSubmitError = "";
   if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
   try {
-    await invoke("leaderboard_submit");
+    const payload = await invoke<{ lastSync?: LeaderboardSyncState }>("leaderboard_submit");
+    leaderboardSubmitError = "";
+    if (payload.lastSync && leaderboardStatusPayload) {
+      leaderboardStatusPayload = { ...leaderboardStatusPayload, lastSync: payload.lastSync };
+    }
   } catch (error) {
-    leaderboardError = error instanceof Error ? error.message : String(error || "Could not submit leaderboard score.");
+    leaderboardSubmitError = friendlyLeaderboardError(error || "Could not submit leaderboard score.");
   } finally {
     leaderboardSubmitting = false;
     await loadLeaderboardStatus({ quiet: true });
@@ -2106,15 +2624,16 @@ async function submitLeaderboardSnapshot(options: { quiet?: boolean } = {}) {
 }
 
 async function refreshLeaderboard() {
+  leaderboardError = "";
+  leaderboardSubmitError = "";
   const userDataTask = loadUserData();
   const statusTask = loadLeaderboardStatus({ quiet: true });
-  const rowsTask = loadLeaderboardRows({ quiet: true });
   await Promise.allSettled([userDataTask, statusTask]);
   await loadLeaderboardStatus({ quiet: true });
   if (leaderboardStatusPayload?.canSubmit) {
     await submitLeaderboardSnapshot({ quiet: true });
   }
-  await rowsTask;
+  await loadLeaderboardRows({ quiet: true });
   if (browserPage === "leaderboard") renderReplayBrowser();
 }
 
@@ -2177,6 +2696,110 @@ async function openReplayFromBrowser(replay: ReplayBrowserItem) {
   }
 }
 
+function openReplayDeleteDialog(replay: ReplayBrowserItem) {
+  if (browserDeleteInFlight) return;
+  browserDeleteCandidate = replay;
+  browserDeleteError = "";
+  renderReplayBrowser();
+  window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#cancelReplayDelete")?.focus());
+}
+
+function closeReplayDeleteDialog() {
+  if (browserDeleteInFlight) return;
+  const replay = browserDeleteCandidate;
+  browserDeleteCandidate = null;
+  browserDeleteError = "";
+  renderReplayBrowser();
+  if (replay) {
+    const replayIndex = browserReplays.indexOf(replay);
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>(`[data-replay-delete-index="${replayIndex}"]`)?.focus();
+    });
+  }
+}
+
+async function deleteReplayFromBrowser() {
+  const replay = browserDeleteCandidate;
+  if (!replay || browserDeleteInFlight) return;
+  browserDeleteInFlight = true;
+  browserDeleteError = "";
+  renderReplayBrowser();
+  try {
+    await invoke<number>("delete_replay", { filePath: replay.filePath });
+    browserDeleteCandidate = null;
+    browserDeleteInFlight = false;
+    await loadBrowserReplays(true);
+  } catch (error) {
+    browserDeleteInFlight = false;
+    browserDeleteError = error instanceof Error ? error.message : String(error || "Could not delete the replay.");
+    renderReplayBrowser();
+    window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#cancelReplayDelete")?.focus());
+  }
+}
+
+async function downloadReplayFromBrowser(replay: ReplayBrowserItem) {
+  if (browserDownloadingPaths.has(replay.filePath)) return;
+  browserDownloadingPaths.add(replay.filePath);
+  updateReplayDownloadButton(replay, true);
+  try {
+    await invoke<boolean>("download_replay", {
+      filePath: replay.filePath,
+      fileName: replayDownloadFileName(replay),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || "Could not save the replay.");
+    window.alert(`Could not save the replay.\n\n${message}`);
+  } finally {
+    browserDownloadingPaths.delete(replay.filePath);
+    updateReplayDownloadButton(replay, false);
+  }
+}
+
+async function uploadBrowserReplays(files: File[]) {
+  if (browserUploading || !files.length) return;
+  browserUploading = true;
+  browserUploadLabel = files.length === 1 ? "Uploading..." : `Uploading 1/${files.length}`;
+  renderReplayBrowser();
+
+  const failures: string[] = [];
+  for (const [index, file] of files.entries()) {
+    browserUploadLabel = files.length === 1 ? "Uploading..." : `Uploading ${index + 1}/${files.length}`;
+    const label = document.querySelector<HTMLElement>("#uploadReplays span");
+    if (label) label.textContent = browserUploadLabel;
+    try {
+      const buffer = await file.arrayBuffer();
+      await invoke("upload_replay", {
+        fileName: file.name,
+        replayBase64: bytesToBase64(new Uint8Array(buffer)),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || "Upload failed.");
+      failures.push(`${file.name}: ${message}`);
+    }
+  }
+
+  browserUploading = false;
+  browserUploadLabel = "Upload";
+  await loadBrowserReplays(true);
+  if (failures.length) {
+    window.alert(`Could not upload ${failures.length} ${failures.length === 1 ? "replay" : "replays"}.\n\n${failures.join("\n\n")}`);
+  }
+}
+
+function updateReplayDownloadButton(replay: ReplayBrowserItem, isDownloading: boolean) {
+  const replayIndex = browserReplays.indexOf(replay);
+  if (replayIndex < 0) return;
+  const button = document.querySelector<HTMLButtonElement>(`[data-replay-download-index="${replayIndex}"]`);
+  if (!button) return;
+
+  const label = replay.players.map((player) => player.name).join(" versus ");
+  const action = isDownloading ? "Saving replay" : "Download replay";
+  button.classList.toggle("is-downloading", isDownloading);
+  button.disabled = isDownloading;
+  button.setAttribute("aria-label", `${action}: ${label}`);
+  button.title = action;
+}
+
 function replayListSignature(replays: ReplayBrowserItem[]): string {
   return replays
     .map((replay) =>
@@ -2193,26 +2816,22 @@ function replayListSignature(replays: ReplayBrowserItem[]): string {
 
 async function loadBrowserReplays(
   preserveControls = false,
-  options: { quiet?: boolean; page?: number } = {},
+  options: { quiet?: boolean } = {},
 ) {
   if (browserLoading) return;
-  const requestLimit = browserReplayRequestLimit();
-  const page = requestLimit === 0 ? 0 : Math.max(0, Math.floor(options.page ?? browserReplayPage));
   let shouldRender = !options.quiet;
   browserLoading = true;
   browserError = "";
   if (!options.quiet) renderReplayBrowser();
   try {
     const payload = await invoke<ReplayBrowserPayload>("list_replays", {
-      offset: page * requestLimit,
-      limit: requestLimit,
+      offset: 0,
+      limit: 0,
     });
     const replays = payload.replays;
     const nextSignature = replayListSignature(replays);
-    const changed = nextSignature !== browserReplaySignature || page !== browserReplayPage || payload.totalCandidates !== browserReplayTotal;
+    const changed = nextSignature !== browserReplaySignature;
     browserReplays = replays;
-    browserReplayTotal = payload.totalCandidates;
-    browserReplayPage = Math.min(page, browserReplayPageCount(payload.totalCandidates) - 1);
     browserReplaySignature = nextSignature;
     setupBrowserDuration(replays, preserveControls);
     shouldRender = shouldRender || changed;
@@ -2227,9 +2846,9 @@ async function loadBrowserReplays(
   }
 }
 
-function startBrowserReplayPolling() {
-  window.clearInterval(browserReplayPollTimer);
-  browserReplayPollTimer = 0;
+function startBrowserRelativeTimeUpdates() {
+  window.clearInterval(browserRelativeTimeTimer);
+  browserRelativeTimeTimer = window.setInterval(updateReplayAgeLabels, 15_000);
 }
 
 function startRegionPolling() {
@@ -5048,8 +5667,9 @@ async function loadCurrentLaunchRequest() {
 
 if (appMode === "browser") {
   renderReplayBrowser();
+  void initializeAppUpdater();
   void loadBrowserReplays();
-  startBrowserReplayPolling();
+  startBrowserRelativeTimeUpdates();
   startRegionPolling();
   window.addEventListener("keydown", (event) => {
     const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";

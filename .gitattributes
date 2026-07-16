@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Keep scripts native on Windows while normalizing source and config files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets must never be line-ending normalized.
+*.dll binary
+*.exe binary
+*.ico binary
+*.png binary
+*.rep binary

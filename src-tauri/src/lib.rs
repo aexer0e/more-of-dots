@@ -38,6 +38,8 @@ const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
 const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
+const REPLAY_EVENT_DETECTION_VERSION: u8 = 1;
+const RED_BLUE_EVENT_LABEL: &str = "World";
 const USER_DATA_CHECKPOINT_FILE_NAME: &str = "user-data-checkpoints.json";
 const LEADERBOARD_SYNC_FILE_NAME: &str = "leaderboard-sync.json";
 const DEFAULT_USER_DATA_URL: &str = "ws://cs.war-of-dots.com:9056";
@@ -160,6 +162,8 @@ struct ReplaySummary {
     thumbnail_data_url: Option<String>,
     modified: u64,
     score_delta: Option<i64>,
+    #[serde(default)]
+    event_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -169,6 +173,8 @@ struct ParsedReplay {
     event_winner_index: Option<usize>,
     map_id: Option<String>,
     custom_map_surface: Option<String>,
+    #[serde(default)]
+    event_detection_version: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +231,14 @@ struct ReplayListPayload {
     total_candidates: usize,
     has_more: bool,
     next_offset: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayUploadResult {
+    file_name: String,
+    replay_path: String,
+    backup_path: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -643,6 +657,9 @@ fn parsed_replay_from_index(
     }
 
     let mut parsed = entry.parsed.clone()?;
+    if parsed.event_detection_version != REPLAY_EVENT_DETECTION_VERSION {
+        return None;
+    }
     parsed.summary.file_name = candidate.file_name.clone();
     parsed.summary.modified = candidate.modified;
     parsed.summary.thumbnail_data_url = None;
@@ -2842,6 +2859,39 @@ fn discover_replay_dirs() -> Vec<PathBuf> {
     replay_dirs
 }
 
+fn primary_replay_dir() -> Result<PathBuf, String> {
+    if let Some(path) = discover_replay_dirs().into_iter().next() {
+        return Ok(path);
+    }
+
+    let mut game_dirs = discover_steamapps_dirs()
+        .into_iter()
+        .map(|steamapps| steamapps.join("common").join(GAME_DIR_NAME))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    let configured_game_dir = steam_game_dir();
+    if configured_game_dir.is_dir()
+        && !game_dirs
+            .iter()
+            .any(|path| path_key(path) == path_key(&configured_game_dir))
+    {
+        game_dirs.push(configured_game_dir);
+    }
+
+    let game_dir = game_dirs
+        .into_iter()
+        .next()
+        .ok_or_else(|| "War of Dots installation folder was not found.".to_string())?;
+    let replay_dir = game_dir.join("replays");
+    fs::create_dir_all(&replay_dir).map_err(|error| {
+        format!(
+            "Could not create replay folder {}: {error}",
+            replay_dir.display()
+        )
+    })?;
+    Ok(replay_dir)
+}
+
 fn discover_map_editor_dirs() -> Vec<PathBuf> {
     let mut map_dirs = discover_steamapps_dirs()
         .into_iter()
@@ -3339,12 +3389,71 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
             thumbnail_data_url: None,
             modified,
             score_delta: None,
+            event_label: replay_event_label(&raw),
         },
         result: raw.get("result").cloned(),
         event_winner_index,
         map_id: replay_map_id(&raw),
         custom_map_surface: custom_map_surface(&raw),
+        event_detection_version: REPLAY_EVENT_DETECTION_VERSION,
     })
+}
+
+fn replay_event_label(raw: &Value) -> Option<String> {
+    is_red_blue_event_replay(raw).then(|| RED_BLUE_EVENT_LABEL.to_string())
+}
+
+fn is_red_blue_event_replay(raw: &Value) -> bool {
+    let Some(map) = raw.get("map").and_then(Value::as_object) else {
+        return false;
+    };
+    if map.get("mode").and_then(Value::as_str) != Some("1v1")
+        || map
+            .get("map_surface")
+            .and_then(Value::as_str)
+            .and_then(png_dimensions_from_base64)
+            != Some((960, 540))
+        || map
+            .get("bridges")
+            .and_then(Value::as_array)
+            .is_none_or(|bridges| !bridges.is_empty())
+    {
+        return false;
+    }
+
+    let Some(cities) = map.get("cities").and_then(Value::as_array) else {
+        return false;
+    };
+    let (infantry_per_team, tanks_per_team) = match cities.len() {
+        8 => (16, 4),
+        10 => (20, 5),
+        _ => return false,
+    };
+    let has_equal_teams = |key: &str, units_per_team: usize| {
+        map.get(key).and_then(Value::as_array).is_some_and(|teams| {
+            teams.len() == 2
+                && teams.iter().all(|team| {
+                    team.as_array()
+                        .is_some_and(|units| units.len() == units_per_team)
+                })
+        })
+    };
+    let valid_capitals = map
+        .get("capitals")
+        .and_then(Value::as_array)
+        .is_some_and(|capitals| {
+            capitals.len() == 2
+                && capitals[0] != capitals[1]
+                && capitals.iter().all(|capital| {
+                    capital
+                        .as_u64()
+                        .is_some_and(|index| index < cities.len() as u64)
+                })
+        });
+
+    has_equal_teams("infantry", infantry_per_team)
+        && has_equal_teams("tanks", tanks_per_team)
+        && valid_capitals
 }
 
 fn replay_player_names(raw: &Value) -> Vec<String> {
@@ -3935,6 +4044,268 @@ fn list_replays_impl(
         has_more: page_end < candidates.len(),
         next_offset: (page_end < candidates.len()).then_some(page_end),
     })
+}
+
+fn select_replay_download_path(default_file_name: &str) -> Result<Option<PathBuf>, String> {
+    let file_name = default_file_name.replace('\'', "''");
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.SaveFileDialog
+$dialog.AddExtension = $true
+$dialog.DefaultExt = 'rep'
+$dialog.FileName = '{file_name}'
+$dialog.Filter = 'War of Dots replay (*.rep)|*.rep'
+$dialog.OverwritePrompt = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::Write($dialog.FileName)
+}}
+"#
+    );
+    let encoded_script = BASE64.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("Could not open the Save As dialog: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not open the Save As dialog: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
+}
+
+fn safe_replay_file_name(file_name: &str) -> Result<String, String> {
+    let name = file_name.trim();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
+        || name == "."
+        || name == ".."
+        || !name.to_ascii_lowercase().ends_with(".rep")
+    {
+        return Err("Replay filename must be a valid .rep filename.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn replay_upload_destination(
+    replay_dir: &Path,
+    file_name: &str,
+    hash: &str,
+) -> Result<PathBuf, String> {
+    let requested = replay_dir.join(file_name);
+    if !requested.exists() || sha256_file(&requested).is_ok_and(|existing| existing == hash) {
+        return Ok(requested);
+    }
+
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("replay");
+    for suffix in 2..=10_000 {
+        let candidate = replay_dir.join(format!("{stem} ({suffix}).rep"));
+        if !candidate.exists() || sha256_file(&candidate).is_ok_and(|existing| existing == hash) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "Could not find an available filename in {}.",
+        replay_dir.display()
+    ))
+}
+
+fn upload_replay_impl(
+    app: &AppHandle,
+    file_name: String,
+    replay_base64: String,
+) -> Result<ReplayUploadResult, String> {
+    let file_name = safe_replay_file_name(&file_name)?;
+    let bytes = BASE64
+        .decode(replay_base64.as_bytes())
+        .map_err(|error| format!("Replay payload is not valid base64: {error}"))?;
+    if bytes.is_empty() {
+        return Err("Replay file is empty.".to_string());
+    }
+
+    let uploads_dir = app_runtime_dir(app)?.join("desktop-uploads");
+    fs::create_dir_all(&uploads_dir).map_err(|error| error.to_string())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let upload_path = uploads_dir.join(format!("upload-{now}.rep"));
+    fs::write(&upload_path, bytes)
+        .map_err(|error| format!("Could not stage replay {}: {error}", upload_path.display()))?;
+
+    let result = (|| {
+        parse_replay(&upload_path)
+            .map_err(|error| format!("{file_name} is not a valid replay: {error}"))?;
+        let hash = sha256_file(&upload_path)?;
+        let backup_path = backup_replay_file(&upload_path, &hash, &replay_backup_dir(app)?)?;
+        let replay_dir = primary_replay_dir()?;
+        let replay_path = replay_upload_destination(&replay_dir, &file_name, &hash)?;
+        if !replay_path.exists() {
+            fs::copy(&upload_path, &replay_path).map_err(|error| {
+                format!(
+                    "Could not save replay to {}: {error}",
+                    replay_path.display()
+                )
+            })?;
+        }
+
+        Ok(ReplayUploadResult {
+            file_name: candidate_file_name(&replay_path),
+            replay_path: replay_path.to_string_lossy().to_string(),
+            backup_path: backup_path.to_string_lossy().to_string(),
+        })
+    })();
+    let _ = fs::remove_file(&upload_path);
+    result
+}
+
+#[tauri::command]
+async fn upload_replay(
+    app: AppHandle,
+    file_name: String,
+    replay_base64: String,
+) -> Result<ReplayUploadResult, String> {
+    tauri::async_runtime::spawn_blocking(move || upload_replay_impl(&app, file_name, replay_base64))
+        .await
+        .map_err(|error| format!("Replay upload task failed: {error}"))?
+}
+
+fn delete_replay_impl(app: &AppHandle, file_path: String) -> Result<usize, String> {
+    let source_path = PathBuf::from(file_path);
+    if !source_path.is_file() || !is_replay_file(&source_path) {
+        return Err(format!(
+            "Replay file is not readable: {}",
+            source_path.display()
+        ));
+    }
+
+    let backup_dir = replay_backup_dir(app)?;
+    let backup_dir_key = path_key(&backup_dir);
+    let mut managed_dirs = discover_replay_dirs();
+    push_unique_path(&mut managed_dirs, backup_dir);
+    let source_path = fs::canonicalize(&source_path).map_err(|error| {
+        format!(
+            "Could not resolve replay path {}: {error}",
+            source_path.display()
+        )
+    })?;
+    let is_managed = source_path.parent().is_some_and(|source_parent| {
+        managed_dirs.iter().any(|directory| {
+            fs::canonicalize(directory)
+                .is_ok_and(|managed| path_key(&managed) == path_key(source_parent))
+        })
+    });
+    if !is_managed {
+        return Err("Replay is outside the managed game and backup folders.".to_string());
+    }
+
+    let hash = sha256_file(&source_path)?;
+    let mut targets = Vec::new();
+    for directory in &managed_dirs {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && is_replay_file(&path)
+                && sha256_file(&path).is_ok_and(|candidate_hash| candidate_hash == hash)
+            {
+                let is_backup = path
+                    .parent()
+                    .is_some_and(|parent| path_key(parent) == backup_dir_key);
+                targets.push((path, is_backup));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Err("No managed copies of this replay were found.".to_string());
+    }
+
+    let mut deleted = 0;
+    let mut failures = Vec::new();
+    for (target, is_backup) in targets {
+        if is_backup && !failures.is_empty() {
+            continue;
+        }
+        match fs::remove_file(&target) {
+            Ok(()) => deleted += 1,
+            Err(error) => failures.push(format!("{}: {error}", target.display())),
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(format!(
+            "Deleted {deleted} replay copies, but could not delete:\n{}",
+            failures.join("\n")
+        ));
+    }
+
+    let index_path = replay_index_path(app)?;
+    let mut index = load_replay_index(&index_path);
+    let previous_entry_count = index.entries.len();
+    index.entries.retain(|_, entry| entry.hash != hash);
+    if index.entries.len() != previous_entry_count {
+        write_replay_index(&index_path, &index)?;
+    }
+    Ok(deleted)
+}
+
+#[tauri::command]
+async fn delete_replay(app: AppHandle, file_path: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || delete_replay_impl(&app, file_path))
+        .await
+        .map_err(|error| format!("Replay deletion task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn download_replay(file_path: String, file_name: String) -> Result<bool, String> {
+    let source_path = PathBuf::from(file_path);
+    if !source_path.is_file() || !is_replay_file(&source_path) {
+        return Err(format!(
+            "Replay file is not readable: {}",
+            source_path.display()
+        ));
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(mut destination_path) = select_replay_download_path(&file_name)? else {
+            return Ok(false);
+        };
+        if !destination_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rep"))
+        {
+            destination_path.set_extension("rep");
+        }
+        fs::copy(&source_path, &destination_path).map_err(|error| {
+            format!(
+                "Could not save replay to {}: {error}",
+                destination_path.display()
+            )
+        })?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| format!("Replay download task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -4621,7 +4992,9 @@ async fn capture_progress(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(WindowOwnerProcesses::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -4650,6 +5023,9 @@ pub fn run() {
             stage_game,
             list_jobs,
             list_replays,
+            upload_replay,
+            delete_replay,
+            download_replay,
             list_maps,
             read_map,
             save_map,
@@ -4720,6 +5096,44 @@ mod tests {
 
         assert_eq!(custom_map_surface(&raw), Some("iVBORw0KGgo=".to_string()));
         assert_eq!(replay_map_id(&raw), None);
+    }
+
+    #[test]
+    fn red_blue_event_label_uses_procedural_map_signature() {
+        let surface = solid_map_surface_base64(960, 540).unwrap();
+        let infantry = vec![vec![json!([0, 0]); 16]; 2];
+        let tanks = vec![vec![json!([0, 0]); 4]; 2];
+        let raw = json!({
+            "map": {
+                "map_surface": surface,
+                "mode": "1v1",
+                "infantry": infantry,
+                "tanks": tanks,
+                "cities": vec![json!([0, 0]); 8],
+                "capitals": [0, 7],
+                "bridges": []
+            }
+        });
+
+        assert_eq!(replay_event_label(&raw).as_deref(), Some("World"));
+        assert_eq!(replay_event_label(&json!({ "map": "35" })), None);
+    }
+
+    #[test]
+    fn arbitrary_custom_map_is_not_labeled_as_red_blue_event() {
+        let raw = json!({
+            "map": {
+                "map_surface": solid_map_surface_base64(960, 540).unwrap(),
+                "mode": "1v1",
+                "infantry": [[], []],
+                "tanks": [[], []],
+                "cities": [],
+                "capitals": [0, 1],
+                "bridges": []
+            }
+        });
+
+        assert_eq!(replay_event_label(&raw), None);
     }
 
     #[test]
@@ -4848,11 +5262,13 @@ mod tests {
                 thumbnail_data_url: None,
                 modified: 123,
                 score_delta: None,
+                event_label: None,
             },
             result: None,
             event_winner_index: None,
             map_id: None,
             custom_map_surface: None,
+            event_detection_version: REPLAY_EVENT_DETECTION_VERSION,
         };
         let entry = ReplayIndexEntry {
             path_key: path_key(&path),

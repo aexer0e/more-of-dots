@@ -5,14 +5,23 @@
   "type": "module",
   "scripts": {
     "dev:web": "vite --host 127.0.0.1",
-    "dev": "tauri dev",
+    "dev": "node scripts/version.mjs tauri dev",
+    "tauri": "tauri",
+    "version:config": "node scripts/version.mjs config",
+    "version:release-config": "node scripts/version.mjs config --release",
+    "check:version": "node --test scripts/version.test.mjs",
+    "check:web": "tsc --noEmit",
+    "check:worker": "npm --prefix leaderboard-worker run check",
+    "check": "npm run check:version && npm run check:web && npm run check:worker",
     "build:web": "tsc && vite build",
     "build:sidecar": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1",
     "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
-    "build": "tauri build && npm run size:audit"
+    "build": "node scripts/version.mjs tauri build && npm run size:audit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-process": "2.3.1",
+    "@tauri-apps/plugin-updater": "2.10.1",
     "lucide-react": "^1.23.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"

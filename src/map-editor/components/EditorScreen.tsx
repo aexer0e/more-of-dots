@@ -1180,88 +1180,21 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     ctx.restore();
   }
 
-  function drawPulseRing(
-    ctx: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    radius: number,
-    color: string,
-    pulse: number,
-  ) {
-    ctx.save();
-    ctx.globalAlpha = 0.18 + pulse * 0.1;
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(x, y, radius + 2 + pulse * 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 0.9;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2 + pulse * 1.4;
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 12 + pulse * 14;
-    ctx.beginPath();
-    ctx.arc(x, y, radius + 4 + pulse * 3, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  function drawHoverHighlight(ctx: CanvasRenderingContext2D, hover: { x: number; y: number } | null) {
+  function drawBridgeHoverHighlight(ctx: CanvasRenderingContext2D) {
     const target = hoverTargetRef.current;
-    if (!target) return false;
-    const tool = selectedToolRef.current;
-
-    const pulse = 0.55 + 0.45 * ((Math.sin(performance.now() / 210) + 1) / 2);
-
-    if (target.type === 'terrain') {
-      if (TOOL_LOOKUP[tool].group !== 'terrain') {
-        return false;
-      }
-      if (!hover) return false;
-      const radius = tool === 'terrainBrush' || tool === 'terrainLine'
-        ? Math.max(8, Math.round(brushSizeRef.current / 2))
-        : scaledHitRadius();
-      drawPulseRing(ctx, hover.x, hover.y, radius, target.terrainHex, pulse);
-      return true;
-    }
-
-    if (target.type === 'bridge' && target.bridge) {
-      if (tool !== 'bridge') {
-        return false;
-      }
+    if (selectedToolRef.current === 'bridge' && target?.type === 'bridge' && target.bridge) {
       ctx.save();
       ctx.strokeStyle = target.color;
-      ctx.lineWidth = BRIDGE_WIDTH + pulse * 1.5;
+      ctx.lineWidth = BRIDGE_WIDTH + 1;
       ctx.lineCap = 'square';
       ctx.lineJoin = 'miter';
-      ctx.shadowColor = target.color;
-      ctx.shadowBlur = 12 + pulse * 16;
       ctx.globalAlpha = 0.95;
       ctx.beginPath();
       ctx.moveTo(target.bridge[0][0], target.bridge[0][1]);
       ctx.lineTo(target.bridge[1][0], target.bridge[1][1]);
       ctx.stroke();
       ctx.restore();
-      return true;
     }
-
-    if (!isMoveEntityTool(tool) && tool !== 'select') {
-      return false;
-    }
-
-    if (target.type === 'infantry' || target.type === 'tank' || target.type === 'city' || target.type === 'capital') {
-      const [x, y] = target.point;
-      const radius = target.type === 'tank'
-        ? scaledIconSize(SPRITE_SIZE) * 0.72
-        : target.type === 'capital'
-          ? scaledIconSize(CAPITAL_SIZE) * 0.55
-          : target.type === 'city'
-            ? scaledIconSize(CITY_SIZE) * 0.52
-            : scaledIconSize(SPRITE_SIZE) * 0.62;
-      drawPulseRing(ctx, x, y, radius, target.color, pulse);
-      return true;
-    }
-
-    return false;
   }
 
   function selectionEntityPoint(map: StoredMap, entity: SelectedEntityRef): Point | null {
@@ -1531,14 +1464,18 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       drawSelectionOverlay(ctx);
     }
 
-    const animateHover = drawHoverHighlight(ctx, hover);
+    drawBridgeHoverHighlight(ctx);
 
     if (hover) {
-      if (tool === 'tank' || tool === 'capital') {
-        const size = Math.max(scaledHitRadius() * 2, Math.round(brushSizeRef.current));
+      if (tool === 'terrainBrush' || tool === 'terrainLine') {
+        drawCircleOutline(ctx, hover, brushSizeRef.current, terrainColorRef.current);
+      } else if (tool === 'tank' || tool === 'capital') {
+        const size = tool === 'tank'
+          ? scaledHitRadius() * 2
+          : Math.max(scaledHitRadius() * 2, Math.round(brushSizeRef.current));
         const color = tool === 'tank' ? teamAccent(selectedTeamRef.current, teamCount) : '#f7ca5d';
         drawCircleOutline(ctx, hover, size, color);
-      } else if (tool !== 'bridge' && tool !== 'select' && tool !== 'terrainBrush' && tool !== 'terrainLine') {
+      } else if (tool !== 'bridge' && tool !== 'select') {
         ctx.strokeStyle = 'rgba(255,255,255,0.6)';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -1548,11 +1485,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     }
 
     ctx.restore();
-
-    if (animateHover && hover) {
-      overlayDirtyRef.current = true;
-      requestDraw();
-    }
   }
 
   function drawSprite(
@@ -3002,7 +2934,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       { id: 'brush-brackets', icon: Brackets, label: '[ / ]', action: 'Shrink or grow the brush.' },
       { id: 'teams', icon: Keyboard, label: '1 - 4', action: 'Switch the active team color.' },
       { id: 'tools', icon: Keyboard, label: 'Q B L R F S I T C K G E', action: 'Quick-select editor tools.' },
-      { id: 'hover', icon: MousePointer2, label: 'Hover', action: 'Preview glow only on targets relevant to the active tool.' },
+      { id: 'hover', icon: MousePointer2, label: 'Hover', action: 'Preview the active tool at the cursor.' },
     ];
 
     if (selectedTool === 'select') {

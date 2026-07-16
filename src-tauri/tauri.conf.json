@@ -36,6 +36,17 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDOEMxM0I4NjVCNjIzNUYKUldSZkk3Wmx1Qk9NUEwzOEJ5N1NJaXBvekhZRy9EK0NodGxmcXVrdGVOUUtJYkI1SXEyekprek4K",
+      "endpoints": [
+        "https://github.com/aexer0e/more-of-dots/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],

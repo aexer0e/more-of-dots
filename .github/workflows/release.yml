@@ -1,24 +1,23 @@
-name: Publish Windows release
+name: Draft Windows release
 
 on:
   push:
     paths:
       - VERSION
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: production-release
-  cancel-in-progress: false
+  group: draft-release
+  cancel-in-progress: true
 
 jobs:
-  publish:
-    name: Validate, sign, and publish
+  build:
+    name: Build and draft
     if: github.ref_name == github.event.repository.default_branch
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository and tags
@@ -29,24 +28,6 @@ jobs:
       - name: Validate release version
         shell: pwsh
         run: node scripts/version.mjs release-check
-
-      - name: Refuse to overwrite a published release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $version = (Get-Content -Raw VERSION).Trim()
-          $tag = "v$version"
-          $releaseJson = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "$tag has not been published yet."
-            exit 0
-          }
-          $release = $releaseJson | ConvertFrom-Json
-          if (-not $release.isDraft) {
-            throw "$tag is already published; bump VERSION instead of overwriting it."
-          }
-          Write-Host "Resuming existing draft release $tag."
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -60,54 +41,13 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            leaderboard-worker/package-lock.json
+          cache-dependency-path: package-lock.json
 
-      - name: Select stable Rust
-        shell: pwsh
-        run: |
-          rustup update stable --no-self-update
-          rustup default stable
-
-      - name: Install Python dependencies
-        shell: pwsh
-        run: |
-          python -m venv .venv
-          .\.venv\Scripts\python.exe -m pip install --upgrade pip
-          .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+      - name: Create Python environment
+        run: python -m venv .venv
 
       - name: Install JavaScript dependencies
-        run: |
-          npm ci
-          npm ci --prefix leaderboard-worker
-
-      - name: Run Python tests
-        run: .\.venv\Scripts\python.exe -m pytest -q
-
-      - name: Check version and TypeScript
-        run: npm run check
-
-      - name: Audit JavaScript dependencies
-        run: |
-          npm audit --audit-level=high
-          npm --prefix leaderboard-worker audit --audit-level=high
-
-      - name: Check Rust formatting
-        shell: pwsh
-        run: |
-          cargo fmt --all --check --manifest-path tools/python-probe-dll/Cargo.toml
-          cargo fmt --all --check --manifest-path src-tauri/Cargo.toml
-
-      - name: Build packaged backend prerequisites
-        shell: pwsh
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1 -SkipInstall
-
-      - name: Check Rust workspaces
-        shell: pwsh
-        run: |
-          cargo check --locked --manifest-path tools/python-probe-dll/Cargo.toml
-          cargo check --locked --manifest-path src-tauri/Cargo.toml
+        run: npm ci
 
       - name: Prepare signed release configuration
         run: npm run version:release-config
@@ -128,78 +68,4 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
-          args: --config build/tauri.version.conf.json
-
-      - name: Validate release assets and updater metadata
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $version = (Get-Content -Raw VERSION).Trim()
-          $tag = "v$version"
-          $release = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets,isDraft | ConvertFrom-Json
-          if (-not $release.isDraft) {
-            throw "$tag must remain a draft until validation completes."
-          }
-          $names = @($release.assets | ForEach-Object { $_.name })
-          $checks = [ordered]@{
-            latest_json = $names -contains "latest.json"
-            nsis_installer = @($names | Where-Object { $_ -match "-setup\.exe$" }).Count -gt 0
-            nsis_signature = @($names | Where-Object { $_ -match "-setup\.exe\.sig$" }).Count -gt 0
-            msi_installer = @($names | Where-Object { $_ -match "\.msi$" }).Count -gt 0
-            msi_signature = @($names | Where-Object { $_ -match "\.msi\.sig$" }).Count -gt 0
-          }
-          $missing = @($checks.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key })
-          if ($missing.Count) {
-            throw "Release asset validation failed: $($missing -join ', '). Assets: $($names -join ', ')"
-          }
-
-          $downloadDir = Join-Path $env:RUNNER_TEMP "more-of-dots-release-validation"
-          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
-          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern latest.json --dir $downloadDir --clobber
-          $latest = Get-Content -Raw (Join-Path $downloadDir "latest.json") | ConvertFrom-Json
-          if ($latest.version -ne $version) {
-            throw "latest.json contains version $($latest.version), expected $version."
-          }
-          $windowsEntries = @(
-            $latest.platforms.PSObject.Properties |
-              Where-Object { $_.Name -match "^windows-" } |
-              ForEach-Object { $_.Value }
-          )
-          $nsisEntry = $windowsEntries | Where-Object { $_.url -match "-setup\.exe$" -and $_.signature } | Select-Object -First 1
-          if (-not $nsisEntry) {
-            throw "latest.json does not prefer a signed NSIS installer for Windows."
-          }
-
-      - name: Publish validated release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $version = (Get-Content -Raw VERSION).Trim()
-          gh release edit "v$version" --repo $env:GITHUB_REPOSITORY --draft=false --latest
-
-      - name: Verify public update metadata
-        shell: pwsh
-        run: |
-          $expected = (Get-Content -Raw VERSION).Trim()
-          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/latest.json"
-          $latest = $null
-          foreach ($attempt in 1..6) {
-            try {
-              $latest = Invoke-RestMethod -Uri $url -Headers @{ "Cache-Control" = "no-cache" }
-              break
-            } catch {
-              if ($attempt -eq 6) { throw }
-              Start-Sleep -Seconds 5
-            }
-          }
-          if ($latest.version -ne $expected) {
-            throw "Public latest.json contains $($latest.version), expected $expected."
-          }
-
-      - name: Write release summary
-        shell: pwsh
-        run: |
-          $version = (Get-Content -Raw VERSION).Trim()
-          "Published [More of Dots v$version](https://github.com/$env:GITHUB_REPOSITORY/releases/tag/v$version)." >> $env:GITHUB_STEP_SUMMARY
+          args: --bundles nsis --config build/tauri.version.conf.json

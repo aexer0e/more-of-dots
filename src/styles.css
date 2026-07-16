@@ -2961,16 +2961,16 @@ p {
   min-height: calc(214px * var(--card-scale));
   overflow: hidden;
   position: relative;
-  transition: opacity 120ms ease, transform 120ms ease;
+  transition: border-color 150ms ease, box-shadow 150ms ease, opacity 120ms ease, transform 120ms ease;
 }
 
 .replay-card:hover {
   transform: translateY(-1px);
 }
 
-.replay-card.is-dimmed {
-  filter: brightness(0.48) saturate(0.72);
-  opacity: 0.34;
+.replay-card.is-selected {
+  border-color: rgba(111, 207, 151, 0.82);
+  box-shadow: 0 0 0 2px rgba(111, 207, 151, 0.2), 0 18px 38px rgba(0, 0, 0, 0.34);
 }
 
 .replay-labels {
@@ -3074,12 +3074,6 @@ p {
   z-index: 1;
 }
 
-.replay-card:hover .replay-shade,
-.replay-card:focus-within .replay-shade {
-  background: rgba(3, 5, 4, 0.76);
-  z-index: 3;
-}
-
 .replay-play-button {
   -webkit-backdrop-filter: blur(12px);
   align-items: center;
@@ -3119,118 +3113,97 @@ p {
   width: 0;
 }
 
-.replay-download-button {
+.replay-select-button {
+  -webkit-backdrop-filter: blur(10px);
   align-items: center;
-  background: linear-gradient(145deg, rgba(247, 250, 246, 0.98), rgba(198, 221, 238, 0.95));
-  border: 1px solid rgba(255, 255, 255, 0.86);
-  border-radius: 50%;
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.42), 0 0 0 calc(6px * var(--card-scale)) rgba(255, 255, 255, 0.1);
-  color: #15212a;
+  backdrop-filter: blur(10px);
+  background: rgba(10, 15, 12, 0.72);
+  border: 1px solid rgba(241, 245, 239, 0.16);
+  border-radius: 999px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.26);
+  color: rgba(241, 245, 239, 0.78);
   cursor: pointer;
   display: inline-flex;
-  height: clamp(42px, calc(68px * var(--card-scale)), 88px);
+  font: inherit;
+  font-size: clamp(8px, calc(11px * var(--card-scale)), 13px);
+  font-weight: 750;
+  gap: clamp(4px, calc(5px * var(--card-scale)), 7px);
+  min-height: clamp(28px, calc(32px * var(--card-scale)), 36px);
   justify-content: center;
-  left: calc(50% - clamp(25px, calc(39px * var(--card-scale)), 51px));
+  bottom: calc(10px * var(--card-scale));
+  left: auto;
   opacity: 0;
-  padding: 0;
+  padding: 0 clamp(9px, calc(11px * var(--card-scale)), 14px);
   pointer-events: none;
   position: absolute;
-  top: 50%;
-  transform: translate(-50%, -50%) scale(0.86);
+  right: calc(12px * var(--card-scale));
+  top: auto;
+  transform: none;
   transition: background 140ms ease, box-shadow 140ms ease, color 140ms ease, opacity 140ms ease, transform 140ms ease;
-  width: clamp(42px, calc(68px * var(--card-scale)), 88px);
+  white-space: nowrap;
   z-index: 4;
 }
 
-.replay-download-button svg {
+.replay-select-button svg {
   fill: none;
-  height: clamp(20px, calc(29px * var(--card-scale)), 38px);
+  height: clamp(13px, calc(15px * var(--card-scale)), 17px);
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 2.15;
-  width: clamp(20px, calc(29px * var(--card-scale)), 38px);
+  stroke-width: 1.9;
+  width: clamp(13px, calc(15px * var(--card-scale)), 17px);
 }
 
-.replay-card:hover .replay-download-button,
-.replay-card:focus-within .replay-download-button {
-  opacity: 1;
-  pointer-events: auto;
-  transform: translate(-50%, -50%) scale(1);
-}
-
-.replay-download-button:hover:not(:disabled),
-.replay-download-button:focus-visible {
-  background: linear-gradient(145deg, #ffffff, #8fd0ff);
-  border-color: rgba(255, 255, 255, 0.98);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.48), 0 0 0 calc(7px * var(--card-scale)) rgba(103, 183, 255, 0.2);
-  color: #0c293d;
-  outline: none;
-  transform: translate(-50%, -50%) scale(1.07);
-}
-
-.replay-download-button:disabled {
-  cursor: wait;
-  opacity: 0.58;
-}
-
-.replay-download-button.is-downloading svg {
-  animation: replay-download-pulse 850ms ease-in-out infinite alternate;
-}
-
-@keyframes replay-download-pulse {
-  from { transform: translateY(-2px); }
-  to { transform: translateY(2px); }
-}
-
-.replay-delete-button {
-  align-items: center;
-  background: linear-gradient(145deg, rgba(255, 246, 246, 0.98), rgba(244, 183, 183, 0.96));
-  border: 1px solid rgba(255, 255, 255, 0.84);
-  border-radius: 50%;
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.42), 0 0 0 calc(6px * var(--card-scale)) rgba(255, 116, 116, 0.1);
-  color: #6e2024;
-  cursor: pointer;
-  display: inline-flex;
-  height: clamp(42px, calc(68px * var(--card-scale)), 88px);
-  justify-content: center;
-  left: calc(50% + clamp(25px, calc(39px * var(--card-scale)), 51px));
+.replay-select-button svg path {
   opacity: 0;
-  padding: 0;
-  pointer-events: none;
-  position: absolute;
-  top: 50%;
-  transform: translate(-50%, -50%) scale(0.86);
-  transition: background 140ms ease, box-shadow 140ms ease, color 140ms ease, opacity 140ms ease, transform 140ms ease;
-  width: clamp(42px, calc(68px * var(--card-scale)), 88px);
-  z-index: 4;
+  transform: scale(0.6);
+  transform-origin: center;
+  transition: opacity 120ms ease, transform 120ms ease;
 }
 
-.replay-delete-button svg {
-  fill: none;
-  height: clamp(19px, calc(27px * var(--card-scale)), 36px);
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 2;
-  width: clamp(19px, calc(27px * var(--card-scale)), 36px);
-}
-
-.replay-card:hover .replay-delete-button,
-.replay-card:focus-within .replay-delete-button {
+.replay-card:hover .replay-select-button,
+.replay-card:focus-within .replay-select-button,
+.replay-grid.has-selection .replay-select-button,
+.replay-select-button.is-selected {
   opacity: 1;
   pointer-events: auto;
-  transform: translate(-50%, -50%) scale(1);
+  transform: none;
 }
 
-.replay-delete-button:hover,
-.replay-delete-button:focus-visible {
-  background: linear-gradient(145deg, #fffafa, #ff8c92);
-  border-color: rgba(255, 255, 255, 0.98);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.48), 0 0 0 calc(7px * var(--card-scale)) rgba(255, 105, 112, 0.2);
-  color: #5b1117;
+.replay-select-button:hover:not(:disabled),
+.replay-select-button:focus-visible {
+  background: rgba(25, 33, 28, 0.94);
+  border-color: rgba(151, 221, 178, 0.4);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3), 0 0 0 2px rgba(111, 207, 151, 0.08);
+  color: rgba(241, 245, 239, 0.96);
+  opacity: 1;
   outline: none;
-  transform: translate(-50%, -50%) scale(1.07);
+  transform: translateY(-1px);
+}
+
+.replay-select-button.is-selected {
+  background: rgba(43, 111, 69, 0.86);
+  border-color: rgba(139, 225, 172, 0.46);
+  box-shadow: 0 7px 18px rgba(0, 0, 0, 0.3);
+  color: #ddffe9;
+  transform: none;
+}
+
+.replay-select-button.is-selected:hover:not(:disabled),
+.replay-select-button.is-selected:focus-visible {
+  background: rgba(49, 128, 78, 0.94);
+  border-color: rgba(164, 239, 192, 0.62);
+  transform: translateY(-1px);
+}
+
+.replay-select-button.is-selected svg path {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.replay-select-button:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .replay-delete-backdrop {
@@ -3738,6 +3711,76 @@ p {
   animation: upload-pulse 780ms ease-in-out infinite alternate;
 }
 
+.replay-selection-actions {
+  border-color: rgba(111, 207, 151, 0.28);
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(111, 207, 151, 0.06) inset;
+}
+
+.replay-selection-actions.is-entering {
+  animation: replay-selection-actions-in 160ms ease-out;
+}
+
+.replay-selection-count {
+  align-items: center;
+  color: var(--browser-muted);
+  display: inline-flex;
+  font-size: 11px;
+  gap: 5px;
+  padding: 0 8px 0 7px;
+  white-space: nowrap;
+}
+
+.replay-selection-count strong {
+  align-items: center;
+  background: rgba(111, 207, 151, 0.17);
+  border: 1px solid rgba(111, 207, 151, 0.3);
+  border-radius: 999px;
+  color: #8be1ac;
+  display: inline-flex;
+  font-size: 11px;
+  height: 22px;
+  justify-content: center;
+  min-width: 22px;
+  padding: 0 6px;
+}
+
+.unselect-button {
+  background: rgba(241, 245, 239, 0.06);
+  border-color: rgba(241, 245, 239, 0.12);
+  color: var(--browser-muted);
+}
+
+.selection-download-button {
+  background: rgba(103, 183, 255, 0.14);
+  border-color: rgba(103, 183, 255, 0.34);
+}
+
+.selection-download-button.is-loading svg {
+  animation: download-selection-pulse 700ms ease-in-out infinite alternate;
+}
+
+.selection-delete-button {
+  background: rgba(255, 105, 112, 0.12);
+  border-color: rgba(255, 105, 112, 0.3);
+  color: #ffb0b4;
+}
+
+.selection-delete-button:hover:not(:disabled),
+.selection-delete-button:focus-visible {
+  background: rgba(255, 105, 112, 0.2);
+  border-color: rgba(255, 105, 112, 0.58);
+  box-shadow: 0 0 0 3px rgba(255, 105, 112, 0.12);
+}
+
+@keyframes replay-selection-actions-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+}
+
+@keyframes download-selection-pulse {
+  from { transform: translateY(-1px); }
+  to { transform: translateY(2px); }
+}
+
 @keyframes upload-pulse {
   to {
     opacity: 0.45;
@@ -4019,6 +4062,21 @@ mark {
     left: 12px;
   }
 
+  .replay-upload-dock:has(.replay-selection-actions) {
+    right: 12px;
+  }
+
+  .replay-selection-actions {
+    display: grid;
+    grid-template-columns: auto repeat(3, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .replay-selection-actions .refresh-button {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
   .replay-delete-dialog {
     gap: 14px;
     grid-template-columns: 44px minmax(0, 1fr);
@@ -4067,10 +4125,20 @@ mark {
   }
 }
 
+@media (hover: none) {
+  .replay-select-button {
+    opacity: 0.92;
+    pointer-events: auto;
+    transform: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .region-console.is-online .region-radar-sweep,
   .region-card-spinner,
   .upload-button.is-loading svg,
+  .selection-download-button.is-loading svg,
+  .replay-selection-actions.is-entering,
   .replay-delete-dialog,
   .replay-delete-confirm.is-deleting svg {
     animation: none;

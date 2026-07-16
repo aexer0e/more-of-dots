@@ -4084,6 +4084,66 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
     Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
 }
 
+fn select_replay_download_directory() -> Result<Option<PathBuf>, String> {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose where to save the selected War of Dots replays'
+$dialog.ShowNewFolderButton = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::Write($dialog.SelectedPath)
+}
+"#;
+    let encoded_script = BASE64.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("Could not open the folder picker: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not open the folder picker: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
+}
+
+fn available_replay_download_path(directory: &Path, requested_name: &str) -> PathBuf {
+    let requested = Path::new(requested_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("replay.rep");
+    let mut base = PathBuf::from(requested);
+    if !base
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rep"))
+    {
+        base.set_extension("rep");
+    }
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("replay");
+    let mut candidate = directory.join(&base);
+    let mut suffix = 2;
+    while candidate.exists() {
+        candidate = directory.join(format!("{stem} ({suffix}).rep"));
+        suffix += 1;
+    }
+    candidate
+}
+
 fn safe_replay_file_name(file_name: &str) -> Result<String, String> {
     let name = file_name.trim();
     if name.is_empty()
@@ -4303,6 +4363,58 @@ async fn download_replay(file_path: String, file_name: String) -> Result<bool, S
             )
         })?;
         Ok(true)
+    })
+    .await
+    .map_err(|error| format!("Replay download task failed: {error}"))?
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayDownloadRequest {
+    file_path: String,
+    file_name: String,
+}
+
+#[tauri::command]
+async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if replays.is_empty() {
+            return Ok(0);
+        }
+        let mut sources = Vec::with_capacity(replays.len());
+        for replay in replays {
+            let source_path = PathBuf::from(&replay.file_path);
+            if !source_path.is_file() || !is_replay_file(&source_path) {
+                return Err(format!(
+                    "Replay file is not readable: {}",
+                    source_path.display()
+                ));
+            }
+            sources.push((source_path, replay.file_name));
+        }
+
+        let Some(destination_dir) = select_replay_download_directory()? else {
+            return Ok(0);
+        };
+        if !destination_dir.is_dir() {
+            return Err(format!(
+                "Replay destination is not a folder: {}",
+                destination_dir.display()
+            ));
+        }
+
+        let mut saved = 0;
+        for (source_path, file_name) in sources {
+            let destination_path = available_replay_download_path(&destination_dir, &file_name);
+            fs::copy(&source_path, &destination_path).map_err(|error| {
+                format!(
+                    "Saved {saved} replays, but could not save {}: {error}",
+                    destination_path.display()
+                )
+            })?;
+            saved += 1;
+        }
+        Ok(saved)
     })
     .await
     .map_err(|error| format!("Replay download task failed: {error}"))?
@@ -5026,6 +5138,7 @@ pub fn run() {
             upload_replay,
             delete_replay,
             download_replay,
+            download_replays,
             list_maps,
             read_map,
             save_map,

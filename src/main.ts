@@ -551,12 +551,13 @@ let browserReplays: ReplayBrowserItem[] = [];
 let browserLoading = false;
 let browserUploading = false;
 let browserUploadLabel = "Upload";
-let browserDeleteCandidate: ReplayBrowserItem | null = null;
+let browserSelectedReplayPaths = new Set<string>();
+let browserDeleteCandidates: ReplayBrowserItem[] = [];
 let browserDeleteInFlight = false;
 let browserDeleteError = "";
+let browserBulkDownloadInFlight = false;
 let browserError = "";
 let browserSearch = "";
-let browserHideUnmatched = true;
 let browserNationGamesOnly = false;
 let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
 let browserDurationBounds = { min: 0, max: 0 };
@@ -567,7 +568,6 @@ let browserSuggestionItems: BrowserSuggestion[] = [];
 let browserRenderedCards: BrowserRenderedCard[] = [];
 let pendingBrowserSearchFrame = 0;
 let browserOpeningPaths = new Set<string>();
-let browserDownloadingPaths = new Set<string>();
 let browserGridCapped = loadBrowserGridCapped();
 let browserGridCardSize = loadBrowserGridCardSize();
 let browserReplaySignature = "";
@@ -1665,40 +1665,23 @@ function replayDownloadFileName(replay: ReplayBrowserItem): string {
   return `${playerNames || "replay"}.rep`;
 }
 
-function renderReplayDownloadButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
-  const isDownloading = browserDownloadingPaths.has(replay.filePath);
-  const action = isDownloading ? "Saving replay" : "Download replay";
+function renderReplaySelectButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
+  const isSelected = browserSelectedReplayPaths.has(replay.filePath);
   return `
     <button
-      class="replay-download-button ${isDownloading ? "is-downloading" : ""}"
+      class="replay-select-button ${isSelected ? "is-selected" : ""}"
       type="button"
-      data-replay-download-index="${replayIndex}"
-      ${isDownloading ? "disabled" : ""}
-      aria-label="${escapeHtml(`${action}: ${label}`)}"
-      title="${escapeHtml(action)}"
+      data-replay-select-index="${replayIndex}"
+      aria-pressed="${isSelected}"
+      aria-label="${escapeHtml(`${isSelected ? "Deselect" : "Select"} replay: ${label}`)}"
+      title="${isSelected ? "Deselect replay" : "Select replay"}"
+      ${browserDeleteInFlight || browserBulkDownloadInFlight ? "disabled" : ""}
     >
       <svg aria-hidden="true" viewBox="0 0 24 24">
-        <path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" />
+        <circle cx="12" cy="12" r="8.5" />
+        <path d="m8.5 12 2.3 2.3 4.9-5" />
       </svg>
-    </button>
-  `;
-}
-
-function renderReplayDeleteButton(label: string, replayIndex: number): string {
-  return `
-    <button
-      class="replay-delete-button"
-      type="button"
-      data-replay-delete-index="${replayIndex}"
-      aria-label="${escapeHtml(`Delete replay: ${label}`)}"
-      title="Delete replay"
-    >
-      <svg aria-hidden="true" viewBox="0 0 24 24">
-        <path d="M4 7h16" />
-        <path d="M9 7V4h6v3" />
-        <path d="m7 7 1 13h8l1-13" />
-        <path d="M10 11v5M14 11v5" />
-      </svg>
+      <span>${isSelected ? "Selected" : "Select"}</span>
     </button>
   `;
 }
@@ -1727,7 +1710,7 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
   const label = replay.players.map((player) => player.name).join(" versus ");
   const accessibleLabel = replay.eventLabel ? `${label}, ${replay.eventLabel}` : label;
   return `
-    <article class="replay-card" data-card-index="${replayIndex}" aria-label="${escapeHtml(accessibleLabel)}">
+    <article class="replay-card ${browserSelectedReplayPaths.has(replay.filePath) ? "is-selected" : ""}" data-card-index="${replayIndex}" aria-label="${escapeHtml(accessibleLabel)}">
       <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
       <div class="replay-shade"></div>
       <div class="replay-labels">
@@ -1739,8 +1722,7 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
       </div>
       ${eventLabel}
       ${renderReplayPlayButton(replay, label, replayIndex)}
-      ${renderReplayDownloadButton(replay, label, replayIndex)}
-      ${renderReplayDeleteButton(label, replayIndex)}
+      ${renderReplaySelectButton(replay, label, replayIndex)}
       <time class="replay-age" data-replay-modified="${replay.modified}" datetime="${new Date(replay.modified * 1000).toISOString()}" aria-live="off">${formatReplayAge(replay.modified)}</time>
       <div class="replay-meta">
         <div class="players">
@@ -1769,7 +1751,7 @@ function renderBrowserGrid(): string {
   return `
     <section
       id="replayGrid"
-      class="replay-grid ${browserGridCapped ? "" : "is-unlocked"}"
+      class="replay-grid ${browserGridCapped ? "" : "is-unlocked"} ${browserSelectedReplayPaths.size ? "has-selection" : ""}"
       style="--replay-card-min-width:${browserGridCardSize}px;--replay-card-scale:${browserGridCardScale()}"
       aria-live="polite"
     >
@@ -1780,9 +1762,13 @@ function renderBrowserGrid(): string {
 }
 
 function renderReplayDeleteDialog(): string {
-  const replay = browserDeleteCandidate;
-  if (!replay) return "";
-  const matchup = replay.players.map((player) => player.name).join(" vs ") || replay.fileName || "this replay";
+  if (!browserDeleteCandidates.length) return "";
+  const count = browserDeleteCandidates.length;
+  const firstReplay = browserDeleteCandidates[0];
+  const matchup = firstReplay.players.map((player) => player.name).join(" vs ") || firstReplay.fileName || "this replay";
+  const description = count === 1
+    ? `<strong>${escapeHtml(matchup)}</strong> will be permanently removed from War of Dots and the backup library.`
+    : `<strong>${count} selected replays</strong> will be permanently removed from War of Dots and the backup library.`;
   return `
     <div id="replayDeleteModal" class="replay-delete-backdrop" role="presentation">
       <section class="replay-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="replayDeleteTitle" aria-describedby="replayDeleteDescription">
@@ -1795,9 +1781,9 @@ function renderReplayDeleteDialog(): string {
           </svg>
         </div>
         <div class="replay-delete-copy">
-          <span class="replay-delete-eyebrow">Delete replay</span>
-          <h2 id="replayDeleteTitle">Remove this replay?</h2>
-          <p id="replayDeleteDescription"><strong>${escapeHtml(matchup)}</strong> will be permanently removed from War of Dots and the backup library.</p>
+          <span class="replay-delete-eyebrow">Delete ${count === 1 ? "replay" : `${count} replays`}</span>
+          <h2 id="replayDeleteTitle">Remove ${count === 1 ? "this replay" : "selected replays"}?</h2>
+          <p id="replayDeleteDescription">${description}</p>
           ${browserDeleteError ? `<div class="replay-delete-error" role="alert">${escapeHtml(browserDeleteError)}</div>` : ""}
         </div>
         <div class="replay-delete-actions">
@@ -1806,10 +1792,52 @@ function renderReplayDeleteDialog(): string {
             <svg aria-hidden="true" viewBox="0 0 24 24">
               <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13" />
             </svg>
-            <span>${browserDeleteInFlight ? "Deleting..." : "Delete replay"}</span>
+            <span>${browserDeleteInFlight ? "Deleting..." : `Delete ${count === 1 ? "replay" : `${count} replays`}`}</span>
           </button>
         </div>
       </section>
+    </div>
+  `;
+}
+
+function selectedBrowserReplays(): ReplayBrowserItem[] {
+  return browserReplays.filter((replay) => browserSelectedReplayPaths.has(replay.filePath));
+}
+
+function renderReplayUploadDockContent(animateSelection = false): string {
+  const selectedCount = browserSelectedReplayPaths.size;
+  const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight;
+  if (!selectedCount) {
+    return `
+      <input id="replayUploadInput" type="file" accept=".rep" multiple hidden>
+      <div class="replay-action-group">
+        <button id="uploadReplays" class="refresh-button upload-button ${browserUploading ? "is-loading" : ""}" type="button" aria-label="Upload replays" title="Upload replays to War of Dots" ${browserUploading || browserLoading ? "disabled" : ""}>
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M12 16V4" />
+            <path d="m7.5 8.5 4.5-4.5 4.5 4.5" />
+            <path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
+          </svg>
+          <span aria-live="polite">${escapeHtml(browserUploadLabel)}</span>
+        </button>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="replay-action-group replay-selection-actions ${animateSelection ? "is-entering" : ""}" role="group" aria-label="Actions for ${selectedCount} selected ${selectedCount === 1 ? "replay" : "replays"}">
+      <span class="replay-selection-count" aria-live="polite"><strong>${selectedCount}</strong> selected</span>
+      <button id="unselectAllReplays" class="refresh-button unselect-button" type="button" ${selectionBusy ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        <span>Unselect all</span>
+      </button>
+      <button id="downloadSelectedReplays" class="refresh-button selection-download-button ${browserBulkDownloadInFlight ? "is-loading" : ""}" type="button" ${selectionBusy ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" /></svg>
+        <span>${browserBulkDownloadInFlight ? "Saving..." : "Download"}</span>
+      </button>
+      <button id="deleteSelectedReplays" class="refresh-button selection-delete-button" type="button" ${selectionBusy ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5M14 11v5" /></svg>
+        <span>Delete</span>
+      </button>
     </div>
   `;
 }
@@ -2144,14 +2172,13 @@ function applyBrowserSearch() {
       renderHighlightedText(card.winnerNameElement, card.winnerName, filterState.query);
     }
 
-    card.element.hidden = browserHideUnmatched && !visible;
-    card.element.classList.toggle("is-dimmed", !browserHideUnmatched && !visible);
+    card.element.hidden = !visible;
     card.visible = visible;
     if (visible) visibleCount += 1;
   }
 
   const searchEmpty = document.querySelector<HTMLElement>("#searchEmpty");
-  if (searchEmpty) searchEmpty.hidden = !browserHideUnmatched || visibleCount > 0;
+  if (searchEmpty) searchEmpty.hidden = visibleCount > 0;
 }
 
 function scheduleBrowserSearch() {
@@ -2242,10 +2269,6 @@ function renderReplayBrowser() {
               <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions"></div>
             </div>
           </div>
-          <label class="match-mode-toggle" title="Dim non-matching replays">
-            <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
-            <span aria-hidden="true">&#128123;&#65039;</span>
-          </label>
           <label class="match-mode-toggle nation-mode-toggle" title="World games only">
             <input id="nationGamesToggle" type="checkbox" aria-label="World games only" ${browserNationGamesOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
             <span aria-hidden="true">&#127760;</span>
@@ -2274,18 +2297,8 @@ function renderReplayBrowser() {
         </div>
       </div>
       ${renderBrowserGrid()}
-      <div class="replay-upload-dock">
-        <input id="replayUploadInput" type="file" accept=".rep" multiple hidden>
-        <div class="replay-action-group">
-          <button id="uploadReplays" class="refresh-button upload-button ${browserUploading ? "is-loading" : ""}" type="button" aria-label="Upload replays" title="Upload replays to War of Dots" ${browserUploading || browserLoading ? "disabled" : ""}>
-            <svg aria-hidden="true" viewBox="0 0 24 24">
-              <path d="M12 16V4" />
-              <path d="m7.5 8.5 4.5-4.5 4.5 4.5" />
-              <path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
-            </svg>
-            <span aria-live="polite">${escapeHtml(browserUploadLabel)}</span>
-          </button>
-        </div>
+      <div id="replayUploadDock" class="replay-upload-dock">
+        ${renderReplayUploadDockContent()}
       </div>
       <div class="replay-action-dock">
         <div class="replay-action-group" role="group" aria-label="Replay browser actions">
@@ -2337,6 +2350,65 @@ async function switchBrowserPage(nextPage: BrowserPage) {
   browserPage = nextPage;
   renderReplayBrowser();
   if (browserPage === "region" && !regionStatusPayload && !regionLoading) void loadRegionStatus();
+}
+
+function refreshBrowserSelectionUi() {
+  document.querySelector<HTMLElement>("#replayGrid")?.classList.toggle("has-selection", browserSelectedReplayPaths.size > 0);
+
+  document.querySelectorAll<HTMLElement>("#replayGrid .replay-card").forEach((card) => {
+    const replayIndex = Number(card.dataset.cardIndex);
+    const replay = browserReplays[replayIndex];
+    if (!replay) return;
+    const isSelected = browserSelectedReplayPaths.has(replay.filePath);
+    card.classList.toggle("is-selected", isSelected);
+    const button = card.querySelector<HTMLButtonElement>("[data-replay-select-index]");
+    if (!button) return;
+    const label = replay.players.map((player) => player.name).join(" versus ");
+    button.classList.toggle("is-selected", isSelected);
+    button.disabled = browserDeleteInFlight || browserBulkDownloadInFlight;
+    button.setAttribute("aria-pressed", String(isSelected));
+    button.setAttribute("aria-label", `${isSelected ? "Deselect" : "Select"} replay: ${label}`);
+    button.title = isSelected ? "Deselect replay" : "Select replay";
+    const copy = button.querySelector<HTMLElement>("span");
+    if (copy) copy.textContent = isSelected ? "Selected" : "Select";
+  });
+
+  const dock = document.querySelector<HTMLElement>("#replayUploadDock");
+  if (dock) {
+    const hadSelectionActions = Boolean(dock.querySelector(".replay-selection-actions"));
+    dock.innerHTML = renderReplayUploadDockContent(!hadSelectionActions && browserSelectedReplayPaths.size > 0);
+    bindReplayUploadDockEvents();
+  }
+}
+
+function toggleBrowserReplaySelection(replay: ReplayBrowserItem) {
+  if (browserDeleteInFlight || browserBulkDownloadInFlight) return;
+  if (browserSelectedReplayPaths.has(replay.filePath)) browserSelectedReplayPaths.delete(replay.filePath);
+  else browserSelectedReplayPaths.add(replay.filePath);
+  refreshBrowserSelectionUi();
+}
+
+function clearBrowserReplaySelection() {
+  if (browserDeleteInFlight || browserBulkDownloadInFlight) return;
+  browserSelectedReplayPaths.clear();
+  refreshBrowserSelectionUi();
+}
+
+function bindReplayUploadDockEvents() {
+  const replayUploadInput = document.querySelector<HTMLInputElement>("#replayUploadInput");
+  document.querySelector<HTMLButtonElement>("#uploadReplays")?.addEventListener("click", () => {
+    replayUploadInput?.click();
+  });
+  replayUploadInput?.addEventListener("change", () => {
+    const files = Array.from(replayUploadInput.files ?? []);
+    replayUploadInput.value = "";
+    if (files.length) void uploadBrowserReplays(files);
+  });
+  document.querySelector<HTMLButtonElement>("#unselectAllReplays")?.addEventListener("click", clearBrowserReplaySelection);
+  document.querySelector<HTMLButtonElement>("#downloadSelectedReplays")?.addEventListener("click", () => {
+    void downloadSelectedReplays();
+  });
+  document.querySelector<HTMLButtonElement>("#deleteSelectedReplays")?.addEventListener("click", openReplayDeleteDialog);
 }
 
 function bindBrowserEvents() {
@@ -2404,10 +2476,6 @@ function bindBrowserEvents() {
   });
   document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("click", clearBrowserSearch);
   document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("pointerdown", handleBrowserSuggestionPointerDown);
-  document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("click", (event) => {
-    browserHideUnmatched = !(event.target as HTMLInputElement).checked;
-    scheduleBrowserSearch();
-  });
   document.querySelector<HTMLInputElement>("#nationGamesToggle")?.addEventListener("change", (event) => {
     browserNationGamesOnly = (event.target as HTMLInputElement).checked;
     refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
@@ -2458,15 +2526,7 @@ function bindBrowserEvents() {
   document.querySelector<HTMLButtonElement>("#refreshReplays")?.addEventListener("click", () => {
     void loadBrowserReplays(true);
   });
-  const replayUploadInput = document.querySelector<HTMLInputElement>("#replayUploadInput");
-  document.querySelector<HTMLButtonElement>("#uploadReplays")?.addEventListener("click", () => {
-    replayUploadInput?.click();
-  });
-  replayUploadInput?.addEventListener("change", () => {
-    const files = Array.from(replayUploadInput.files ?? []);
-    replayUploadInput.value = "";
-    if (files.length) void uploadBrowserReplays(files);
-  });
+  bindReplayUploadDockEvents();
   document.querySelector<HTMLButtonElement>("#gridWidthToggle")?.addEventListener("click", () => {
     browserGridCapped = !browserGridCapped;
     saveBrowserGridCapped(browserGridCapped);
@@ -2507,17 +2567,10 @@ function bindBrowserEvents() {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
 
-    const deleteButton = target.closest<HTMLButtonElement>("[data-replay-delete-index]");
-    if (deleteButton) {
-      const replay = browserReplays[Number(deleteButton.dataset.replayDeleteIndex)];
-      if (replay) openReplayDeleteDialog(replay);
-      return;
-    }
-
-    const downloadButton = target.closest<HTMLButtonElement>("[data-replay-download-index]");
-    if (downloadButton) {
-      const replay = browserReplays[Number(downloadButton.dataset.replayDownloadIndex)];
-      if (replay) void downloadReplayFromBrowser(replay);
+    const selectButton = target.closest<HTMLButtonElement>("[data-replay-select-index]");
+    if (selectButton) {
+      const replay = browserReplays[Number(selectButton.dataset.replaySelectIndex)];
+      if (replay) toggleBrowserReplaySelection(replay);
       return;
     }
 
@@ -2696,9 +2749,10 @@ async function openReplayFromBrowser(replay: ReplayBrowserItem) {
   }
 }
 
-function openReplayDeleteDialog(replay: ReplayBrowserItem) {
+function openReplayDeleteDialog() {
   if (browserDeleteInFlight) return;
-  browserDeleteCandidate = replay;
+  browserDeleteCandidates = selectedBrowserReplays();
+  if (!browserDeleteCandidates.length) return;
   browserDeleteError = "";
   renderReplayBrowser();
   window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#cancelReplayDelete")?.focus());
@@ -2706,52 +2760,69 @@ function openReplayDeleteDialog(replay: ReplayBrowserItem) {
 
 function closeReplayDeleteDialog() {
   if (browserDeleteInFlight) return;
-  const replay = browserDeleteCandidate;
-  browserDeleteCandidate = null;
+  browserDeleteCandidates = [];
   browserDeleteError = "";
   renderReplayBrowser();
-  if (replay) {
-    const replayIndex = browserReplays.indexOf(replay);
-    window.requestAnimationFrame(() => {
-      document.querySelector<HTMLButtonElement>(`[data-replay-delete-index="${replayIndex}"]`)?.focus();
-    });
-  }
+  window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#deleteSelectedReplays")?.focus());
 }
 
 async function deleteReplayFromBrowser() {
-  const replay = browserDeleteCandidate;
-  if (!replay || browserDeleteInFlight) return;
+  const candidates = [...browserDeleteCandidates];
+  if (!candidates.length || browserDeleteInFlight) return;
   browserDeleteInFlight = true;
   browserDeleteError = "";
   renderReplayBrowser();
-  try {
-    await invoke<number>("delete_replay", { filePath: replay.filePath });
-    browserDeleteCandidate = null;
-    browserDeleteInFlight = false;
-    await loadBrowserReplays(true);
-  } catch (error) {
-    browserDeleteInFlight = false;
-    browserDeleteError = error instanceof Error ? error.message : String(error || "Could not delete the replay.");
-    renderReplayBrowser();
+  const failures: Array<{ replay: ReplayBrowserItem; message: string }> = [];
+  for (const [index, replay] of candidates.entries()) {
+    const progress = document.querySelector<HTMLElement>("#confirmReplayDelete span");
+    if (progress && candidates.length > 1) progress.textContent = `Deleting ${index + 1}/${candidates.length}`;
+    try {
+      await invoke<number>("delete_replay", { filePath: replay.filePath });
+      browserSelectedReplayPaths.delete(replay.filePath);
+    } catch (error) {
+      failures.push({
+        replay,
+        message: error instanceof Error ? error.message : String(error || "Could not delete the replay."),
+      });
+    }
+  }
+  browserDeleteInFlight = false;
+  browserDeleteCandidates = failures.map(({ replay }) => replay);
+  browserDeleteError = failures.length
+    ? `${failures.length} ${failures.length === 1 ? "replay could" : "replays could"} not be deleted. ${failures[0].message}`
+    : "";
+  await loadBrowserReplays(true);
+  if (failures.length) {
     window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#cancelReplayDelete")?.focus());
   }
 }
 
-async function downloadReplayFromBrowser(replay: ReplayBrowserItem) {
-  if (browserDownloadingPaths.has(replay.filePath)) return;
-  browserDownloadingPaths.add(replay.filePath);
-  updateReplayDownloadButton(replay, true);
+async function downloadSelectedReplays() {
+  const replays = selectedBrowserReplays();
+  if (!replays.length || browserBulkDownloadInFlight || browserDeleteInFlight) return;
+  browserBulkDownloadInFlight = true;
+  refreshBrowserSelectionUi();
   try {
-    await invoke<boolean>("download_replay", {
-      filePath: replay.filePath,
-      fileName: replayDownloadFileName(replay),
-    });
+    if (replays.length === 1) {
+      const replay = replays[0];
+      await invoke<boolean>("download_replay", {
+        filePath: replay.filePath,
+        fileName: replayDownloadFileName(replay),
+      });
+    } else {
+      await invoke<number>("download_replays", {
+        replays: replays.map((replay) => ({
+          filePath: replay.filePath,
+          fileName: replayDownloadFileName(replay),
+        })),
+      });
+    }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error || "Could not save the replay.");
-    window.alert(`Could not save the replay.\n\n${message}`);
+    const message = error instanceof Error ? error.message : String(error || "Could not save the selected replays.");
+    window.alert(`Could not save the selected ${replays.length === 1 ? "replay" : "replays"}.\n\n${message}`);
   } finally {
-    browserDownloadingPaths.delete(replay.filePath);
-    updateReplayDownloadButton(replay, false);
+    browserBulkDownloadInFlight = false;
+    refreshBrowserSelectionUi();
   }
 }
 
@@ -2786,20 +2857,6 @@ async function uploadBrowserReplays(files: File[]) {
   }
 }
 
-function updateReplayDownloadButton(replay: ReplayBrowserItem, isDownloading: boolean) {
-  const replayIndex = browserReplays.indexOf(replay);
-  if (replayIndex < 0) return;
-  const button = document.querySelector<HTMLButtonElement>(`[data-replay-download-index="${replayIndex}"]`);
-  if (!button) return;
-
-  const label = replay.players.map((player) => player.name).join(" versus ");
-  const action = isDownloading ? "Saving replay" : "Download replay";
-  button.classList.toggle("is-downloading", isDownloading);
-  button.disabled = isDownloading;
-  button.setAttribute("aria-label", `${action}: ${label}`);
-  button.title = action;
-}
-
 function replayListSignature(replays: ReplayBrowserItem[]): string {
   return replays
     .map((replay) =>
@@ -2832,6 +2889,10 @@ async function loadBrowserReplays(
     const nextSignature = replayListSignature(replays);
     const changed = nextSignature !== browserReplaySignature;
     browserReplays = replays;
+    const availablePaths = new Set(replays.map((replay) => replay.filePath));
+    const selectedCountBeforePrune = browserSelectedReplayPaths.size;
+    browserSelectedReplayPaths = new Set([...browserSelectedReplayPaths].filter((path) => availablePaths.has(path)));
+    if (browserSelectedReplayPaths.size !== selectedCountBeforePrune) shouldRender = true;
     browserReplaySignature = nextSignature;
     setupBrowserDuration(replays, preserveControls);
     shouldRender = shouldRender || changed;

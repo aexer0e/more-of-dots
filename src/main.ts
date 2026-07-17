@@ -271,6 +271,7 @@ type ReplayBrowserItem = {
   fileName: string;
   filePath: string;
   players: ReplayBrowserPlayer[];
+  draw: boolean;
   length: string;
   durationSeconds: number;
   thumbnailDataUrl?: string | null;
@@ -289,6 +290,7 @@ type BrowserSuggestion = {
   replayCount: number;
   winCount: number;
   lossCount: number;
+  drawCount: number;
   opponents: string[];
 };
 type BrowserFilterState = {
@@ -307,6 +309,7 @@ type BrowserRenderedCard = {
   names: string[];
   normalizedNames: string[];
   winnerIndex: number;
+  isDraw: boolean;
   winnerName: string;
   nameElements: HTMLElement[];
   winnerNameElement: HTMLElement | null;
@@ -1451,6 +1454,7 @@ function buildBrowserSuggestionItems(filterState: BrowserFilterState): BrowserSu
           replayCount: 0,
           winCount: 0,
           lossCount: 0,
+          drawCount: 0,
           opponents: [],
           latestModified: 0,
           rank,
@@ -1461,6 +1465,7 @@ function buildBrowserSuggestionItems(filterState: BrowserFilterState): BrowserSu
       existing.replayCount += 1;
       existing.winCount += card.winnerIndex === index ? 1 : 0;
       existing.lossCount += card.winnerIndex >= 0 && card.winnerIndex !== index ? 1 : 0;
+      existing.drawCount += card.isDraw ? 1 : 0;
       existing.latestModified = Math.max(existing.latestModified, card.modified);
       card.names.forEach((opponentName, opponentIndex) => {
         if (opponentIndex === index) return;
@@ -1562,7 +1567,7 @@ function renderBrowserSuggestions(query: string) {
     detail.className = "suggestion-detail";
 
     renderHighlightedText(name, item.name, query);
-    meta.textContent = `${pluralize(item.replayCount, "replay")} - ${pluralize(item.winCount, "win")} - ${pluralize(item.lossCount, "loss")}`;
+    meta.textContent = `${pluralize(item.replayCount, "replay")} - ${pluralize(item.winCount, "win")} - ${pluralize(item.lossCount, "loss")} - ${pluralize(item.drawCount, "draw")}`;
     detail.textContent = suggestionDetailText(item);
 
     primary.append(name, meta);
@@ -1704,7 +1709,9 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
       return `${separator}<span class="player-name ${playerColorClass(player, index)}" data-player-index="${index}">${escapeHtml(player.name)}</span>`;
     })
     .join("");
-  const winnerLine = winner
+  const winnerLine = replay.draw
+    ? `<div class="winner-line">draw</div>`
+    : winner
     ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, winnerIndex)}" data-winner-name>${escapeHtml(winner.name)}</span></div>`
     : "";
   const label = replay.players.map((player) => player.name).join(" versus ");
@@ -2142,6 +2149,7 @@ function hydrateBrowserCards() {
       names: replay.players.map((player) => player.name),
       normalizedNames: replay.players.map((player) => normalizeSearchText(player.name)),
       winnerIndex,
+      isDraw: replay.draw,
       winnerName: winnerIndex >= 0 ? replay.players[winnerIndex]?.name ?? "" : "",
       nameElements: Array.from(element.querySelectorAll<HTMLElement>("[data-player-index]")),
       winnerNameElement: element.querySelector<HTMLElement>("[data-winner-name]"),
@@ -2865,6 +2873,7 @@ function replayListSignature(replays: ReplayBrowserItem[]): string {
         replay.modified,
         replay.durationSeconds,
         replay.scoreDelta ?? "",
+        replay.draw ? "draw" : "",
         replay.players.map((player) => `${player.name}:${player.winner ? "1" : "0"}`).join(","),
       ].join("|"),
     )

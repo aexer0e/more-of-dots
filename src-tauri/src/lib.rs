@@ -157,6 +157,8 @@ struct ReplaySummary {
     file_name: String,
     file_path: String,
     players: Vec<PlayerSummary>,
+    #[serde(default)]
+    draw: bool,
     length: String,
     duration_seconds: u64,
     thumbnail_data_url: Option<String>,
@@ -3379,11 +3381,14 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
     let duration_seconds = duration_seconds(end_frame);
     let event_winner_index = replay_event_winner_index(&raw, players.len());
 
+    let result = raw.get("result").cloned();
+
     Ok(ParsedReplay {
         summary: ReplaySummary {
             file_name,
             file_path: path.to_string_lossy().to_string(),
             players,
+            draw: result.as_ref().is_some_and(replay_result_is_draw),
             length: format_duration_seconds(duration_seconds),
             duration_seconds,
             thumbnail_data_url: None,
@@ -3391,7 +3396,7 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
             score_delta: None,
             event_label: replay_event_label(&raw),
         },
-        result: raw.get("result").cloned(),
+        result,
         event_winner_index,
         map_id: replay_map_id(&raw),
         custom_map_surface: custom_map_surface(&raw),
@@ -3523,6 +3528,10 @@ fn mark_winner(players: &mut [PlayerSummary], winner_index: Option<usize>) {
     }
 }
 
+fn replay_result_is_draw(result: &Value) -> bool {
+    result.as_f64() == Some(0.5)
+}
+
 fn replay_winner_index(
     result: Option<&Value>,
     players: &[PlayerSummary],
@@ -3530,6 +3539,9 @@ fn replay_winner_index(
     home_player: Option<&str>,
 ) -> Option<usize> {
     if let Some(result) = result {
+        if replay_result_is_draw(result) {
+            return None;
+        }
         if let Some(index) = result_player_name_index(result, players) {
             return Some(index);
         }
@@ -4022,6 +4034,7 @@ fn list_replays_impl(
     let replays = parsed_replays
         .into_iter()
         .map(|mut parsed| {
+            parsed.summary.draw = parsed.result.as_ref().is_some_and(replay_result_is_draw);
             let winner_index = replay_winner_index(
                 parsed.result.as_ref(),
                 &parsed.summary.players,
@@ -5170,6 +5183,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn draw_result_suppresses_all_winner_detection() {
+        let players = vec![
+            PlayerSummary {
+                name: "Player 1".to_string(),
+                team_index: 0,
+                winner: false,
+            },
+            PlayerSummary {
+                name: "Player 2".to_string(),
+                team_index: 1,
+                winner: false,
+            },
+        ];
+        let result = json!(0.5);
+
+        assert!(replay_result_is_draw(&result));
+        assert_eq!(
+            replay_winner_index(Some(&result), &players, Some(1), None),
+            None
+        );
+    }
+
+    #[test]
     fn flatten_name_reads_new_player_objects() {
         let value = json!([
             [
@@ -5370,6 +5406,7 @@ mod tests {
                 file_name: "match.rep".to_string(),
                 file_path: path.to_string_lossy().to_string(),
                 players: Vec::new(),
+                draw: false,
                 length: "0:00".to_string(),
                 duration_seconds: 0,
                 thumbnail_data_url: None,

@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>More of Dots</title>
+  <meta name="description" content="A free Windows app for War of Dots. Browse and back up replays, switch game regions, and create custom maps.">
+  <link rel="icon" type="image/png" href="icon.png">
+  <meta property="og:title" content="More of Dots">
+  <meta property="og:description" content="A free Windows app for War of Dots. Browse and back up replays, switch game regions, and create custom maps.">
+  <meta property="og:image" content="screenshots/replays.png">
+  <style>
+    :root {
+      --bg: #f7f3e8;
+      --text: #2b2620;
+      --muted: #57503f;
+      --faint: #7a7260;
+      --line: #2b2620;
+      --green: #5c8a3c;
+      --green-dark: #47702e;
+      --red: #e0392b;
+      --blue: #2f88d8;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background-color: var(--bg);
+      background-image: radial-gradient(rgba(43, 38, 32, 0.07) 1px, transparent 1.5px);
+      background-size: 26px 26px;
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ---- hero ---- */
+
+    .hero {
+      text-align: center;
+      padding-top: 72px;
+    }
+
+    .hero img.logo {
+      width: 112px;
+      height: 112px;
+      display: block;
+      margin: 0 auto 20px;
+    }
+
+    h1 {
+      font-size: 2.6rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      line-height: 1.15;
+    }
+
+    .squiggle {
+      display: block;
+      margin: 2px auto 0;
+    }
+
+    .tagline {
+      margin-top: 12px;
+      font-size: 1.125rem;
+      color: var(--muted);
+      max-width: 34em;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .buttons {
+      margin-top: 28px;
+      display: flex;
+      gap: 14px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 12px 22px;
+      font-size: 1rem;
+      font-weight: 600;
+      text-decoration: none;
+      border: 3px solid var(--line);
+      border-radius: 10px;
+      color: var(--text);
+      background: #fff;
+      box-shadow: 3px 3px 0 var(--line);
+      transition: transform 80ms ease, box-shadow 80ms ease;
+    }
+
+    .btn:hover {
+      transform: translate(-1px, -1px);
+      box-shadow: 4px 4px 0 var(--line);
+    }
+
+    .btn:active {
+      transform: translate(2px, 2px);
+      box-shadow: 1px 1px 0 var(--line);
+    }
+
+    .btn.primary {
+      background: var(--green);
+      color: #fff;
+    }
+
+    .btn.primary:hover { background: var(--green-dark); }
+
+    .fine-print {
+      margin-top: 14px;
+      font-size: 0.85rem;
+      color: var(--faint);
+    }
+
+    /* ---- screenshots ---- */
+
+    .shot {
+      border: 3px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 6px 6px 0 var(--line);
+      overflow: hidden;
+      background: #0e1013;
+      font-size: 0;
+    }
+
+    .shot img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    figure.tilt-l .shot { transform: rotate(-0.6deg); }
+    figure.tilt-r .shot { transform: rotate(0.6deg); }
+
+    figure {
+      margin: 0;
+    }
+
+    .shot-hero {
+      margin-top: 52px;
+      padding-bottom: 8px;
+    }
+
+    figcaption {
+      margin-top: 18px;
+      font-size: 0.9rem;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    figcaption .cap-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 2px solid var(--line);
+      margin-right: 7px;
+      vertical-align: -1px;
+    }
+
+    .cap-dot.red  { background: var(--red); }
+    .cap-dot.blue { background: var(--blue); }
+
+    .shot-pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+      margin-top: 48px;
+    }
+
+    @media (max-width: 640px) {
+      .shot-pair { grid-template-columns: 1fr; gap: 40px; }
+    }
+
+    /* ---- terrain divider ---- */
+
+    .terrain {
+      display: block;
+      width: 100%;
+      height: 110px;
+      margin-top: 10px;
+    }
+
+    /* ---- features ---- */
+
+    section.features-section {
+      padding-top: 64px;
+    }
+
+    h2 {
+      font-size: 1.45rem;
+      margin-bottom: 26px;
+      text-align: center;
+    }
+
+    .features {
+      list-style: none;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 26px 40px;
+    }
+
+    @media (max-width: 640px) {
+      .features { grid-template-columns: 1fr; }
+    }
+
+    .features li {
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+
+    .features .dot {
+      width: 17px;
+      height: 17px;
+      margin-top: 5px;
+      border-radius: 50%;
+      border: 2.5px solid var(--line);
+    }
+
+    .features li:nth-child(4n+1) .dot { background: var(--blue); }
+    .features li:nth-child(4n+2) .dot { background: var(--red); }
+    .features li:nth-child(4n+3) .dot { background: var(--red); }
+    .features li:nth-child(4n+4) .dot { background: var(--blue); }
+
+    .features strong {
+      display: block;
+      font-size: 1.05rem;
+    }
+
+    .features p {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    /* ---- dots divider ---- */
+
+    .dots {
+      display: flex;
+      justify-content: center;
+      gap: 14px;
+      margin: 64px 0 0;
+    }
+
+    .dots span {
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      border: 2.5px solid var(--line);
+    }
+
+    .dots span:nth-child(odd)  { background: var(--red); }
+    .dots span:nth-child(even) { background: var(--blue); }
+
+    /* ---- footer ---- */
+
+    footer {
+      border-top: 3px solid var(--line);
+      margin-top: 28px;
+      padding: 24px 0 48px;
+      font-size: 0.9rem;
+      color: var(--faint);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    footer a { color: var(--text); }
+
+    @media (max-width: 480px) {
+      .hero { padding-top: 48px; }
+      h1 { font-size: 2.1rem; }
+      .shot { box-shadow: 4px 4px 0 var(--line); }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container hero">
+    <img class="logo" src="icon.png" alt="More of Dots icon" width="112" height="112">
+    <h1>More of Dots</h1>
+    <svg class="squiggle" width="190" height="12" viewBox="0 0 190 12" aria-hidden="true">
+      <path d="M3 8 C 20 2, 36 10, 52 6 S 84 2, 100 7 S 132 10, 148 5 S 178 3, 187 7"
+            fill="none" stroke="#5c8a3c" stroke-width="4" stroke-linecap="round"/>
+    </svg>
+    <p class="tagline">A free Windows app for War of Dots. Browse and back up replays, switch game regions, and create custom maps.</p>
+    <div class="buttons">
+      <a class="btn primary" id="download-btn" href="https://github.com/aexer0e/more-of-dots/releases/download/v1.0.1/More.of.Dots_1.0.1_x64-setup.exe">Download for Windows</a>
+      <a class="btn" href="https://github.com/aexer0e/more-of-dots">Source on GitHub</a>
+    </div>
+    <p class="fine-print" id="fine-print">Free · Open source · Windows installer</p>
+
+    <figure class="shot-hero tilt-l">
+      <div class="shot">
+        <img src="screenshots/replays.png" alt="The replay browser showing a grid of War of Dots replays with map thumbnails, player names and winners" width="1532" height="975">
+      </div>
+      <figcaption><span class="cap-dot blue"></span>Replay browser</figcaption>
+    </figure>
+  </div>
+
+  <svg class="terrain" viewBox="0 0 1600 120" preserveAspectRatio="xMidYMax slice" aria-hidden="true">
+    <path fill="#47702e" d="M0,78 C160,42 340,92 540,64 C740,36 920,86 1120,60 C1300,38 1460,74 1600,58 L1600,120 L0,120 Z"/>
+    <circle cx="560" cy="52" r="9" fill="#e0392b" stroke="#2b2620" stroke-width="3"/>
+    <circle cx="610" cy="46" r="9" fill="#2f88d8" stroke="#2b2620" stroke-width="3"/>
+    <circle cx="660" cy="44" r="9" fill="#e0392b" stroke="#2b2620" stroke-width="3"/>
+    <circle cx="940" cy="60" r="9" fill="#2f88d8" stroke="#2b2620" stroke-width="3"/>
+    <circle cx="990" cy="57" r="9" fill="#e0392b" stroke="#2b2620" stroke-width="3"/>
+    <path fill="#5c8a3c" d="M0,100 C220,68 400,112 640,90 C880,68 1060,110 1280,86 C1420,72 1530,98 1600,90 L1600,120 L0,120 Z"/>
+  </svg>
+
+  <div class="container">
+    <section class="features-section">
+      <h2>Features</h2>
+      <ul class="features">
+        <li>
+          <span class="dot" aria-hidden="true"></span>
+          <div>
+            <strong>Replay browser</strong>
+            <p>Search replays by player and download them directly into the game.</p>
+          </div>
+        </li>
+        <li>
+          <span class="dot" aria-hidden="true"></span>
+          <div>
+            <strong>Automatic backups</strong>
+            <p>Discovered replays are backed up automatically.</p>
+          </div>
+        </li>
+        <li>
+          <span class="dot" aria-hidden="true"></span>
+          <div>
+            <strong>Region switching</strong>
+            <p>Change your game region from within the app. No VPN required.</p>
+          </div>
+        </li>
+        <li>
+          <span class="dot" aria-hidden="true"></span>
+          <div>
+            <strong>Map editor</strong>
+            <p>Create and edit custom maps and save them to the game.</p>
+          </div>
+        </li>
+      </ul>
+    </section>
+
+    <div class="shot-pair">
+      <figure class="tilt-r">
+        <div class="shot">
+          <img src="screenshots/map-editor.png" alt="The map editor with terrain painting tools and red and blue units placed on a custom map" width="1532" height="975" loading="lazy">
+        </div>
+        <figcaption><span class="cap-dot red"></span>Map editor</figcaption>
+      </figure>
+      <figure class="tilt-l">
+        <div class="shot">
+          <img src="screenshots/region.png" alt="The region picker with North America, Europe and Asia cards, Europe currently selected" width="1532" height="975" loading="lazy">
+        </div>
+        <figcaption><span class="cap-dot blue"></span>Region switching</figcaption>
+      </figure>
+    </div>
+
+    <div class="dots" aria-hidden="true">
+      <span></span><span></span><span></span><span></span><span></span><span></span>
+    </div>
+
+    <footer>
+      <span>Made by <a href="https://github.com/aexer0e">Eeb</a></span>
+      <span>Not affiliated with War of Dots</span>
+    </footer>
+  </div>
+
+  <script>
+    // Point the download button at the newest installer; the hardcoded
+    // v1.0.1 link stays as the fallback if this fails or JS is off.
+    fetch("https://api.github.com/repos/aexer0e/more-of-dots/releases/latest")
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((release) => {
+        const exe = (release.assets || []).find((a) => a.name.endsWith(".exe"));
+        if (!exe) return;
+        document.getElementById("download-btn").href = exe.browser_download_url;
+        if (release.tag_name) {
+          document.getElementById("fine-print").textContent =
+            "Free · Open source · Windows installer · " + release.tag_name;
+        }
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>

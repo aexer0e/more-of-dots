@@ -38,7 +38,6 @@ const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
 const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
-const REPLAY_EVENT_DETECTION_VERSION: u8 = 1;
 const RED_BLUE_EVENT_LABEL: &str = "World";
 const USER_DATA_CHECKPOINT_FILE_NAME: &str = "user-data-checkpoints.json";
 const LEADERBOARD_SYNC_FILE_NAME: &str = "leaderboard-sync.json";
@@ -172,11 +171,8 @@ struct ReplaySummary {
 struct ParsedReplay {
     summary: ReplaySummary,
     result: Option<Value>,
-    event_winner_index: Option<usize>,
     map_id: Option<String>,
     custom_map_surface: Option<String>,
-    #[serde(default)]
-    event_detection_version: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -659,9 +655,6 @@ fn parsed_replay_from_index(
     }
 
     let mut parsed = entry.parsed.clone()?;
-    if parsed.event_detection_version != REPLAY_EVENT_DETECTION_VERSION {
-        return None;
-    }
     parsed.summary.file_name = candidate.file_name.clone();
     parsed.summary.modified = candidate.modified;
     parsed.summary.thumbnail_data_url = None;
@@ -3379,8 +3372,6 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
 
     let end_frame = replay_end_frame(&raw);
     let duration_seconds = duration_seconds(end_frame);
-    let event_winner_index = replay_event_winner_index(&raw, players.len());
-
     let result = raw.get("result").cloned();
 
     Ok(ParsedReplay {
@@ -3397,10 +3388,8 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
             event_label: replay_event_label(&raw),
         },
         result,
-        event_winner_index,
         map_id: replay_map_id(&raw),
         custom_map_surface: custom_map_surface(&raw),
-        event_detection_version: REPLAY_EVENT_DETECTION_VERSION,
     })
 }
 
@@ -3535,7 +3524,6 @@ fn replay_result_is_draw(result: &Value) -> bool {
 fn replay_winner_index(
     result: Option<&Value>,
     players: &[PlayerSummary],
-    event_winner_index: Option<usize>,
     home_player: Option<&str>,
 ) -> Option<usize> {
     if let Some(result) = result {
@@ -3548,10 +3536,6 @@ fn replay_winner_index(
         if let Some(index) = result_special_winner_index(result, players, home_player) {
             return Some(index);
         }
-    }
-
-    if let Some(index) = event_winner_index {
-        return Some(index);
     }
 
     None
@@ -3575,40 +3559,21 @@ fn result_special_winner_index(
         return result_flag_winner_index(flag, players, home_player);
     }
 
-    if let Some(index) = result.as_i64() {
-        if index == -1 && players.len() == 2 {
-            return Some(1);
-        }
-
-        return match index {
-            0 | 1 => result_index_or_home_flag_winner_index(index, players, home_player),
+    if result.is_number() {
+        return match result.as_f64() {
+            Some(1.0) => (!players.is_empty()).then_some(0),
+            Some(0.0) => (players.len() >= 2).then_some(1),
             _ => None,
         };
     }
 
     let text = result.as_str()?;
     let index = text.parse::<i64>().ok()?;
-    if index == -1 && players.len() == 2 {
-        return Some(1);
-    }
-
     match index {
-        0 | 1 => result_index_or_home_flag_winner_index(index, players, home_player),
+        1 => (!players.is_empty()).then_some(0),
+        0 => (players.len() >= 2).then_some(1),
         _ => None,
     }
-}
-
-fn result_index_or_home_flag_winner_index(
-    index: i64,
-    players: &[PlayerSummary],
-    home_player: Option<&str>,
-) -> Option<usize> {
-    if home_player_index(players, home_player).is_some() {
-        return result_flag_winner_index(index != 0, players, home_player);
-    }
-
-    let index = usize::try_from(index).ok()?;
-    (index < players.len()).then_some(index)
 }
 
 fn result_flag_winner_index(
@@ -3639,113 +3604,6 @@ fn home_player_index(players: &[PlayerSummary], home_player: Option<&str>) -> Op
             .iter()
             .position(|player| player.name.eq_ignore_ascii_case(home_player))
     })
-}
-
-fn replay_event_winner_index(raw: &Value, player_count: usize) -> Option<usize> {
-    if player_count != 2 {
-        return None;
-    }
-
-    production_zone_winner_index(raw, player_count)
-}
-
-fn production_zone_winner_index(raw: &Value, player_count: usize) -> Option<usize> {
-    let end_frame = replay_end_frame(raw);
-    let mut candidates = vec![None; player_count];
-
-    let Some(object) = raw.as_object() else {
-        return None;
-    };
-
-    for (frame_key, frame_value) in object {
-        let Ok(frame) = frame_key.parse::<f64>() else {
-            continue;
-        };
-        let Some(frame_events) = frame_value.as_object() else {
-            continue;
-        };
-
-        for (event_key, event_value) in frame_events {
-            let Some(index) = production_player_index(event_key, player_count) else {
-                continue;
-            };
-            let Some(zones) = event_value
-                .get("zone")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .filter(|zones| *zones > 0)
-            else {
-                continue;
-            };
-
-            let candidate = ProductionZoneCandidate {
-                index,
-                frame,
-                zones,
-            };
-
-            if end_frame <= 0.0 || end_frame - frame <= FPS * 90.0 {
-                push_better_zone_candidate(&mut candidates[index], candidate);
-            }
-        }
-    }
-
-    production_zone_candidate_winner(&candidates)
-}
-
-#[derive(Clone, Copy)]
-struct ProductionZoneCandidate {
-    index: usize,
-    frame: f64,
-    zones: usize,
-}
-
-fn production_player_index(key: &str, player_count: usize) -> Option<usize> {
-    let index = key.strip_prefix("production")?.parse::<usize>().ok()?;
-    (index < player_count).then_some(index)
-}
-
-fn push_better_zone_candidate(
-    best: &mut Option<ProductionZoneCandidate>,
-    candidate: ProductionZoneCandidate,
-) {
-    let is_better = match best {
-        Some(current) => {
-            candidate.zones > current.zones
-                || (candidate.zones == current.zones && candidate.frame > current.frame)
-        }
-        None => true,
-    };
-
-    if is_better {
-        *best = Some(candidate);
-    }
-}
-
-fn production_zone_candidate_winner(
-    candidates: &[Option<ProductionZoneCandidate>],
-) -> Option<usize> {
-    let mut best: Option<ProductionZoneCandidate> = None;
-    let mut tied = false;
-
-    for candidate in candidates.iter().flatten().copied() {
-        match best {
-            Some(current) if candidate.zones > current.zones => {
-                best = Some(candidate);
-                tied = false;
-            }
-            Some(current) if candidate.zones == current.zones => {
-                tied = true;
-            }
-            None => {
-                best = Some(candidate);
-                tied = false;
-            }
-            _ => {}
-        }
-    }
-
-    (!tied).then_some(best?.index)
 }
 
 fn replay_end_frame(raw: &Value) -> f64 {
@@ -4038,7 +3896,6 @@ fn list_replays_impl(
             let winner_index = replay_winner_index(
                 parsed.result.as_ref(),
                 &parsed.summary.players,
-                parsed.event_winner_index,
                 home_player.as_deref(),
             );
             mark_winner(&mut parsed.summary.players, winner_index);
@@ -5200,7 +5057,7 @@ mod tests {
 
         assert!(replay_result_is_draw(&result));
         assert_eq!(
-            replay_winner_index(Some(&result), &players, Some(1), None),
+            replay_winner_index(Some(&result), &players, None),
             None
         );
     }
@@ -5415,10 +5272,8 @@ mod tests {
                 event_label: None,
             },
             result: None,
-            event_winner_index: None,
             map_id: None,
             custom_map_surface: None,
-            event_detection_version: REPLAY_EVENT_DETECTION_VERSION,
         };
         let entry = ReplayIndexEntry {
             path_key: path_key(&path),

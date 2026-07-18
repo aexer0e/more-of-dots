@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -3283,31 +3283,85 @@ fn path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn detect_home_player(replays: &[ParsedReplay]) -> Option<String> {
-    let mut counts: HashMap<String, (usize, String)> = HashMap::new();
+#[derive(Clone, Debug)]
+struct HomePlayerCandidate {
+    normalized_name: String,
+    replay_count: usize,
+    first_seen: usize,
+}
+
+fn home_player_candidates(replays: &[ParsedReplay]) -> Vec<HomePlayerCandidate> {
+    let mut counts: HashMap<String, HomePlayerCandidate> = HashMap::new();
+    let mut next_first_seen = 0;
 
     for replay in replays {
+        let mut seen_in_replay = HashSet::new();
         for player in &replay.summary.players {
             if is_fallback_player_name(&player.name) {
                 continue;
             }
 
             let key = player.name.to_ascii_lowercase();
-            let entry = counts.entry(key).or_insert((0, player.name.clone()));
-            entry.0 += 1;
+            if !seen_in_replay.insert(key.clone()) {
+                continue;
+            }
+
+            let entry = counts.entry(key.clone()).or_insert_with(|| {
+                let first_seen = next_first_seen;
+                next_first_seen += 1;
+                HomePlayerCandidate {
+                    normalized_name: key,
+                    replay_count: 0,
+                    first_seen,
+                }
+            });
+            entry.replay_count += 1;
         }
     }
 
-    let mut counts = counts.into_iter().collect::<Vec<_>>();
-    counts.sort_by(
-        |(_, (left_count, left_name)), (_, (right_count, right_name))| {
-            right_count
-                .cmp(left_count)
-                .then_with(|| left_name.cmp(right_name))
-        },
-    );
+    let mut candidates = counts.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .replay_count
+            .cmp(&left.replay_count)
+            .then_with(|| left.first_seen.cmp(&right.first_seen))
+    });
+    candidates.truncate(3);
+    candidates
+}
 
-    counts.into_iter().next().map(|(key, _)| key)
+fn replay_home_player(
+    players: &[PlayerSummary],
+    candidates: &[HomePlayerCandidate],
+) -> Option<String> {
+    if players.len() != 2 {
+        return None;
+    }
+
+    let eligible = players
+        .iter()
+        .filter_map(|player| {
+            candidates
+                .iter()
+                .find(|candidate| {
+                    candidate
+                        .normalized_name
+                        .eq_ignore_ascii_case(&player.name)
+                })
+                .map(|candidate| (player, candidate.replay_count))
+        })
+        .collect::<Vec<_>>();
+
+    match eligible.as_slice() {
+        [(player, _)] => Some(player.name.clone()),
+        [(left, left_count), (right, right_count)] if left_count > right_count => {
+            Some(left.name.clone())
+        }
+        [(left, left_count), (right, right_count)] if right_count > left_count => {
+            Some(right.name.clone())
+        }
+        _ => None,
+    }
 }
 
 fn is_fallback_player_name(name: &str) -> bool {
@@ -3561,8 +3615,8 @@ fn result_special_winner_index(
 
     if result.is_number() {
         return match result.as_f64() {
-            Some(1.0) => (!players.is_empty()).then_some(0),
-            Some(0.0) => (players.len() >= 2).then_some(1),
+            Some(1.0) => result_flag_winner_index(true, players, home_player),
+            Some(0.0) => result_flag_winner_index(false, players, home_player),
             _ => None,
         };
     }
@@ -3570,8 +3624,8 @@ fn result_special_winner_index(
     let text = result.as_str()?;
     let index = text.parse::<i64>().ok()?;
     match index {
-        1 => (!players.is_empty()).then_some(0),
-        0 => (players.len() >= 2).then_some(1),
+        1 => result_flag_winner_index(true, players, home_player),
+        0 => result_flag_winner_index(false, players, home_player),
         _ => None,
     }
 }
@@ -3585,7 +3639,7 @@ fn result_flag_winner_index(
         return None;
     }
 
-    let perspective_index = home_player_index(players, home_player).unwrap_or(0);
+    let perspective_index = home_player_index(players, home_player)?;
 
     if home_won {
         return Some(perspective_index);
@@ -3888,10 +3942,14 @@ fn list_replays_impl(
         write_replay_index(&index_path, &index)?;
     }
 
-    let home_player = detect_home_player(&parsed_replays);
+    let home_candidates = home_player_candidates(&parsed_replays);
     let replays = parsed_replays
         .into_iter()
         .map(|mut parsed| {
+            let home_player = replay_home_player(
+                &parsed.summary.players,
+                &home_candidates,
+            );
             parsed.summary.draw = parsed.result.as_ref().is_some_and(replay_result_is_draw);
             let winner_index = replay_winner_index(
                 parsed.result.as_ref(),

@@ -3470,17 +3470,35 @@ p {
 }
 
 .replay-age {
+  align-items: baseline;
   bottom: calc(10px * var(--card-scale));
   color: rgba(241, 245, 239, 0.78);
+  column-gap: clamp(3px, calc(5px * var(--card-scale)), 7px);
+  display: flex;
+  flex-wrap: wrap;
   font-size: clamp(7px, calc(12px * var(--card-scale)), 16px);
   font-style: normal;
   font-variant-numeric: tabular-nums;
   font-weight: 750;
   left: calc(12px * var(--card-scale));
   line-height: 1;
+  max-width: calc(100% - calc(24px * var(--card-scale)));
   position: absolute;
+  row-gap: clamp(2px, calc(3px * var(--card-scale)), 4px);
   text-shadow: 0 2px 8px rgba(0, 0, 0, 0.86);
   z-index: 2;
+}
+
+.replay-age-relative,
+.replay-age-separator,
+.replay-age-date {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.replay-age-date {
+  color: rgba(241, 245, 239, 0.66);
+  font-weight: 600;
 }
 
 .replay-action-dock {

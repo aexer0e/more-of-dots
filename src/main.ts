@@ -870,6 +870,40 @@ function formatReplayAge(modifiedSeconds: unknown, now = Date.now()): string {
   return `${Math.floor(ageDays / 7)}w ago`;
 }
 
+const replayTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+const replayDateFormatter = new Intl.DateTimeFormat("en-US", {
+  month: "numeric",
+  day: "numeric",
+  year: "numeric",
+});
+
+function isSameLocalDate(first: Date, second: Date): boolean {
+  return (
+    first.getFullYear() === second.getFullYear() &&
+    first.getMonth() === second.getMonth() &&
+    first.getDate() === second.getDate()
+  );
+}
+
+function formatReplayDate(modifiedSeconds: unknown, now = Date.now()): string {
+  const modified = Number(modifiedSeconds);
+  if (!Number.isFinite(modified) || modified <= 0) return "";
+
+  const modifiedDate = new Date(modified * 1000);
+  const nowDate = new Date(now);
+  const timeLabel = replayTimeFormatter.format(modifiedDate);
+  if (isSameLocalDate(modifiedDate, nowDate)) return timeLabel;
+
+  const yesterday = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate() - 1);
+  if (isSameLocalDate(modifiedDate, yesterday)) return `Yesterday at ${timeLabel}`;
+
+  return `${replayDateFormatter.format(modifiedDate)} ${timeLabel}`;
+}
+
 function browserGridCardScale(): number {
   return browserGridCapped ? 1 : clamp(browserGridCardSize / BROWSER_GRID_CARD_SIZE_DEFAULT, 0.4, 1.6);
 }
@@ -1716,6 +1750,8 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
     : "";
   const label = replay.players.map((player) => player.name).join(" versus ");
   const accessibleLabel = replay.eventLabel ? `${label}, ${replay.eventLabel}` : label;
+  const replayAge = formatReplayAge(replay.modified);
+  const replayDate = formatReplayDate(replay.modified);
   return `
     <article class="replay-card ${browserSelectedReplayPaths.has(replay.filePath) ? "is-selected" : ""}" data-card-index="${replayIndex}" aria-label="${escapeHtml(accessibleLabel)}">
       <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
@@ -1730,7 +1766,11 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
       ${eventLabel}
       ${renderReplayPlayButton(replay, label, replayIndex)}
       ${renderReplaySelectButton(replay, label, replayIndex)}
-      <time class="replay-age" data-replay-modified="${replay.modified}" datetime="${new Date(replay.modified * 1000).toISOString()}" aria-live="off">${formatReplayAge(replay.modified)}</time>
+      <time class="replay-age" data-replay-modified="${replay.modified}" datetime="${new Date(replay.modified * 1000).toISOString()}" aria-label="${escapeHtml(`${replayAge}, ${replayDate}`)}" title="${escapeHtml(`${replayAge} · ${replayDate}`)}" aria-live="off">
+        <span class="replay-age-relative" data-replay-age>${replayAge}</span>
+        <span class="replay-age-separator" aria-hidden="true">·</span>
+        <span class="replay-age-date" data-replay-date>${replayDate}</span>
+      </time>
       <div class="replay-meta">
         <div class="players">
           <div class="matchup player-count-${replay.players.length}">${names}</div>
@@ -2161,8 +2201,14 @@ function hydrateBrowserCards() {
 function updateReplayAgeLabels() {
   const now = Date.now();
   document.querySelectorAll<HTMLTimeElement>("#replayGrid [data-replay-modified]").forEach((element) => {
-    const nextLabel = formatReplayAge(element.dataset.replayModified, now);
-    if (element.textContent !== nextLabel) element.textContent = nextLabel;
+    const nextAge = formatReplayAge(element.dataset.replayModified, now);
+    const nextDate = formatReplayDate(element.dataset.replayModified, now);
+    const ageElement = element.querySelector<HTMLElement>("[data-replay-age]");
+    const dateElement = element.querySelector<HTMLElement>("[data-replay-date]");
+    if (ageElement && ageElement.textContent !== nextAge) ageElement.textContent = nextAge;
+    if (dateElement && dateElement.textContent !== nextDate) dateElement.textContent = nextDate;
+    element.setAttribute("aria-label", `${nextAge}, ${nextDate}`);
+    element.title = `${nextAge} · ${nextDate}`;
   });
 }
 

@@ -12,7 +12,7 @@ from uuid import uuid4
 
 
 DEFAULT_STALE_ACTIVE_JOB_SECONDS = 2 * 60 * 60
-FINAL_JOB_STATUSES = {"captured", "completed", "failed", "recorded", "succeeded"}
+FINAL_JOB_STATUSES = {"cancelled", "captured", "completed", "failed", "recorded", "succeeded"}
 BULKY_JOB_ARTIFACT_PATTERNS = (
     "stats.json.samples.jsonl",
     "stats.json.partial.json",

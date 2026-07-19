@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+import threading
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -181,3 +184,87 @@ def test_frontend_prefers_direct_power_lines_and_draws_bridges() -> None:
     assert "const directLines = cleanProjectionLines(sample.projection_lines);" in content
     assert "if (directLines.length) {" in content
     assert "drawBridgeLines(ctx, sample, toScreen, fit);" in content
+
+
+def test_video_recording_starts_replay_on_main_thread_with_watchdogs() -> None:
+    runner_script = Path(__file__).resolve().parents[1] / "scripts" / "local-runner.ps1"
+    content = runner_script.read_text(encoding="utf-8")
+
+    assert "$ReplayStartupMutexName = 'Global\\MoreOfDotsReplayStartup'" in content
+    assert "function Wait-ReplayStartupLock" in content
+    assert "def install_main_thread_replay_start_hook" in content
+    assert "'strategy': 'main-thread-scene-state-machine'" in content
+    assert "setattr(home, 'change_scene', 'play')" in content
+    assert "prepare_play_scene_for_replay(play_scene, replay, 'replay1')" in content
+    assert "setattr(play_scene, 'change_scene', 'game')" in content
+    assert "'phase': 'home-to-play'" in content
+    assert "'phase': 'play-to-game'" in content
+    assert "Replay startup produced no first video frame within 30 seconds." in content
+    assert "Replay recording made no frame or status progress for 45 seconds." in content
+    assert "if ($CancelPath -and (Test-Path -LiteralPath $CancelPath))" in content
+
+
+def test_main_thread_replay_start_advances_one_scene_per_update(monkeypatch) -> None:
+    runner_script = Path(__file__).resolve().parents[1] / "scripts" / "local-runner.ps1"
+    content = runner_script.read_text(encoding="utf-8")
+    function_source = "def install_main_thread_replay_start_hook" + content.split(
+        "def install_main_thread_replay_start_hook", 1
+    )[1].split("\ndef get_game_objects", 1)[0]
+    statuses: list[dict[str, object]] = []
+    game_objects: list[object] = []
+
+    class HomeScene:
+        def update(self) -> str:
+            return "home-updated"
+
+    class PlayScene:
+        def __init__(self) -> None:
+            self.game_setup: dict[str, object] = {}
+
+        def update(self) -> str:
+            game_objects.append(object())
+            return "play-updated"
+
+    fake_main = SimpleNamespace(HomeScene=HomeScene, PlayScene=PlayScene)
+    monkeypatch.setitem(sys.modules, "__main__", fake_main)
+    namespace = {
+        "sys": sys,
+        "threading": threading,
+        "traceback": traceback,
+        "ARTIFACT_PATH": "unused.json",
+        "write_video_status": lambda payload: statuses.append(payload),
+        "write_json_atomic": lambda _path, _value: True,
+        "force_server_ready": lambda attempts: attempts.append({"method": "force-ready"}),
+        "prepare_play_scene_for_replay": lambda scene, _replay, _name: {"id": id(scene)},
+        "get_game_objects": lambda: game_objects,
+        "get_game_scene_objects": lambda: [],
+    }
+    exec(function_source, namespace)
+
+    result = namespace["install_main_thread_replay_start_hook"]([], {"map": "world"}, {})
+    home = HomeScene()
+    play = PlayScene()
+
+    assert result["strategy"] == "main-thread-scene-state-machine"
+    assert home.update() == "home-updated"
+    assert home.change_scene == "play"
+    assert play.update() == "play-updated"
+    assert play.change_scene == "game"
+    assert statuses[-1]["status"] == "replay-started"
+
+
+def test_recording_progress_counts_all_terminal_replays() -> None:
+    root = Path(__file__).resolve().parents[1]
+    frontend = (root / "src" / "main.ts").read_text(encoding="utf-8")
+    desktop = (root / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
+
+    assert "progress.processed ?? progress.current" in frontend
+    assert "Math.floor((replayRecordingProcessed(progress) * 100) / total)" in frontend
+    assert "function mergeReplayRecordingProgress" in frontend
+    assert "Math.max(replayRecordingProcessed(previous), replayRecordingProcessed(next))" in frontend
+    assert 'role="progressbar"' in frontend
+    assert 'aria-valuetext="${processed} of ${total} replays processed"' in frontend
+    assert "let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;" in desktop
+    assert "let failed = failed_count.fetch_add(1, Ordering::Relaxed) + 1;" in desktop
+    assert '"percent": processed.saturating_mul(100) / total.max(1)' in desktop
+    assert "const MAX_ATTEMPTS: usize = 3;" in desktop

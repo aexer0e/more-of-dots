@@ -2,6 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import { createElement } from "react";
@@ -284,6 +285,48 @@ type ReplayBrowserPayload = {
   replays: ReplayBrowserItem[];
 };
 
+type ReplayRecordingProgressEvent = {
+  stage: string;
+  current?: number;
+  processed?: number;
+  total?: number;
+  active?: number;
+  queued?: number;
+  concurrency?: number;
+  queueIndex?: number;
+  recorded?: number;
+  succeeded?: number;
+  failed?: number;
+  percent?: number;
+  attempt?: number;
+  maxAttempts?: number;
+  fileName?: string;
+  outputPath?: string;
+  destination?: string;
+  message?: string;
+  encoder?: {
+    status?: string;
+    tick?: number;
+    end_tick?: number;
+    frame_count?: number;
+    speed_after?: number;
+  };
+};
+
+type ReplayRecordingSetup = {
+  destinationDir: string;
+  concurrency: number;
+  playbackSpeedIndex: number;
+  bitrateIndex: number;
+  resolutionIndex: number;
+};
+
+type ReplayRecordingNotice = {
+  tone: "success" | "error" | "neutral";
+  title: string;
+  detail: string;
+};
+
 type BrowserSuggestion = {
   name: string;
   normalizedName: string;
@@ -479,6 +522,12 @@ const BROWSER_GRID_CARD_SIZE_MAX = 480;
 const BROWSER_GRID_CARD_SIZE_DEFAULT = 300;
 const BROWSER_GRID_CARD_SIZE_STEP = 10;
 const BROWSER_REPLAY_PLAYBACK_ENABLED = false;
+const RECORDING_SPEED_OPTIONS = [1, 2, 4, 6, 10] as const;
+const RECORDING_BITRATE_OPTIONS = [0.5, 1, 2.5, 5, 10] as const;
+const RECORDING_RESOLUTION_OPTIONS = [480, 720, 1080] as const;
+const RECORDING_DEFAULT_SPEED_INDEX = RECORDING_SPEED_OPTIONS.length - 1;
+const RECORDING_DEFAULT_BITRATE_INDEX = 3;
+const RECORDING_DEFAULT_RESOLUTION_INDEX = 1;
 const REGION_NAMES: RegionName[] = ["NA", "EU", "ASIA"];
 const REGION_LABELS: Record<RegionName, string> = {
   NA: "North America",
@@ -555,12 +604,20 @@ let browserLoading = false;
 let browserUploading = false;
 let browserUploadLabel = "Upload";
 let browserSelectedReplayPaths = new Set<string>();
+let browserSelectionAnchorPath: string | null = null;
 let browserDeleteCandidates: ReplayBrowserItem[] = [];
 let browserDeleteInFlight = false;
 let browserDeleteError = "";
 let browserBulkDownloadInFlight = false;
+let browserRecordingInFlight = false;
+let browserRecordingCancelling = false;
+let browserRecordingProgress: ReplayRecordingProgressEvent | null = null;
+let browserRecordingChoosingDirectory = false;
+let browserRecordingSetup: ReplayRecordingSetup | null = null;
+let browserRecordingNotice: ReplayRecordingNotice | null = null;
 let browserError = "";
 let browserSearch = "";
+let browserHideUnmatched = true;
 let browserNationGamesOnly = false;
 let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
 let browserDurationBounds = { min: 0, max: 0 };
@@ -1704,6 +1761,77 @@ function replayDownloadFileName(replay: ReplayBrowserItem): string {
   return `${playerNames || "replay"}.rep`;
 }
 
+function replayRecordingFileName(replay: ReplayBrowserItem, playbackSpeed: number, resolutionHeight: number): string {
+  const timestamp = new Date(replay.modified * 1000).toISOString().slice(0, 19).replaceAll(":", "-").replace("T", "_");
+  const playerNames = replay.players
+    .map((player) => player.name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "").trim() || "player")
+    .join("-vs-");
+  return `${timestamp}_${playerNames || "replay"}_${playbackSpeed}x_${resolutionHeight}p.mp4`;
+}
+
+function replayRecordingButtonLabel(): string {
+  if (browserRecordingChoosingDirectory) return "Choosing folder...";
+  if (browserRecordingCancelling) return "Stopping...";
+  const progress = browserRecordingProgress;
+  if (!browserRecordingInFlight || !progress) return "Record";
+  if (progress.stage === "staging") return "Preparing...";
+  const current = replayRecordingProcessed(progress);
+  const total = progress.total ?? browserSelectedReplayPaths.size;
+  const percent = replayRecordingPercent(progress);
+  return `Stop ${percent}% · ${current}/${total}`;
+}
+
+function replayRecordingProcessed(progress = browserRecordingProgress): number {
+  if (!progress) return 0;
+  const total = Math.max(0, progress.total ?? browserSelectedReplayPaths.size);
+  const processed = progress.processed ?? progress.current ?? ((progress.succeeded ?? progress.recorded ?? 0) + (progress.failed ?? 0));
+  return Math.max(0, Math.min(total, processed));
+}
+
+function replayRecordingPercent(progress = browserRecordingProgress): number {
+  if (!progress) return 0;
+  const total = Math.max(0, progress.total ?? browserSelectedReplayPaths.size);
+  if (!total) return 0;
+  return Math.max(0, Math.min(100, Math.floor((replayRecordingProcessed(progress) * 100) / total)));
+}
+
+function mergeReplayRecordingProgress(next: ReplayRecordingProgressEvent): ReplayRecordingProgressEvent {
+  const previous = browserRecordingProgress;
+  if (!previous) return next;
+  const processed = Math.max(replayRecordingProcessed(previous), replayRecordingProcessed(next));
+  return {
+    ...next,
+    current: processed,
+    processed,
+    succeeded: Math.max(previous.succeeded ?? previous.recorded ?? 0, next.succeeded ?? next.recorded ?? 0),
+    failed: Math.max(previous.failed ?? 0, next.failed ?? 0),
+  };
+}
+
+function renderReplayRecordingProgress(): string {
+  const progress = browserRecordingProgress;
+  if (!browserRecordingInFlight || !progress) return "";
+  const total = Math.max(0, progress.total ?? browserSelectedReplayPaths.size);
+  const processed = replayRecordingProcessed(progress);
+  const succeeded = Math.max(0, progress.succeeded ?? progress.recorded ?? Math.max(0, processed - (progress.failed ?? 0)));
+  const failed = Math.max(0, progress.failed ?? 0);
+  const active = Math.max(0, progress.active ?? 0);
+  const queued = Math.max(0, progress.queued ?? total - processed - active);
+  const percent = replayRecordingPercent(progress);
+  const attempt = progress.attempt && progress.maxAttempts && progress.attempt > 1
+    ? ` · retry ${progress.attempt}/${progress.maxAttempts}`
+    : "";
+  const status = progress.stage === "staging"
+    ? "Preparing"
+    : `${succeeded} saved${failed ? ` · ${failed} failed` : ""}${active ? ` · ${active} active` : ""}${queued ? ` · ${queued} queued` : ""}${attempt}`;
+  return `
+    <div class="replay-recording-progress" role="progressbar" aria-label="Replay export progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${processed} of ${total} replays processed">
+      <span class="replay-recording-progress-copy"><strong>${percent}%</strong><small>${escapeHtml(status)}</small></span>
+      <span class="replay-recording-progress-track" aria-hidden="true"><span style="width:${percent}%"></span></span>
+    </div>
+  `;
+}
+
 function renderReplaySelectButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
   const isSelected = browserSelectedReplayPaths.has(replay.filePath);
   return `
@@ -1714,7 +1842,7 @@ function renderReplaySelectButton(replay: ReplayBrowserItem, label: string, repl
       aria-pressed="${isSelected}"
       aria-label="${escapeHtml(`${isSelected ? "Deselect" : "Select"} replay: ${label}`)}"
       title="${isSelected ? "Deselect replay" : "Select replay"}"
-      ${browserDeleteInFlight || browserBulkDownloadInFlight ? "disabled" : ""}
+      ${browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory ? "disabled" : ""}
     >
       <svg aria-hidden="true" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="8.5" />
@@ -1847,13 +1975,118 @@ function renderReplayDeleteDialog(): string {
   `;
 }
 
+function renderRecordingScale(values: readonly number[], formatter: (value: number) => string): string {
+  return `<div class="recording-slider-scale" aria-hidden="true">${values
+    .map((value) => `<span>${escapeHtml(formatter(value))}</span>`)
+    .join("")}</div>`;
+}
+
+function renderReplayRecordingDialog(): string {
+  const setup = browserRecordingSetup;
+  if (!setup) return "";
+  const selectedCount = browserSelectedReplayPaths.size;
+  const maxConcurrency = Math.min(20, Math.max(1, selectedCount));
+  const playbackSpeed = RECORDING_SPEED_OPTIONS[setup.playbackSpeedIndex] ?? 10;
+  const bitrate = RECORDING_BITRATE_OPTIONS[setup.bitrateIndex] ?? 5;
+  const resolution = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 720;
+  const needsPowerWarning = setup.concurrency > 5;
+  return `
+    <div id="replayRecordingModal" class="recording-setup-backdrop" role="presentation">
+      <section class="recording-setup-dialog" role="dialog" aria-modal="true" aria-labelledby="recordingSetupTitle" aria-describedby="recordingSetupDescription">
+        <header class="recording-setup-header">
+          <span class="recording-setup-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="12" rx="2"/><path d="m17 10 4-2v8l-4-2"/></svg>
+          </span>
+          <span>
+            <small>Replay export</small>
+            <h2 id="recordingSetupTitle">Configure ${selectedCount} ${selectedCount === 1 ? "recording" : "recordings"}</h2>
+            <p id="recordingSetupDescription">Choose the balance between export speed, video quality, and system load.</p>
+          </span>
+          <button id="closeRecordingSetup" class="recording-setup-close" type="button" aria-label="Close recording setup">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          </button>
+        </header>
+
+        <div class="recording-destination">
+          <span class="recording-destination-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg></span>
+          <span><small>Export folder</small><strong title="${escapeHtml(setup.destinationDir)}">${escapeHtml(setup.destinationDir)}</strong></span>
+          <button id="changeRecordingFolder" type="button">Change</button>
+        </div>
+
+        <div class="recording-option-grid">
+          <label class="recording-option-card is-wide" for="recordingConcurrency">
+            <span class="recording-option-heading">
+              <span><strong>Simultaneous games</strong><small>Parallel hidden game instances</small></span>
+              <output id="recordingConcurrencyValue">${setup.concurrency}</output>
+            </span>
+            <input id="recordingConcurrency" type="range" min="1" max="${maxConcurrency}" step="1" value="${setup.concurrency}" aria-valuetext="${setup.concurrency} simultaneous games">
+            <div class="recording-slider-endpoints" aria-hidden="true"><span>1</span><span>${maxConcurrency}</span></div>
+          </label>
+
+          <label class="recording-option-card" for="recordingSpeed">
+            <span class="recording-option-heading">
+              <span><strong>Playback speed</strong><small>Game simulation speed</small></span>
+              <output id="recordingSpeedValue">${playbackSpeed}×</output>
+            </span>
+            <input id="recordingSpeed" type="range" min="0" max="${RECORDING_SPEED_OPTIONS.length - 1}" step="1" value="${setup.playbackSpeedIndex}" aria-valuetext="${playbackSpeed} times speed">
+            ${renderRecordingScale(RECORDING_SPEED_OPTIONS, (value) => `${value}×`)}
+          </label>
+
+          <label class="recording-option-card" for="recordingBitrate">
+            <span class="recording-option-heading">
+              <span><strong>Video bitrate</strong><small>Higher is clearer and larger</small></span>
+              <output id="recordingBitrateValue">${bitrate} Mbps</output>
+            </span>
+            <input id="recordingBitrate" type="range" min="0" max="${RECORDING_BITRATE_OPTIONS.length - 1}" step="1" value="${setup.bitrateIndex}" aria-valuetext="${bitrate} megabits per second">
+            ${renderRecordingScale(RECORDING_BITRATE_OPTIONS, (value) => `${value}M`)}
+          </label>
+
+          <label class="recording-option-card is-wide" for="recordingResolution">
+            <span class="recording-option-heading">
+              <span><strong>Resolution</strong><small>16:9 MP4 output</small></span>
+              <output id="recordingResolutionValue">${resolution}p</output>
+            </span>
+            <input id="recordingResolution" type="range" min="0" max="${RECORDING_RESOLUTION_OPTIONS.length - 1}" step="1" value="${setup.resolutionIndex}" aria-valuetext="${resolution}p">
+            ${renderRecordingScale(RECORDING_RESOLUTION_OPTIONS, (value) => `${value}p`)}
+          </label>
+        </div>
+
+        <div id="recordingPowerWarning" class="recording-power-warning" ${needsPowerWarning ? "" : "hidden"} role="status">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17h.01"/></svg>
+          <span><strong>Powerful PC recommended</strong><small>More than 5 simultaneous games can heavily load your CPU, GPU, memory, and storage.</small></span>
+        </div>
+
+        <footer class="recording-setup-actions">
+          <span class="recording-setup-summary"><strong>${playbackSpeed}× · ${resolution}p · ${bitrate} Mbps</strong><small>Videos include a 2-second result-screen hold.</small></span>
+          <button id="cancelRecordingSetup" class="recording-setup-cancel" type="button">Cancel</button>
+          <button id="startConfiguredRecording" class="recording-setup-start" type="button">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="12" rx="2"/><path d="m17 10 4-2v8l-4-2"/></svg>
+            Start recording
+          </button>
+        </footer>
+      </section>
+    </div>
+  `;
+}
+
+function renderReplayRecordingNotice(): string {
+  const notice = browserRecordingNotice;
+  if (!notice) return "";
+  return `
+    <aside class="recording-notice is-${notice.tone}" role="status">
+      <span><strong>${escapeHtml(notice.title)}</strong><small>${escapeHtml(notice.detail)}</small></span>
+      <button id="dismissRecordingNotice" type="button" aria-label="Dismiss notification">×</button>
+    </aside>
+  `;
+}
+
 function selectedBrowserReplays(): ReplayBrowserItem[] {
   return browserReplays.filter((replay) => browserSelectedReplayPaths.has(replay.filePath));
 }
 
 function renderReplayUploadDockContent(animateSelection = false): string {
   const selectedCount = browserSelectedReplayPaths.size;
-  const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight;
+  const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory;
   if (!selectedCount) {
     return `
       <input id="replayUploadInput" type="file" accept=".rep" multiple hidden>
@@ -1873,6 +2106,7 @@ function renderReplayUploadDockContent(animateSelection = false): string {
   return `
     <div class="replay-action-group replay-selection-actions ${animateSelection ? "is-entering" : ""}" role="group" aria-label="Actions for ${selectedCount} selected ${selectedCount === 1 ? "replay" : "replays"}">
       <span class="replay-selection-count" aria-live="polite"><strong>${selectedCount}</strong> selected</span>
+      ${renderReplayRecordingProgress()}
       <button id="unselectAllReplays" class="refresh-button unselect-button" type="button" ${selectionBusy ? "disabled" : ""}>
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" /></svg>
         <span>Unselect all</span>
@@ -1880,6 +2114,12 @@ function renderReplayUploadDockContent(animateSelection = false): string {
       <button id="downloadSelectedReplays" class="refresh-button selection-download-button ${browserBulkDownloadInFlight ? "is-loading" : ""}" type="button" ${selectionBusy ? "disabled" : ""}>
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" /></svg>
         <span>${browserBulkDownloadInFlight ? "Saving..." : "Download"}</span>
+      </button>
+      <button id="${browserRecordingInFlight ? "cancelReplayRecording" : "recordSelectedReplays"}" class="refresh-button selection-record-button ${browserRecordingInFlight ? "is-recording" : ""}" type="button" ${browserRecordingCancelling || browserRecordingChoosingDirectory ? "disabled" : ""} title="${browserRecordingInFlight ? "Stop all active recordings cleanly" : "Export selected replays as MP4 videos"}">
+        <svg aria-hidden="true" viewBox="0 0 24 24">
+          ${browserRecordingInFlight ? '<rect x="7" y="7" width="10" height="10" rx="1" />' : '<rect x="3" y="6" width="14" height="12" rx="2" /><path d="m17 10 4-2v8l-4-2" />'}
+        </svg>
+        <span>${escapeHtml(replayRecordingButtonLabel())}</span>
       </button>
       <button id="deleteSelectedReplays" class="refresh-button selection-delete-button" type="button" ${selectionBusy ? "disabled" : ""}>
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5M14 11v5" /></svg>
@@ -2226,13 +2466,14 @@ function applyBrowserSearch() {
       renderHighlightedText(card.winnerNameElement, card.winnerName, filterState.query);
     }
 
-    card.element.hidden = !visible;
+    card.element.hidden = browserHideUnmatched && !visible;
+    card.element.classList.toggle("is-dimmed", !browserHideUnmatched && !visible);
     card.visible = visible;
     if (visible) visibleCount += 1;
   }
 
   const searchEmpty = document.querySelector<HTMLElement>("#searchEmpty");
-  if (searchEmpty) searchEmpty.hidden = visibleCount > 0;
+  if (searchEmpty) searchEmpty.hidden = !browserHideUnmatched || visibleCount > 0;
 }
 
 function scheduleBrowserSearch() {
@@ -2323,6 +2564,10 @@ function renderReplayBrowser() {
               <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions"></div>
             </div>
           </div>
+          <label class="match-mode-toggle" title="Dim non-matching replays">
+            <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
+            <span aria-hidden="true">&#128123;&#65039;</span>
+          </label>
           <label class="match-mode-toggle nation-mode-toggle" title="World games only">
             <input id="nationGamesToggle" type="checkbox" aria-label="World games only" ${browserNationGamesOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
             <span aria-hidden="true">&#127760;</span>
@@ -2370,6 +2615,8 @@ function renderReplayBrowser() {
         </div>
       </div>
       ${renderReplayDeleteDialog()}
+      ${renderReplayRecordingDialog()}
+      ${renderReplayRecordingNotice()}
     </main>
   `;
   hydrateBrowserCards();
@@ -2419,7 +2666,7 @@ function refreshBrowserSelectionUi() {
     if (!button) return;
     const label = replay.players.map((player) => player.name).join(" versus ");
     button.classList.toggle("is-selected", isSelected);
-    button.disabled = browserDeleteInFlight || browserBulkDownloadInFlight;
+    button.disabled = browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory;
     button.setAttribute("aria-pressed", String(isSelected));
     button.setAttribute("aria-label", `${isSelected ? "Deselect" : "Select"} replay: ${label}`);
     button.title = isSelected ? "Deselect replay" : "Select replay";
@@ -2435,16 +2682,34 @@ function refreshBrowserSelectionUi() {
   }
 }
 
-function toggleBrowserReplaySelection(replay: ReplayBrowserItem) {
-  if (browserDeleteInFlight || browserBulkDownloadInFlight) return;
-  if (browserSelectedReplayPaths.has(replay.filePath)) browserSelectedReplayPaths.delete(replay.filePath);
-  else browserSelectedReplayPaths.add(replay.filePath);
+function toggleBrowserReplaySelection(replay: ReplayBrowserItem, selectRange = false) {
+  if (browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory) return;
+
+  const shouldSelect = !browserSelectedReplayPaths.has(replay.filePath);
+  const visibleReplayPaths = Array.from(document.querySelectorAll<HTMLElement>("#replayGrid .replay-card:not([hidden])"))
+    .map((card) => browserReplays[Number(card.dataset.cardIndex)]?.filePath)
+    .filter((filePath): filePath is string => Boolean(filePath));
+  const anchorIndex = browserSelectionAnchorPath ? visibleReplayPaths.indexOf(browserSelectionAnchorPath) : -1;
+  const replayIndex = visibleReplayPaths.indexOf(replay.filePath);
+
+  if (selectRange && anchorIndex >= 0 && replayIndex >= 0) {
+    const start = Math.min(anchorIndex, replayIndex);
+    const end = Math.max(anchorIndex, replayIndex);
+    visibleReplayPaths.slice(start, end + 1).forEach((filePath) => {
+      if (shouldSelect) browserSelectedReplayPaths.add(filePath);
+      else browserSelectedReplayPaths.delete(filePath);
+    });
+  } else if (shouldSelect) browserSelectedReplayPaths.add(replay.filePath);
+  else browserSelectedReplayPaths.delete(replay.filePath);
+
+  browserSelectionAnchorPath = replay.filePath;
   refreshBrowserSelectionUi();
 }
 
 function clearBrowserReplaySelection() {
-  if (browserDeleteInFlight || browserBulkDownloadInFlight) return;
+  if (browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory) return;
   browserSelectedReplayPaths.clear();
+  browserSelectionAnchorPath = null;
   refreshBrowserSelectionUi();
 }
 
@@ -2461,6 +2726,12 @@ function bindReplayUploadDockEvents() {
   document.querySelector<HTMLButtonElement>("#unselectAllReplays")?.addEventListener("click", clearBrowserReplaySelection);
   document.querySelector<HTMLButtonElement>("#downloadSelectedReplays")?.addEventListener("click", () => {
     void downloadSelectedReplays();
+  });
+  document.querySelector<HTMLButtonElement>("#recordSelectedReplays")?.addEventListener("click", () => {
+    void recordSelectedReplays();
+  });
+  document.querySelector<HTMLButtonElement>("#cancelReplayRecording")?.addEventListener("click", () => {
+    void cancelReplayRecording();
   });
   document.querySelector<HTMLButtonElement>("#deleteSelectedReplays")?.addEventListener("click", openReplayDeleteDialog);
 }
@@ -2530,6 +2801,10 @@ function bindBrowserEvents() {
   });
   document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("click", clearBrowserSearch);
   document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("pointerdown", handleBrowserSuggestionPointerDown);
+  document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("change", (event) => {
+    browserHideUnmatched = !(event.target as HTMLInputElement).checked;
+    scheduleBrowserSearch();
+  });
   document.querySelector<HTMLInputElement>("#nationGamesToggle")?.addEventListener("change", (event) => {
     browserNationGamesOnly = (event.target as HTMLInputElement).checked;
     refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
@@ -2624,7 +2899,7 @@ function bindBrowserEvents() {
     const selectButton = target.closest<HTMLButtonElement>("[data-replay-select-index]");
     if (selectButton) {
       const replay = browserReplays[Number(selectButton.dataset.replaySelectIndex)];
-      if (replay) toggleBrowserReplaySelection(replay);
+      if (replay) toggleBrowserReplaySelection(replay, event.shiftKey);
       return;
     }
 
@@ -2660,6 +2935,69 @@ function bindBrowserEvents() {
   document.querySelector<HTMLButtonElement>("#cancelReplayDelete")?.addEventListener("click", closeReplayDeleteDialog);
   document.querySelector<HTMLButtonElement>("#confirmReplayDelete")?.addEventListener("click", () => {
     void deleteReplayFromBrowser();
+  });
+  const recordingModal = document.querySelector<HTMLElement>("#replayRecordingModal");
+  recordingModal?.addEventListener("click", (event) => {
+    if (event.target === recordingModal) closeRecordingSetup();
+  });
+  recordingModal?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeRecordingSetup();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const controls = Array.from(recordingModal.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"));
+    if (!controls.length) return;
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#closeRecordingSetup")?.addEventListener("click", closeRecordingSetup);
+  document.querySelector<HTMLButtonElement>("#cancelRecordingSetup")?.addEventListener("click", closeRecordingSetup);
+  document.querySelector<HTMLButtonElement>("#changeRecordingFolder")?.addEventListener("click", () => {
+    void changeRecordingDirectory();
+  });
+  document.querySelector<HTMLButtonElement>("#startConfiguredRecording")?.addEventListener("click", () => {
+    void startConfiguredRecording();
+  });
+  document.querySelector<HTMLInputElement>("#recordingConcurrency")?.addEventListener("input", (event) => {
+    if (!browserRecordingSetup) return;
+    const input = event.currentTarget as HTMLInputElement;
+    browserRecordingSetup.concurrency = Number(input.value);
+    input.setAttribute("aria-valuetext", `${input.value} simultaneous games`);
+    updateRecordingSetupUi();
+  });
+  document.querySelector<HTMLInputElement>("#recordingSpeed")?.addEventListener("input", (event) => {
+    if (!browserRecordingSetup) return;
+    const input = event.currentTarget as HTMLInputElement;
+    browserRecordingSetup.playbackSpeedIndex = Number(input.value);
+    input.setAttribute("aria-valuetext", `${RECORDING_SPEED_OPTIONS[browserRecordingSetup.playbackSpeedIndex] ?? 10} times speed`);
+    updateRecordingSetupUi();
+  });
+  document.querySelector<HTMLInputElement>("#recordingBitrate")?.addEventListener("input", (event) => {
+    if (!browserRecordingSetup) return;
+    const input = event.currentTarget as HTMLInputElement;
+    browserRecordingSetup.bitrateIndex = Number(input.value);
+    input.setAttribute("aria-valuetext", `${RECORDING_BITRATE_OPTIONS[browserRecordingSetup.bitrateIndex] ?? 5} megabits per second`);
+    updateRecordingSetupUi();
+  });
+  document.querySelector<HTMLInputElement>("#recordingResolution")?.addEventListener("input", (event) => {
+    if (!browserRecordingSetup) return;
+    const input = event.currentTarget as HTMLInputElement;
+    browserRecordingSetup.resolutionIndex = Number(input.value);
+    input.setAttribute("aria-valuetext", `${RECORDING_RESOLUTION_OPTIONS[browserRecordingSetup.resolutionIndex] ?? 720}p`);
+    updateRecordingSetupUi();
+  });
+  document.querySelector<HTMLButtonElement>("#dismissRecordingNotice")?.addEventListener("click", () => {
+    browserRecordingNotice = null;
+    renderReplayBrowser();
   });
   if (!browserDocumentEventsBound) {
     document.addEventListener("pointerdown", handleBrowserOutsidePointerDown);
@@ -2853,7 +3191,7 @@ async function deleteReplayFromBrowser() {
 
 async function downloadSelectedReplays() {
   const replays = selectedBrowserReplays();
-  if (!replays.length || browserBulkDownloadInFlight || browserDeleteInFlight) return;
+  if (!replays.length || browserBulkDownloadInFlight || browserDeleteInFlight || browserRecordingInFlight) return;
   browserBulkDownloadInFlight = true;
   refreshBrowserSelectionUi();
   try {
@@ -2877,6 +3215,186 @@ async function downloadSelectedReplays() {
   } finally {
     browserBulkDownloadInFlight = false;
     refreshBrowserSelectionUi();
+  }
+}
+
+async function chooseRecordingDirectory(): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose replay video export folder",
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+async function recordSelectedReplays() {
+  const replays = selectedBrowserReplays();
+  if (
+    !replays.length ||
+    browserRecordingInFlight ||
+    browserRecordingChoosingDirectory ||
+    browserBulkDownloadInFlight ||
+    browserDeleteInFlight
+  ) return;
+  browserRecordingChoosingDirectory = true;
+  refreshBrowserSelectionUi();
+  try {
+    const destinationDir = await chooseRecordingDirectory();
+    if (!destinationDir) return;
+    browserRecordingSetup = {
+      destinationDir,
+      concurrency: Math.min(2, replays.length, 20),
+      playbackSpeedIndex: RECORDING_DEFAULT_SPEED_INDEX,
+      bitrateIndex: RECORDING_DEFAULT_BITRATE_INDEX,
+      resolutionIndex: RECORDING_DEFAULT_RESOLUTION_INDEX,
+    };
+    browserRecordingNotice = null;
+  } catch (error) {
+    browserRecordingNotice = {
+      tone: "error",
+      title: "Could not choose an export folder",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    browserRecordingChoosingDirectory = false;
+    renderReplayBrowser();
+    window.requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#recordingConcurrency")?.focus());
+  }
+}
+
+async function changeRecordingDirectory() {
+  if (!browserRecordingSetup) return;
+  try {
+    const destinationDir = await chooseRecordingDirectory();
+    if (!destinationDir || !browserRecordingSetup) return;
+    browserRecordingSetup.destinationDir = destinationDir;
+    renderReplayBrowser();
+  } catch (error) {
+    browserRecordingNotice = {
+      tone: "error",
+      title: "Could not change the export folder",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+    renderReplayBrowser();
+  }
+}
+
+function closeRecordingSetup() {
+  browserRecordingSetup = null;
+  renderReplayBrowser();
+  window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#recordSelectedReplays")?.focus());
+}
+
+function updateRecordingSetupUi() {
+  const setup = browserRecordingSetup;
+  if (!setup) return;
+  const speed = RECORDING_SPEED_OPTIONS[setup.playbackSpeedIndex] ?? 10;
+  const bitrate = RECORDING_BITRATE_OPTIONS[setup.bitrateIndex] ?? 5;
+  const resolution = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 720;
+  const concurrencyOutput = document.querySelector<HTMLOutputElement>("#recordingConcurrencyValue");
+  const speedOutput = document.querySelector<HTMLOutputElement>("#recordingSpeedValue");
+  const bitrateOutput = document.querySelector<HTMLOutputElement>("#recordingBitrateValue");
+  const resolutionOutput = document.querySelector<HTMLOutputElement>("#recordingResolutionValue");
+  if (concurrencyOutput) concurrencyOutput.value = String(setup.concurrency);
+  if (speedOutput) speedOutput.value = `${speed}×`;
+  if (bitrateOutput) bitrateOutput.value = `${bitrate} Mbps`;
+  if (resolutionOutput) resolutionOutput.value = `${resolution}p`;
+  document.querySelector<HTMLElement>("#recordingPowerWarning")?.toggleAttribute("hidden", setup.concurrency <= 5);
+  const summary = document.querySelector<HTMLElement>(".recording-setup-summary strong");
+  if (summary) summary.textContent = `${speed}× · ${resolution}p · ${bitrate} Mbps`;
+}
+
+async function startConfiguredRecording() {
+  const setup = browserRecordingSetup;
+  const replays = selectedBrowserReplays();
+  if (!setup || !replays.length || browserRecordingInFlight) return;
+  const playbackSpeed = RECORDING_SPEED_OPTIONS[setup.playbackSpeedIndex] ?? 10;
+  const bitrateMbps = RECORDING_BITRATE_OPTIONS[setup.bitrateIndex] ?? 5;
+  const resolutionHeight = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 720;
+  browserRecordingSetup = null;
+  browserRecordingInFlight = true;
+  browserRecordingCancelling = false;
+  browserRecordingProgress = {
+    stage: "staging",
+    current: 0,
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    total: replays.length,
+    active: 0,
+    queued: replays.length,
+    percent: 0,
+    concurrency: setup.concurrency,
+  };
+  renderReplayBrowser();
+  try {
+    const result = await invoke<{
+      recorded?: number;
+      failed?: number;
+      failures?: string[];
+      cancelled?: boolean;
+      concurrency?: number;
+      reason?: string;
+      destination?: string;
+    }>("record_replays", {
+      replays: replays.map((replay) => ({
+        filePath: replay.filePath,
+        fileName: replayRecordingFileName(replay, playbackSpeed, resolutionHeight),
+      })),
+      options: {
+        destinationDir: setup.destinationDir,
+        concurrency: setup.concurrency,
+        playbackSpeed,
+        bitrateKbps: Math.round(bitrateMbps * 1000),
+        resolutionHeight,
+      },
+    });
+    if (!result.cancelled && (result.failed ?? 0) > 0) {
+      const firstFailure = result.failures?.[0] ?? "One or more recordings failed.";
+      browserRecordingNotice = {
+        tone: "error",
+        title: `Recorded ${result.recorded ?? 0} of ${replays.length} replays`,
+        detail: `${result.failed} failed: ${firstFailure}${result.destination ? ` · Completed videos: ${result.destination}` : ""}`,
+      };
+    } else if (!result.cancelled && (result.recorded ?? 0) > 0 && result.destination) {
+      browserRecordingNotice = {
+        tone: "success",
+        title: `Recorded ${result.recorded} ${result.recorded === 1 ? "replay" : "replays"}`,
+        detail: `${playbackSpeed}× · ${resolutionHeight}p · ${bitrateMbps} Mbps · ${result.destination}`,
+      };
+    } else if (result.cancelled) {
+      browserRecordingNotice = {
+        tone: "neutral",
+        title: "Recording stopped",
+        detail: `${result.recorded ?? 0} completed ${result.recorded === 1 ? "video was" : "videos were"} kept. Partial videos were discarded.`,
+      };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || "Could not record the selected replays.");
+    browserRecordingNotice = {
+      tone: "error",
+      title: `Could not record the selected ${replays.length === 1 ? "replay" : "replays"}`,
+      detail: message,
+    };
+  } finally {
+    browserRecordingInFlight = false;
+    browserRecordingCancelling = false;
+    browserRecordingProgress = null;
+    renderReplayBrowser();
+  }
+}
+
+async function cancelReplayRecording() {
+  if (!browserRecordingInFlight || browserRecordingCancelling) return;
+  browserRecordingCancelling = true;
+  refreshBrowserSelectionUi();
+  try {
+    await invoke<boolean>("cancel_replay_recording");
+  } catch (error) {
+    browserRecordingCancelling = false;
+    refreshBrowserSelectionUi();
+    const message = error instanceof Error ? error.message : String(error || "Could not stop replay recording.");
+    window.alert(`Could not stop replay recording.\n\n${message}`);
   }
 }
 
@@ -5782,6 +6300,13 @@ async function loadCurrentLaunchRequest() {
 }
 
 if (appMode === "browser") {
+  void listen<ReplayRecordingProgressEvent>("replay-recording-progress", (event) => {
+    if (!browserRecordingInFlight) return;
+    browserRecordingProgress = mergeReplayRecordingProgress(event.payload);
+    refreshBrowserSelectionUi();
+  }).catch((error) => {
+    console.error("Replay recording progress listener failed", error);
+  });
   renderReplayBrowser();
   void initializeAppUpdater();
   void loadBrowserReplays();

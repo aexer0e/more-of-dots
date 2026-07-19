@@ -1,6 +1,9 @@
 [CmdletBinding(DefaultParameterSetName = 'Default')]
 param(
     [switch]$CaptureReplay,
+    [switch]$CaptureFramePoc,
+    [switch]$CaptureVideoPoc,
+    [switch]$RecordReplay,
     [switch]$GamePythonCapture,
     [switch]$CaptureLiveReplay,
     [switch]$ProbeReplayState,
@@ -12,6 +15,15 @@ param(
     [string]$JobId,
     [int]$SampleHz = 10,
     [int]$MaxSeconds = 1800,
+    [string]$FrameOutput = '',
+    [string]$VideoOutput = '',
+    [string]$FfmpegPath = '',
+    [string]$CancelPath = '',
+    [string]$StatusPath = '',
+    [int]$PlaybackSpeed = 10,
+    [int]$VideoBitrateKbps = 5000,
+    [int]$VideoHeight = 720,
+    [int]$VideoMaxFrames = 90,
     [string]$ShareRoot = '',
     [string]$GameWindowTitle = 'War of Dots',
     [ValidateSet('automation-desktop', 'current-desktop')]
@@ -109,6 +121,7 @@ $SW_MINIMIZE = 6
 $script:AutomationDesktopHandle = [IntPtr]::Zero
 $script:CurrentGameDir = ''
 $StageGameMutexName = 'Global\MoreOfDotsStageGame'
+$ReplayStartupMutexName = 'Global\MoreOfDotsReplayStartup'
 
 function Write-JsonResult([hashtable]$Data) {
     $Data | ConvertTo-Json -Depth 32 -Compress
@@ -221,6 +234,39 @@ function Invoke-WithStageGameLock([scriptblock]$Action, [int]$TimeoutSeconds = 1
         }
         $mutex.Dispose()
     }
+}
+
+function Wait-ReplayStartupLock(
+    [System.Threading.Mutex]$Mutex,
+    [string]$CancelMarker = '',
+    [string]$RunnerStatusPath = '',
+    [int]$TimeoutSeconds = 1800
+) {
+    if ($RunnerStatusPath) {
+        Write-JsonFile -Path $RunnerStatusPath -Data ([ordered]@{
+            status = 'waiting-for-startup-slot'
+            frame_count = 0
+        })
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(30, $TimeoutSeconds))
+    while ([DateTime]::UtcNow -lt $deadline) {
+        Assert-OwnerProcessAlive
+        if ($CancelMarker -and (Test-Path -LiteralPath $CancelMarker)) {
+            return $false
+        }
+        try {
+            if ($Mutex.WaitOne([TimeSpan]::FromMilliseconds(500))) {
+                return $true
+            }
+        } catch {
+            $inner = $_.Exception.InnerException
+            if (($_.Exception -is [System.Threading.AbandonedMutexException]) -or ($inner -is [System.Threading.AbandonedMutexException])) {
+                return $true
+            }
+            throw
+        }
+    }
+    throw "Timed out waiting for the replay startup slot after $TimeoutSeconds seconds."
 }
 
 function Get-SharedGameDir {
@@ -1173,6 +1219,7 @@ import inspect
 import json
 import math
 import os
+import subprocess
 import sys
 import traceback
 from collections.abc import Mapping
@@ -1627,6 +1674,7 @@ import gzip
 import inspect
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -1647,6 +1695,44 @@ MAP_METADATA_CACHE = {}
 STATIC_BRIDGE_LINE_CACHE = {}
 TERRAIN_BRIDGE_LINE_CACHE = {}
 BRIDGE_FIELD_LINE_CACHE = {}
+FRAME_CAPTURE_PATH = os.environ.get('WOD_FRAME_CAPTURE_PATH', '').strip()
+try:
+    FRAME_CAPTURE_TICK = max(0, int(os.environ.get('WOD_FRAME_CAPTURE_TICK', '300')))
+except Exception:
+    FRAME_CAPTURE_TICK = 300
+FRAME_CAPTURE_COMPLETE = False
+VIDEO_OUTPUT_PATH = os.environ.get('WOD_VIDEO_OUTPUT_PATH', '').strip()
+VIDEO_FFMPEG_PATH = os.environ.get('WOD_VIDEO_FFMPEG_PATH', 'ffmpeg').strip() or 'ffmpeg'
+VIDEO_CANCEL_PATH = os.environ.get('WOD_VIDEO_CANCEL_PATH', '').strip()
+VIDEO_STATUS_PATH = os.environ.get('WOD_VIDEO_STATUS_PATH', '').strip()
+try:
+    VIDEO_PLAYBACK_SPEED = max(1, min(10, int(os.environ.get('WOD_VIDEO_PLAYBACK_SPEED', '10'))))
+except Exception:
+    VIDEO_PLAYBACK_SPEED = 10
+try:
+    VIDEO_BITRATE_KBPS = max(500, min(10000, int(os.environ.get('WOD_VIDEO_BITRATE_KBPS', '5000'))))
+except Exception:
+    VIDEO_BITRATE_KBPS = 5000
+try:
+    VIDEO_END_HOLD_SECONDS = max(2.0, min(10.0, float(os.environ.get('WOD_VIDEO_END_HOLD_SECONDS', '2'))))
+except Exception:
+    VIDEO_END_HOLD_SECONDS = 2.0
+try:
+    VIDEO_FPS = max(1, min(60, int(os.environ.get('WOD_VIDEO_FPS', '30'))))
+except Exception:
+    VIDEO_FPS = 30
+try:
+    VIDEO_WIDTH = max(320, min(3840, int(os.environ.get('WOD_VIDEO_WIDTH', '1280'))))
+    VIDEO_HEIGHT = max(180, min(2160, int(os.environ.get('WOD_VIDEO_HEIGHT', '720'))))
+except Exception:
+    VIDEO_WIDTH, VIDEO_HEIGHT = 1280, 720
+try:
+    VIDEO_MAX_FRAMES = max(0, int(os.environ.get('WOD_VIDEO_MAX_FRAMES', '0')))
+except Exception:
+    VIDEO_MAX_FRAMES = 0
+INSTALL_FRAME_HOOK = MODE == 'install-frame-hook'
+INSTALL_VIDEO_HOOK = MODE == 'install-video-hook'
+INSTALL_RENDER_HOOK = INSTALL_FRAME_HOOK or INSTALL_VIDEO_HOOK
 PROGRESS_PATH = ARTIFACT_PATH + '.progress.jsonl'
 SAMPLE_STREAM_PATH = STATS_PATH + '.samples.jsonl' if STATS_PATH else None
 PARTIAL_META_PATH = STATS_PATH + '.partial.meta.json' if STATS_PATH else None
@@ -2006,6 +2092,18 @@ def call_with_timeout(label, func, timeout_seconds=3.0):
         }
     return result
 
+def call_scene_method(label, func, timeout_seconds=3.0, main_thread=False):
+    if not main_thread:
+        return call_with_timeout(label, func, timeout_seconds=timeout_seconds)
+    try:
+        return {'status': 'called', 'value': func()}
+    except Exception as exc:
+        return {
+            'status': 'failed',
+            'error': repr(exc),
+            'traceback': traceback.format_exc(limit=6),
+        }
+
 def write_json_atomic(path, value):
     directory = os.path.dirname(path)
     if directory:
@@ -2036,6 +2134,14 @@ def write_json_atomic(path, value):
         except Exception:
             pass
     return True
+
+def write_video_status(payload):
+    if not VIDEO_STATUS_PATH:
+        return False
+    value = dict(payload or {})
+    value.setdefault('path', VIDEO_OUTPUT_PATH)
+    value['updated_at_ms'] = int(time.time() * 1000)
+    return write_json_atomic(VIDEO_STATUS_PATH, value)
 
 def install_trace_hooks(attempts):
     main = sys.modules.get('__main__')
@@ -4379,7 +4485,7 @@ def wait_for_play_scene(seconds=3.0):
         time.sleep(0.1)
     return find_active_play_scenes()
 
-def request_play_scene(home, scene_name, attempts):
+def request_play_scene(home, scene_name, attempts, main_thread=False):
     try:
         setattr(home, 'game_mode', 'replay')
         setattr(home, 'change_scene', scene_name)
@@ -4395,7 +4501,7 @@ def request_play_scene(home, scene_name, attempts):
     update = getattr(home, 'update', None)
     if callable_no_args(update):
         for index in range(4):
-            result = call_with_timeout('home-scene-update', update, timeout_seconds=2.0)
+            result = call_scene_method('home-scene-update', update, timeout_seconds=2.0, main_thread=main_thread)
             if result.get('status') != 'called':
                 attempts.append({
                     'method': 'HomeScene.update',
@@ -4408,9 +4514,12 @@ def request_play_scene(home, scene_name, attempts):
             if ready or get_game_objects():
                 return ready
             time.sleep(0.1)
-    return wait_for_play_scene(seconds=8.0)
+    # The game-thread path must not block the render loop while probing aliases.
+    # If the normal HomeScene transition does not materialize quickly, fall back
+    # to constructing PlayScene while the main thread owns the OpenGL context.
+    return wait_for_play_scene(seconds=0.25 if main_thread else 8.0)
 
-def attempt_play_scene_transition(play_scene, replay, attempts, label, replay_file_value=None, call_start_game=False):
+def attempt_play_scene_transition(play_scene, replay, attempts, label, replay_file_value=None, call_start_game=False, main_thread=False):
     record_progress({'phase': 'variant-start', 'label': label, 'call_start_game': call_start_game})
     prepared = prepare_play_scene_for_replay(play_scene, replay, replay_file_value)
     attempts.append({
@@ -4423,7 +4532,7 @@ def attempt_play_scene_transition(play_scene, replay, attempts, label, replay_fi
     try:
         if call_start_game:
             record_progress({'phase': 'variant-call-start-game', 'label': label})
-            call_result = call_with_timeout('start-game', play_scene.start_game, timeout_seconds=4.0)
+            call_result = call_scene_method('start-game', play_scene.start_game, timeout_seconds=4.0, main_thread=main_thread)
             if call_result.get('status') != 'called':
                 attempts.append({
                     'method': 'PlayScene.start_game.%s' % label,
@@ -4457,7 +4566,7 @@ def attempt_play_scene_transition(play_scene, replay, attempts, label, replay_fi
     for _ in range(12):
         try:
             record_progress({'phase': 'variant-update-before', 'label': label})
-            call_result = call_with_timeout('play-scene-update', play_scene.update, timeout_seconds=4.0)
+            call_result = call_scene_method('play-scene-update', play_scene.update, timeout_seconds=4.0, main_thread=main_thread)
             if call_result.get('status') != 'called':
                 record_progress({'phase': 'variant-update-timeout', 'label': label, 'result': call_result})
                 attempts.append({
@@ -4534,7 +4643,7 @@ def force_server_ready(attempts):
             changes[key] = '<failed: %s>' % exc
     attempts.append({'method': 'server_manager.force_ready', 'object': summarize_obj(server), 'changes': changes, 'status': 'set'})
 
-def poke_home_scene_start(attempts, replay):
+def poke_home_scene_start(attempts, replay, main_thread=False):
     install_trace_hooks(attempts)
     force_server_ready(attempts)
     experimental_variants = [
@@ -4553,7 +4662,7 @@ def poke_home_scene_start(attempts, replay):
         homes = find_instances('HomeScene', limit=5)
         for home in homes:
             for scene_name in ('play', 'PlayScene', 'game', 'replay'):
-                ready_play_scenes = request_play_scene(home, scene_name, attempts)
+                ready_play_scenes = request_play_scene(home, scene_name, attempts, main_thread=main_thread)
                 if not ready_play_scenes and not get_game_objects():
                     attempts.append({
                         'method': 'HomeScene.change_scene',
@@ -4570,6 +4679,7 @@ def poke_home_scene_start(attempts, replay):
                         label,
                         replay_file_value=replay_file_value,
                         call_start_game=call_start_game,
+                        main_thread=main_thread,
                     ):
                         attempts.append({
                             'method': 'HomeScene.change_scene',
@@ -4644,11 +4754,11 @@ def load_replay_summary():
             calls[name] = {'error': repr(exc)}
     return replay, calls
 
-def try_start_live_replay(candidates, replay):
+def try_start_live_replay(candidates, replay, main_thread=False):
     attempts = []
     main = sys.modules.get('__main__')
     if main is not None:
-        if poke_home_scene_start(attempts, replay):
+        if poke_home_scene_start(attempts, replay, main_thread=main_thread):
             return attempts
 
         play_scene_cls = getattr(main, 'PlayScene', None)
@@ -4699,6 +4809,131 @@ def try_start_live_replay(candidates, replay):
             except Exception as exc:
                 attempts.append({'method': method_name, 'object': summary, 'status': 'failed', 'error': repr(exc)})
     return attempts
+
+def install_main_thread_replay_start_hook(candidates, replay, artifact):
+    main = sys.modules.get('__main__')
+    home_cls = getattr(main, 'HomeScene', None) if main is not None else None
+    original_update = getattr(home_cls, 'update', None) if home_cls is not None else None
+    play_cls = getattr(main, 'PlayScene', None) if main is not None else None
+    original_play_update = getattr(play_cls, 'update', None) if play_cls is not None else None
+    if not callable(original_update):
+        return {'status': 'failed', 'error': 'HomeScene.update is not callable'}
+    if not callable(original_play_update):
+        return {'status': 'failed', 'error': 'PlayScene.update is not callable'}
+    if getattr(original_update, '_more_of_dots_replay_start_wrapped', False):
+        return {'status': 'already-installed'}
+
+    # Do not run the complete Home -> Play -> Game transition recursively from
+    # one callback. Each scene is prepared immediately before its normal update
+    # runs, keeping every OpenGL-sensitive operation on the game's main thread
+    # without blocking the render loop.
+    state = {
+        'status': 'waiting-for-home-update',
+        'home_updates': 0,
+        'play_updates': 0,
+        'attempts': [],
+    }
+    write_video_status({
+        'status': 'waiting-for-replay-start',
+        'phase': 'waiting-for-main-thread',
+        'frame_count': 0,
+    })
+
+    def persist_start_state():
+        artifact['start_attempts'] = list(state['attempts'])
+        artifact['main_thread_replay_start'] = {
+            'status': state['status'],
+            'home_updates': state['home_updates'],
+            'play_updates': state['play_updates'],
+            'game_object_count': len(get_game_objects()),
+            'game_scene_count': len(get_game_scene_objects()),
+            'thread_id': threading.get_ident(),
+        }
+        write_json_atomic(ARTIFACT_PATH, artifact)
+
+    def fail_start(phase, exc):
+        state['status'] = 'failed'
+        state['attempts'].append({
+            'method': phase,
+            'status': 'failed',
+            'error': repr(exc),
+            'traceback': traceback.format_exc(limit=8),
+        })
+        persist_start_state()
+        write_video_status({
+            'status': 'failed',
+            'phase': phase,
+            'frame_count': 0,
+            'error': repr(exc),
+        })
+
+    def replay_start_update_wrapper(home, *args, **kwargs):
+        state['home_updates'] += 1
+        if state['status'] == 'waiting-for-home-update':
+            try:
+                force_server_ready(state['attempts'])
+                setattr(home, 'game_mode', 'replay')
+                setattr(home, 'change_scene', 'play')
+                state['status'] = 'home-transition-requested'
+                state['attempts'].append({
+                    'method': 'HomeScene.change_scene',
+                    'arg': 'play',
+                    'status': 'set-on-main-thread',
+                })
+                persist_start_state()
+                write_video_status({
+                    'status': 'starting-replay',
+                    'phase': 'home-to-play',
+                    'frame_count': 0,
+                })
+            except Exception as exc:
+                fail_start('home-to-play', exc)
+        return original_update(home, *args, **kwargs)
+
+    def replay_start_play_update_wrapper(play_scene, *args, **kwargs):
+        state['play_updates'] += 1
+        if state['status'] in ('waiting-for-home-update', 'home-transition-requested'):
+            try:
+                prepared = prepare_play_scene_for_replay(play_scene, replay, 'replay1')
+                setattr(play_scene, 'change_scene', 'game')
+                state['status'] = 'play-transition-requested'
+                state['attempts'].append({
+                    'method': 'PlayScene.prepare-and-change-scene',
+                    'arg': 'game',
+                    'object': prepared,
+                    'status': 'set-on-main-thread',
+                })
+                persist_start_state()
+                write_video_status({
+                    'status': 'starting-replay',
+                    'phase': 'play-to-game',
+                    'frame_count': 0,
+                })
+            except Exception as exc:
+                fail_start('play-to-game', exc)
+        result = original_play_update(play_scene, *args, **kwargs)
+        if state['status'] == 'play-transition-requested' and get_game_objects():
+            state['status'] = 'started'
+            persist_start_state()
+            write_video_status({
+                'status': 'replay-started',
+                'phase': 'waiting-for-first-frame',
+                'frame_count': 0,
+            })
+        return result
+
+    replay_start_update_wrapper._more_of_dots_replay_start_wrapped = True
+    replay_start_play_update_wrapper._more_of_dots_replay_start_wrapped = True
+    setattr(home_cls, 'update', replay_start_update_wrapper)
+    setattr(play_cls, 'update', replay_start_play_update_wrapper)
+    if main is not None:
+        setattr(main, '_more_of_dots_replay_start_state', state)
+    return {
+        'status': 'installed',
+        'classes': [getattr(home_cls, '__name__', None), getattr(play_cls, '__name__', None)],
+        'methods': ['HomeScene.update', 'PlayScene.update'],
+        'strategy': 'main-thread-scene-state-machine',
+    }
 
 def get_game_objects():
     games = []
@@ -5237,6 +5472,325 @@ def set_simulation_speed(game_scenes):
                 'error': repr(exc),
             })
     return changes
+
+def maybe_capture_framebuffer(game_scenes, tick):
+    global FRAME_CAPTURE_COMPLETE
+    if FRAME_CAPTURE_COMPLETE or not FRAME_CAPTURE_PATH:
+        return None
+    tick_number = to_int(tick)
+    if tick_number is None or tick_number < FRAME_CAPTURE_TICK:
+        return None
+    result = {
+        'path': FRAME_CAPTURE_PATH,
+        'tick': tick_number,
+        'scene_count': len(game_scenes),
+        'render_calls': [],
+    }
+    try:
+        import pygame
+        for scene in game_scenes[:2]:
+            render = getattr(scene, 'render', None)
+            if not callable_no_args(render):
+                continue
+            try:
+                render()
+                result['render_calls'].append({'scene_id': hex(id(scene)), 'status': 'called'})
+            except Exception as exc:
+                result['render_calls'].append({'scene_id': hex(id(scene)), 'status': 'failed', 'error': repr(exc)})
+        surface = pygame.display.get_surface()
+        if surface is None:
+            raise RuntimeError('pygame.display.get_surface() returned None')
+        pygame.display.flip()
+        parent = os.path.dirname(FRAME_CAPTURE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        pygame.image.save(surface, FRAME_CAPTURE_PATH)
+        result.update({
+            'status': 'captured',
+            'size': list(surface.get_size()),
+            'bytes': os.path.getsize(FRAME_CAPTURE_PATH),
+        })
+        FRAME_CAPTURE_COMPLETE = True
+    except Exception as exc:
+        result.update({'status': 'failed', 'error': repr(exc)})
+    return result
+
+def install_main_thread_frame_hook():
+    capture_path = VIDEO_OUTPUT_PATH if INSTALL_VIDEO_HOOK else FRAME_CAPTURE_PATH
+    capture_kind = 'video' if INSTALL_VIDEO_HOOK else 'frame'
+    result = {'status': 'installing', 'path': capture_path, 'kind': capture_kind}
+    if not capture_path:
+        return {'status': 'failed', 'error': 'Capture output path is not configured'}
+    main = sys.modules.get('__main__')
+    scene_cls = getattr(main, 'aaadaa', None) if main is not None else None
+    if scene_cls is None:
+        return {'status': 'failed', 'error': '__main__.aaadaa is not available'}
+    original = getattr(scene_cls, 'render', None)
+    if not callable(original):
+        return {'status': 'failed', 'error': 'Game scene render method is not callable'}
+    state = {
+        'complete': False,
+        'speed_applied': False,
+        'speed_method': None,
+        'frame_count': 0,
+        'encoder': None,
+        'replay_end_reached': False,
+        'end_hold_frame_count': 0,
+    }
+    status_path = VIDEO_STATUS_PATH or (capture_path + '.status.json')
+    requested_end_tick = to_int(request.get('replay_metadata', {}).get('end')) if isinstance(request, dict) else None
+    # Include both endpoints so the result screen spans at least the requested
+    # duration in the encoded timeline (61 frames at 30 fps for two seconds).
+    end_hold_target_frames = max(2, int(round(VIDEO_FPS * VIDEO_END_HOLD_SECONDS)) + 1)
+
+    def write_frame_status(payload):
+        try:
+            if status_path == VIDEO_STATUS_PATH:
+                write_video_status(payload)
+            else:
+                write_json_atomic(status_path, payload)
+        except Exception:
+            pass
+
+    def stop_encoder():
+        encoder = state.get('encoder')
+        if encoder is None:
+            return 0, ''
+        try:
+            if encoder.stdin is not None:
+                encoder.stdin.close()
+        except Exception:
+            pass
+        try:
+            return_code = encoder.wait(timeout=30)
+        except Exception:
+            try:
+                encoder.kill()
+            except Exception:
+                pass
+            return_code = -1
+        try:
+            error_text = encoder.stderr.read().decode('utf-8', 'replace') if encoder.stderr is not None else ''
+        except Exception:
+            error_text = ''
+        state['encoder'] = None
+        return return_code, error_text[-4000:]
+
+    def start_encoder():
+        if state.get('encoder') is not None:
+            return state['encoder']
+        parent = os.path.dirname(capture_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        command = [
+            VIDEO_FFMPEG_PATH,
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-video_size', '%dx%d' % (VIDEO_WIDTH, VIDEO_HEIGHT),
+            '-framerate', str(VIDEO_FPS), '-i', '-',
+            '-an', '-c:v', 'libx264', '-preset', 'veryfast',
+            '-b:v', '%dk' % VIDEO_BITRATE_KBPS,
+            '-maxrate', '%dk' % VIDEO_BITRATE_KBPS,
+            '-bufsize', '%dk' % (VIDEO_BITRATE_KBPS * 2),
+            '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+            capture_path,
+        ]
+        state['encoder'] = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            creationflags=creation_flags,
+        )
+        state['encoder_command'] = command
+        return state['encoder']
+
+    def apply_playback_speed(scene):
+        if state['speed_applied']:
+            return
+        before = to_float(attrs_of(scene).get('ips'))
+        try:
+            import pygame
+            event_check = getattr(scene, 'event_check', None)
+            if callable(event_check):
+                events = [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0, unicode='') for _ in range(max(0, VIDEO_PLAYBACK_SPEED - 1))]
+                if events:
+                    event_check(events)
+                    state['speed_method'] = 'up-arrow-events'
+        except Exception:
+            pass
+        after = to_float(attrs_of(scene).get('ips'))
+        if after != float(VIDEO_PLAYBACK_SPEED):
+            try:
+                setattr(scene, 'ips', float(VIDEO_PLAYBACK_SPEED))
+                after = to_float(attrs_of(scene).get('ips'))
+                state['speed_method'] = 'direct-ips-fallback'
+            except Exception:
+                pass
+        elif state.get('speed_method') is None:
+            state['speed_method'] = 'already-at-target'
+        state['speed_before'] = before
+        state['speed_after'] = after
+        state['speed_applied'] = after == float(VIDEO_PLAYBACK_SPEED)
+
+    def render_wrapper(scene, *args, **kwargs):
+        apply_playback_speed(scene)
+        rendered = original(scene, *args, **kwargs)
+        if state['complete'] or not state['speed_applied']:
+            return rendered
+        try:
+            if INSTALL_VIDEO_HOOK and VIDEO_CANCEL_PATH and os.path.exists(VIDEO_CANCEL_PATH):
+                return_code, error_text = stop_encoder()
+                state['complete'] = True
+                if return_code not in (0, -1):
+                    raise RuntimeError('ffmpeg exited with code %s while cancelling: %s' % (return_code, error_text))
+                write_frame_status({
+                    'status': 'cancelled',
+                    'path': capture_path,
+                    'frame_count': state['frame_count'],
+                    'speed_after': state.get('speed_after'),
+                    'speed_method': state.get('speed_method'),
+                })
+                return rendered
+            tick = read_tick([scene, attrs_of(scene).get('core'), attrs_of(scene).get('game')])
+            if not INSTALL_VIDEO_HOOK and tick is not None and tick < FRAME_CAPTURE_TICK:
+                return rendered
+            import pygame
+            from OpenGL.GL import GL_RGB, GL_UNSIGNED_BYTE, glReadPixels
+            display_surface = pygame.display.get_surface()
+            if display_surface is None:
+                raise RuntimeError('pygame.display.get_surface() returned None')
+            width, height = display_surface.get_size()
+            pixels = glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE)
+            if not isinstance(pixels, (bytes, bytearray)):
+                pixels = bytes(pixels)
+            frame_surface = pygame.image.fromstring(pixels, (width, height), 'RGB', True)
+            if INSTALL_VIDEO_HOOK:
+                if frame_surface.get_size() != (VIDEO_WIDTH, VIDEO_HEIGHT):
+                    frame_surface = pygame.transform.scale(frame_surface, (VIDEO_WIDTH, VIDEO_HEIGHT))
+                encoder = start_encoder()
+                encoder.stdin.write(pygame.image.tostring(frame_surface, 'RGB'))
+                state['frame_count'] += 1
+                reached_limit = VIDEO_MAX_FRAMES > 0 and state['frame_count'] >= VIDEO_MAX_FRAMES
+                reached_end = requested_end_tick is not None and tick is not None and tick >= requested_end_tick
+                if reached_end:
+                    state['replay_end_reached'] = True
+                if state['replay_end_reached']:
+                    state['end_hold_frame_count'] += 1
+                end_hold_complete = state['replay_end_reached'] and state['end_hold_frame_count'] >= end_hold_target_frames
+                if reached_limit or end_hold_complete:
+                    return_code, error_text = stop_encoder()
+                    if return_code != 0:
+                        raise RuntimeError('ffmpeg exited with code %s: %s' % (return_code, error_text))
+                    state['complete'] = True
+                    write_frame_status({
+                        'status': 'completed',
+                        'path': capture_path,
+                        'bytes': os.path.getsize(capture_path),
+                        'source_size': [width, height],
+                        'output_size': [VIDEO_WIDTH, VIDEO_HEIGHT],
+                        'fps': VIDEO_FPS,
+                        'bitrate_kbps': VIDEO_BITRATE_KBPS,
+                        'tick': tick,
+                        'end_tick': requested_end_tick,
+                        'frame_count': state['frame_count'],
+                        'speed_before': state.get('speed_before'),
+                        'speed_after': state.get('speed_after'),
+                        'speed_method': state.get('speed_method'),
+                        'end_hold_seconds': VIDEO_END_HOLD_SECONDS,
+                        'end_hold_frames': state['end_hold_frame_count'],
+                        'completion_reason': 'frame-limit' if reached_limit else 'replay-end-hold',
+                    })
+                elif state['frame_count'] == 1 or state['frame_count'] % VIDEO_FPS == 0:
+                    write_frame_status({
+                        'status': 'finishing' if state['replay_end_reached'] else 'recording',
+                        'path': capture_path,
+                        'output_size': [VIDEO_WIDTH, VIDEO_HEIGHT],
+                        'fps': VIDEO_FPS,
+                        'bitrate_kbps': VIDEO_BITRATE_KBPS,
+                        'tick': tick,
+                        'end_tick': requested_end_tick,
+                        'frame_count': state['frame_count'],
+                        'speed_after': state.get('speed_after'),
+                        'speed_method': state.get('speed_method'),
+                        'end_hold_frames': state['end_hold_frame_count'],
+                        'end_hold_target_frames': end_hold_target_frames,
+                    })
+            else:
+                state['frame_count'] += 1
+                parent = os.path.dirname(capture_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                temporary_frame_path = capture_path + '.tmp.png'
+                pygame.image.save(frame_surface, temporary_frame_path)
+                os.replace(temporary_frame_path, capture_path)
+                state['complete'] = True
+                write_frame_status({
+                    'status': 'captured',
+                    'path': capture_path,
+                    'bytes': os.path.getsize(capture_path),
+                    'size': [width, height],
+                    'tick': tick,
+                    'frame_count': state['frame_count'],
+                    'speed_before': state.get('speed_before'),
+                    'speed_after': state.get('speed_after'),
+                    'speed_method': state.get('speed_method'),
+                })
+        except Exception as exc:
+            stop_encoder()
+            state['complete'] = True
+            write_frame_status({
+                'status': 'failed',
+                'path': capture_path,
+                'frame_count': state['frame_count'],
+                'speed_before': state.get('speed_before'),
+                'speed_after': state.get('speed_after'),
+                'speed_method': state.get('speed_method'),
+                'error': repr(exc),
+            })
+        return rendered
+
+    setattr(scene_cls, 'render', render_wrapper)
+    driver_classes = []
+    for driver_name in ('HomeScene', 'PlayScene'):
+        driver_cls = getattr(main, driver_name, None) if main is not None else None
+        driver_render = getattr(driver_cls, 'render', None) if driver_cls is not None else None
+        if not callable(driver_render):
+            continue
+
+        def make_driver_wrapper(original_driver_render):
+            def driver_wrapper(driver_scene, *args, **kwargs):
+                rendered = original_driver_render(driver_scene, *args, **kwargs)
+                if state['complete']:
+                    return rendered
+                game_scene = getattr(main, '_codex_last_game_scene', None) if main is not None else None
+                if game_scene is None:
+                    return rendered
+                try:
+                    update = getattr(game_scene, 'update', None)
+                    if callable_no_args(update):
+                        update()
+                    game_scene.render()
+                except Exception as exc:
+                    state['complete'] = True
+                    stop_encoder()
+                    write_frame_status({
+                        'status': 'failed',
+                        'path': capture_path,
+                        'frame_count': state['frame_count'],
+                        'error': 'Main-thread replay driver failed: %r' % (exc,),
+                    })
+                return rendered
+            return driver_wrapper
+
+        setattr(driver_cls, 'render', make_driver_wrapper(driver_render))
+        driver_classes.append(driver_name)
+    if main is not None:
+        setattr(main, '_more_of_dots_frame_hook_state', state)
+    result.update({'status': 'installed', 'class': getattr(scene_cls, '__name__', None), 'driver_classes': driver_classes, 'kind': capture_kind})
+    return result
 
 def pump_live_scene_updates(game_scenes, replay, end_tick, frame_budget=None):
     frames_per_sample = resolve_fast_forward_frame_budget(frame_budget)
@@ -5961,6 +6515,7 @@ try:
         'start_attempts': [],
         'advance_calls': [],
         'speed_changes': [],
+        'framebuffer_captures': [],
         'scene_update_pumps': [],
         'capture_config': {
             'sample_hz': SAMPLE_HZ,
@@ -5998,15 +6553,25 @@ try:
     troop_slots_seen = set()
     map_payload = None
     teams = build_teams(replay, [])
+    games = []
+    game_scenes = []
+    city_owner_transition_total = 0
     end_tick = to_int(request.get('replay_metadata', {}).get('end'))
     if end_tick is None and isinstance(replay, dict):
         end_tick = to_int(replay.get('end'))
-    if MODE in ('sample-live-state', 'capture-live-replay'):
-        artifact['start_attempts'] = try_start_live_replay(candidates, replay)
-        time.sleep(0.75)
-        candidates = merge_known_candidates(candidates)
-        artifact['target_inventory_after_start'] = target_inventory()
-        sample_total = max(1, int(MAX_SAMPLES))
+    if MODE in ('sample-live-state', 'capture-live-replay', 'install-frame-hook', 'install-video-hook'):
+        if INSTALL_VIDEO_HOOK:
+            artifact['replay_start_hook'] = install_main_thread_replay_start_hook(candidates, replay, artifact)
+            artifact['frame_hook'] = install_main_thread_frame_hook()
+            artifact['target_inventory_after_start'] = target_inventory()
+        else:
+            artifact['start_attempts'] = try_start_live_replay(candidates, replay)
+            time.sleep(0.75)
+            candidates = merge_known_candidates(candidates)
+            artifact['target_inventory_after_start'] = target_inventory()
+            if INSTALL_RENDER_HOOK:
+                artifact['frame_hook'] = install_main_thread_frame_hook()
+        sample_total = 0 if INSTALL_RENDER_HOOK else max(1, int(MAX_SAMPLES))
         if not get_game_objects():
             sample_total = min(sample_total, 5)
         capture_start_ms = int(time.time() * 1000)
@@ -6036,7 +6601,6 @@ try:
         previous_rate_tick = None
         previous_rate_ms = None
         previous_city_owner_state = None
-        city_owner_transition_total = 0
         active_fast_forward_frames = FAST_FORWARD_FRAMES_PER_SAMPLE
         last_pump_frame_budget = None
         last_pump_timing_ms = None
@@ -6075,6 +6639,9 @@ try:
             tick = live_tick if live_tick is not None else candidate_tick
             sample_tick = tick if tick is not None else (tick_from_replay if tick_from_replay is not None else index)
             timing_end(sample_timing, 'read_tick', step_start)
+            framebuffer_capture = maybe_capture_framebuffer(game_scenes, sample_tick)
+            if framebuffer_capture is not None:
+                artifact['framebuffer_captures'].append(framebuffer_capture)
             refresh_troop_cache = index == 0 or (index % TROOP_CACHE_REFRESH_SAMPLES == 0)
             step_start = timing_start()
             troops = collect_troops(troop_sources, refresh=refresh_troop_cache)
@@ -6492,6 +7059,305 @@ function Invoke-LiveStateExperiment([string]$Id, [string]$Mode) {
     }
 }
 
+function Invoke-FrameCapturePoc([string]$Id) {
+    $jobRoot = Get-JobRoot $Id
+    $requestPath = Join-Path $jobRoot 'capture-request.json'
+    if (-not (Test-Path -LiteralPath $requestPath)) {
+        throw "Capture request not found: $requestPath"
+    }
+    if (-not $FrameOutput) {
+        $script:FrameOutput = Join-Path $jobRoot 'poc-main-thread-frame.png'
+    }
+    $resolvedFrameOutput = [System.IO.Path]::GetFullPath($FrameOutput)
+    $frameStatusPath = $resolvedFrameOutput + '.status.json'
+    $artifactPath = Join-Path $jobRoot 'frame-poc-artifact.json'
+
+    $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $builtDll = Join-Path $root 'tools\python-probe-dll\target\release\wod_python_probe.dll'
+    if (-not (Test-Path -LiteralPath $builtDll)) {
+        throw "Python probe DLL is not built: $builtDll"
+    }
+
+    $probeRoot = Join-Path $jobRoot 'probe\game-frame-poc'
+    New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
+    $probeDll = Join-Path $probeRoot 'wod_python_probe.dll'
+    $payloadPath = Join-Path $probeRoot 'wod_python_probe_payload.py'
+    $statusPath = Join-Path $probeRoot 'wod_python_probe.status.json'
+    Remove-Item -LiteralPath $resolvedFrameOutput, $frameStatusPath, $artifactPath, ($artifactPath + '.error.txt'), $statusPath -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $builtDll -Destination $probeDll -Force
+    Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath '' -ArtifactPath $artifactPath -Mode 'install-frame-hook' -SampleHz 1 -MaxSamples 1) -Encoding UTF8
+
+    $previousFrameOutput = $env:WOD_FRAME_CAPTURE_PATH
+    $previousFrameTick = $env:WOD_FRAME_CAPTURE_TICK
+    $env:WOD_FRAME_CAPTURE_PATH = $resolvedFrameOutput
+    if (-not $env:WOD_FRAME_CAPTURE_TICK) {
+        $env:WOD_FRAME_CAPTURE_TICK = '0'
+    }
+
+    $process = $null
+    $slotState = $null
+    try {
+        [void](Use-JobGameRuntime -Id $Id)
+        $slotState = Prepare-ReplaySlot -Id $Id
+        $process = Start-GameProcess -OwnerJobId $Id
+        $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
+        if ($hWnd -eq [IntPtr]::Zero) {
+            throw 'War of Dots window was not found.'
+        }
+        Apply-WindowStrategy -WindowHandle $hWnd
+
+        $injector = Join-Path $PSScriptRoot 'invoke-python-probe.ps1'
+        $injectResult = Invoke-HiddenPowerShellFile -FilePath $injector -Arguments @(
+            '-ProcessId', [string]$process.Id,
+            '-ProbeDll', $probeDll,
+            '-TimeoutSeconds', '30'
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Frame capture injector failed with exit code $LASTEXITCODE."
+        }
+
+        $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(15, [Math]::Min($MaxSeconds, 180)))
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-Path -LiteralPath $frameStatusPath) {
+                break
+            }
+            if ($process.HasExited) {
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+
+        $frameStatus = if (Test-Path -LiteralPath $frameStatusPath) { Read-JsonFile $frameStatusPath } else { $null }
+        if (-not (Test-Path -LiteralPath $resolvedFrameOutput)) {
+            $detail = if ($frameStatus -and $frameStatus.error) { [string]$frameStatus.error } else { 'The main-thread frame hook did not produce an image before the timeout.' }
+            throw $detail
+        }
+        Write-JsonResult @{
+            ok = $true
+            status = 'captured'
+            source = 'pygame-opengl-main-thread'
+            job_id = $Id
+            frame_path = $resolvedFrameOutput
+            frame_bytes = (Get-Item -LiteralPath $resolvedFrameOutput).Length
+            frame_status = $frameStatus
+            artifact_path = $artifactPath
+            inject_result = $injectResult
+        }
+    } finally {
+        [void](Stop-CaptureGameProcess -Process $process -OwnerJobId $Id)
+        Close-AutomationDesktop
+        Restore-ReplaySlot $slotState
+        Clear-JobGameRuntime -Id $Id
+        if ($null -eq $previousFrameOutput) { Remove-Item Env:WOD_FRAME_CAPTURE_PATH -ErrorAction SilentlyContinue } else { $env:WOD_FRAME_CAPTURE_PATH = $previousFrameOutput }
+        if ($null -eq $previousFrameTick) { Remove-Item Env:WOD_FRAME_CAPTURE_TICK -ErrorAction SilentlyContinue } else { $env:WOD_FRAME_CAPTURE_TICK = $previousFrameTick }
+    }
+}
+
+function Invoke-VideoCapturePoc([string]$Id) {
+    $jobRoot = Get-JobRoot $Id
+    $requestPath = Join-Path $jobRoot 'capture-request.json'
+    if (-not (Test-Path -LiteralPath $requestPath)) {
+        throw "Capture request not found: $requestPath"
+    }
+    if (-not $VideoOutput) {
+        $script:VideoOutput = Join-Path $jobRoot 'poc-video.mp4'
+    }
+    $resolvedVideoOutput = [System.IO.Path]::GetFullPath($VideoOutput)
+    $videoStatusPath = if ($StatusPath) { [System.IO.Path]::GetFullPath($StatusPath) } else { $resolvedVideoOutput + '.status.json' }
+    $artifactPath = Join-Path $jobRoot $(if ($RecordReplay) { 'video-recording-artifact.json' } else { 'video-poc-artifact.json' })
+    $resolvedFfmpeg = if ($FfmpegPath) { (Resolve-Path -LiteralPath $FfmpegPath).Path } else { (Get-Command ffmpeg.exe -ErrorAction Stop).Source }
+
+    $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $builtDll = Join-Path $root 'tools\python-probe-dll\target\release\wod_python_probe.dll'
+    if (-not (Test-Path -LiteralPath $builtDll)) {
+        throw "Python probe DLL is not built: $builtDll"
+    }
+
+    $probeRoot = Join-Path $jobRoot 'probe\game-video-poc'
+    New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
+    $probeDll = Join-Path $probeRoot 'wod_python_probe.dll'
+    $payloadPath = Join-Path $probeRoot 'wod_python_probe_payload.py'
+    $statusPath = Join-Path $probeRoot 'wod_python_probe.status.json'
+    Remove-Item -LiteralPath $resolvedVideoOutput, $videoStatusPath, $artifactPath, ($artifactPath + '.error.txt'), $statusPath -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $builtDll -Destination $probeDll -Force
+    Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath '' -ArtifactPath $artifactPath -Mode 'install-video-hook' -SampleHz 1 -MaxSamples 1) -Encoding UTF8
+
+    $previousVideoOutput = $env:WOD_VIDEO_OUTPUT_PATH
+    $previousVideoFfmpeg = $env:WOD_VIDEO_FFMPEG_PATH
+    $previousVideoMaxFrames = $env:WOD_VIDEO_MAX_FRAMES
+    $previousVideoCancelPath = $env:WOD_VIDEO_CANCEL_PATH
+    $previousVideoStatusPath = $env:WOD_VIDEO_STATUS_PATH
+    $previousVideoPlaybackSpeed = $env:WOD_VIDEO_PLAYBACK_SPEED
+    $previousVideoBitrate = $env:WOD_VIDEO_BITRATE_KBPS
+    $previousVideoWidth = $env:WOD_VIDEO_WIDTH
+    $previousVideoHeight = $env:WOD_VIDEO_HEIGHT
+    $resolvedVideoHeight = if ($VideoHeight -in @(480, 720, 1080)) { $VideoHeight } else { 720 }
+    $resolvedVideoWidth = switch ($resolvedVideoHeight) { 480 { 854 } 1080 { 1920 } default { 1280 } }
+    $env:WOD_VIDEO_OUTPUT_PATH = $resolvedVideoOutput
+    $env:WOD_VIDEO_FFMPEG_PATH = $resolvedFfmpeg
+    $env:WOD_VIDEO_MAX_FRAMES = [string]([Math]::Max(0, $VideoMaxFrames))
+    $env:WOD_VIDEO_STATUS_PATH = $videoStatusPath
+    $env:WOD_VIDEO_PLAYBACK_SPEED = [string]([Math]::Max(1, [Math]::Min(10, $PlaybackSpeed)))
+    $env:WOD_VIDEO_BITRATE_KBPS = [string]([Math]::Max(500, [Math]::Min(10000, $VideoBitrateKbps)))
+    $env:WOD_VIDEO_WIDTH = [string]$resolvedVideoWidth
+    $env:WOD_VIDEO_HEIGHT = [string]$resolvedVideoHeight
+    if ($CancelPath) { $env:WOD_VIDEO_CANCEL_PATH = [System.IO.Path]::GetFullPath($CancelPath) } else { Remove-Item Env:WOD_VIDEO_CANCEL_PATH -ErrorAction SilentlyContinue }
+
+    $process = $null
+    $slotState = $null
+    $startupMutex = New-Object System.Threading.Mutex($false, $ReplayStartupMutexName)
+    $startupLockOwned = $false
+    try {
+        $startupLockOwned = Wait-ReplayStartupLock -Mutex $startupMutex -CancelMarker $CancelPath -RunnerStatusPath $videoStatusPath -TimeoutSeconds ([Math]::Max(60, $MaxSeconds))
+        if (-not $startupLockOwned) {
+            Write-JsonFile -Path $videoStatusPath -Data ([ordered]@{
+                status = 'cancelled'
+                frame_count = 0
+                phase = 'waiting-for-startup-slot'
+            })
+            Write-JsonResult @{
+                ok = $false
+                status = 'cancelled'
+                job_id = $Id
+                video_path = $resolvedVideoOutput
+            }
+            return
+        }
+        Write-JsonFile -Path $videoStatusPath -Data ([ordered]@{
+            status = 'launching-game'
+            frame_count = 0
+            phase = 'startup'
+        })
+        [void](Use-JobGameRuntime -Id $Id)
+        $slotState = Prepare-ReplaySlot -Id $Id
+        $process = Start-GameProcess -OwnerJobId $Id
+        $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
+        if ($hWnd -eq [IntPtr]::Zero) {
+            throw 'War of Dots window was not found.'
+        }
+        Apply-WindowStrategy -WindowHandle $hWnd
+
+        $injector = Join-Path $PSScriptRoot 'invoke-python-probe.ps1'
+        $injectResult = Invoke-HiddenPowerShellFile -FilePath $injector -Arguments @(
+            '-ProcessId', [string]$process.Id,
+            '-ProbeDll', $probeDll,
+            '-TimeoutSeconds', '30'
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Video capture injector failed with exit code $LASTEXITCODE."
+        }
+
+        $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(30, $MaxSeconds))
+        $startupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        $lastProgressAt = [DateTime]::UtcNow
+        $lastStatusContents = ''
+        $firstFrameSeen = $false
+        $videoStatus = $null
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($CancelPath -and (Test-Path -LiteralPath $CancelPath)) {
+                $videoStatus = [pscustomobject]@{ status = 'cancelled'; frame_count = 0; phase = 'runner-watchdog' }
+                Write-JsonFile -Path $videoStatusPath -Data $videoStatus
+                break
+            }
+            if (Test-Path -LiteralPath $videoStatusPath) {
+                try {
+                    $statusContents = Get-Content -LiteralPath $videoStatusPath -Raw
+                    $videoStatus = $statusContents | ConvertFrom-Json
+                    if ($statusContents -ne $lastStatusContents) {
+                        $lastStatusContents = $statusContents
+                        $lastProgressAt = [DateTime]::UtcNow
+                    }
+                } catch { $videoStatus = $null }
+                $frameCount = if ($videoStatus -and $null -ne $videoStatus.frame_count) { [int]$videoStatus.frame_count } else { 0 }
+                if ($frameCount -gt 0 -and -not $firstFrameSeen) {
+                    $firstFrameSeen = $true
+                    if ($startupLockOwned) {
+                        [void]$startupMutex.ReleaseMutex()
+                        $startupLockOwned = $false
+                    }
+                }
+                if ($videoStatus -and $videoStatus.status -in @('completed', 'cancelled', 'failed')) {
+                    break
+                }
+            }
+            if (-not $firstFrameSeen -and [DateTime]::UtcNow -ge $startupDeadline) {
+                $videoStatus = [pscustomobject]@{
+                    status = 'failed'
+                    frame_count = 0
+                    phase = 'startup-watchdog'
+                    error = 'Replay startup produced no first video frame within 30 seconds.'
+                }
+                Write-JsonFile -Path $videoStatusPath -Data $videoStatus
+                break
+            }
+            if ($firstFrameSeen -and ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge 45) {
+                $videoStatus = [pscustomobject]@{
+                    status = 'failed'
+                    frame_count = if ($videoStatus -and $null -ne $videoStatus.frame_count) { [int]$videoStatus.frame_count } else { 0 }
+                    phase = 'progress-watchdog'
+                    error = 'Replay recording made no frame or status progress for 45 seconds.'
+                }
+                Write-JsonFile -Path $videoStatusPath -Data $videoStatus
+                break
+            }
+            if ($process.HasExited) {
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+
+        if ($videoStatus -and $videoStatus.status -eq 'cancelled') {
+            Write-JsonResult @{
+                ok = $false
+                status = 'cancelled'
+                job_id = $Id
+                video_path = $resolvedVideoOutput
+                video_status = $videoStatus
+            }
+            return
+        }
+        if (-not $videoStatus -or $videoStatus.status -ne 'completed' -or -not (Test-Path -LiteralPath $resolvedVideoOutput)) {
+            $detail = if ($videoStatus -and $videoStatus.error) { [string]$videoStatus.error } else { 'The main-thread video hook did not complete before the timeout.' }
+            throw $detail
+        }
+        Write-JsonResult @{
+            ok = $true
+            status = 'completed'
+            source = 'pygame-opengl-ffmpeg-main-thread'
+            job_id = $Id
+            video_path = $resolvedVideoOutput
+            video_bytes = (Get-Item -LiteralPath $resolvedVideoOutput).Length
+            video_status = $videoStatus
+            artifact_path = $artifactPath
+            inject_result = $injectResult
+        }
+    } finally {
+        if ($startupLockOwned) {
+            try { [void]$startupMutex.ReleaseMutex() } catch {}
+            $startupLockOwned = $false
+        }
+        $startupMutex.Dispose()
+        [void](Stop-CaptureGameProcess -Process $process -OwnerJobId $Id)
+        foreach ($encoder in @(Get-CimInstance Win32_Process -Filter "Name = 'ffmpeg.exe'" -ErrorAction SilentlyContinue)) {
+            if ([string]$encoder.CommandLine -like "*$resolvedVideoOutput*") {
+                Stop-Process -Id ([int]$encoder.ProcessId) -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Close-AutomationDesktop
+        Restore-ReplaySlot $slotState
+        Clear-JobGameRuntime -Id $Id
+        if ($null -eq $previousVideoOutput) { Remove-Item Env:WOD_VIDEO_OUTPUT_PATH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_OUTPUT_PATH = $previousVideoOutput }
+        if ($null -eq $previousVideoFfmpeg) { Remove-Item Env:WOD_VIDEO_FFMPEG_PATH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_FFMPEG_PATH = $previousVideoFfmpeg }
+        if ($null -eq $previousVideoMaxFrames) { Remove-Item Env:WOD_VIDEO_MAX_FRAMES -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_MAX_FRAMES = $previousVideoMaxFrames }
+        if ($null -eq $previousVideoCancelPath) { Remove-Item Env:WOD_VIDEO_CANCEL_PATH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_CANCEL_PATH = $previousVideoCancelPath }
+        if ($null -eq $previousVideoStatusPath) { Remove-Item Env:WOD_VIDEO_STATUS_PATH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_STATUS_PATH = $previousVideoStatusPath }
+        if ($null -eq $previousVideoPlaybackSpeed) { Remove-Item Env:WOD_VIDEO_PLAYBACK_SPEED -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_PLAYBACK_SPEED = $previousVideoPlaybackSpeed }
+        if ($null -eq $previousVideoBitrate) { Remove-Item Env:WOD_VIDEO_BITRATE_KBPS -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_BITRATE_KBPS = $previousVideoBitrate }
+        if ($null -eq $previousVideoWidth) { Remove-Item Env:WOD_VIDEO_WIDTH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_WIDTH = $previousVideoWidth }
+        if ($null -eq $previousVideoHeight) { Remove-Item Env:WOD_VIDEO_HEIGHT -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_HEIGHT = $previousVideoHeight }
+    }
+}
+
 if ($Calibrate) {
     Run-Calibration
     exit 0
@@ -6528,6 +7394,21 @@ if ($CaptureReplay) {
     exit 0
 }
 
+if ($CaptureFramePoc) {
+    Invoke-FrameCapturePoc -Id $JobId
+    exit 0
+}
+
+if ($CaptureVideoPoc) {
+    Invoke-VideoCapturePoc -Id $JobId
+    exit 0
+}
+
+if ($RecordReplay) {
+    Invoke-VideoCapturePoc -Id $JobId
+    exit 0
+}
+
 if ($GamePythonCapture -or $CaptureLiveReplay) {
     Invoke-GamePythonCapture -Id $JobId
     exit 0
@@ -6535,6 +7416,6 @@ if ($GamePythonCapture -or $CaptureLiveReplay) {
 
 Write-JsonResult @{
     ok = $false
-    message = 'Specify -Calibrate, -CleanupJob, -PythonProbe, -ProbeReplayState, -SampleLiveState, -CaptureLiveReplay, -GamePythonCapture, or -CaptureReplay.'
+    message = 'Specify -Calibrate, -CleanupJob, -PythonProbe, -ProbeReplayState, -SampleLiveState, -CaptureLiveReplay, -GamePythonCapture, -CaptureFramePoc, -CaptureVideoPoc, -RecordReplay, or -CaptureReplay.'
 }
 exit 3

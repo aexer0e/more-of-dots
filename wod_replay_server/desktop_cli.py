@@ -601,6 +601,59 @@ def command_probe_file(
     return {"job": _job_response(job), "result": result}
 
 
+def command_record_replay(
+    runtime_dir: Path | None,
+    input_path: Path,
+    filename: str | None,
+    output_path: Path,
+    ffmpeg_path: Path,
+    cancel_path: Path,
+    status_path: Path,
+    playback_speed: int,
+    bitrate_kbps: int,
+    resolution_height: int,
+    owner_pid: int | None = None,
+) -> dict[str, Any]:
+    ctx = _load_backend(runtime_dir, owner_pid)
+    paths, document = _create_capture_job(ctx, input_path, filename)
+    if document is None:
+        return _job_response(ctx.store.read_job(paths))
+
+    output_path = output_path.expanduser().resolve()
+    ffmpeg_path = ffmpeg_path.expanduser().resolve()
+    cancel_path = cancel_path.expanduser().resolve()
+    status_path = status_path.expanduser().resolve()
+    if playback_speed not in {1, 2, 4, 6, 10}:
+        raise ValueError("Playback speed must be 1x, 2x, 4x, 6x, or 10x.")
+    if bitrate_kbps not in {500, 1000, 2500, 5000, 10000}:
+        raise ValueError("Video bitrate must use one of the supported presets.")
+    if resolution_height not in {480, 720, 1080}:
+        raise ValueError("Video resolution must be 480p, 720p, or 1080p.")
+    if not ffmpeg_path.is_file():
+        raise FileNotFoundError(f"FFmpeg was not found: {ffmpeg_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cancel_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ctx.store.update_job(paths, status="recording_replay")
+    result = ctx.replay_runner.record_replay(
+        paths.job_id,
+        output_path=output_path,
+        ffmpeg_path=ffmpeg_path,
+        cancel_path=cancel_path,
+        status_path=status_path,
+        playback_speed=playback_speed,
+        bitrate_kbps=bitrate_kbps,
+        resolution_height=resolution_height,
+        timeout_seconds=max(60, ctx.settings.capture_timeout_seconds),
+    )
+    ctx.store.append_log(paths, f"record-replay result: {result}")
+    final_status = "cancelled" if result.get("status") == "cancelled" else result.get("status", "failed")
+    ctx.store.update_job(paths, status=final_status, capture=result)
+    _cleanup_runtime(ctx, preserve_job_ids={paths.job_id})
+    return {"job_id": paths.job_id, "status": final_status, "result": result}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="War of Dots replay desktop backend command mode.")
     parser.add_argument("--desktop-command", required=True)
@@ -609,6 +662,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--filename", default=None)
     parser.add_argument("--job-id", default=None)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--ffmpeg", type=Path, default=None)
+    parser.add_argument("--cancel-path", type=Path, default=None)
+    parser.add_argument("--status-path", type=Path, default=None)
+    parser.add_argument("--playback-speed", type=int, default=10)
+    parser.add_argument("--bitrate-kbps", type=int, default=5000)
+    parser.add_argument("--resolution-height", type=int, default=720)
     parser.add_argument("--owner-pid", type=int, default=None)
     return parser
 
@@ -641,6 +701,22 @@ def run(argv: list[str] | None = None) -> int:
             if args.input is None:
                 raise ValueError(f"--input is required for {args.desktop_command}.")
             payload = command_probe_file(args.runtime_dir, args.input, args.filename, args.desktop_command, args.owner_pid)
+        elif args.desktop_command == "record-replay":
+            if args.input is None or args.output is None or args.ffmpeg is None or args.cancel_path is None or args.status_path is None:
+                raise ValueError("--input, --output, --ffmpeg, --cancel-path, and --status-path are required for record-replay.")
+            payload = command_record_replay(
+                args.runtime_dir,
+                args.input,
+                args.filename,
+                args.output,
+                args.ffmpeg,
+                args.cancel_path,
+                args.status_path,
+                args.playback_speed,
+                args.bitrate_kbps,
+                args.resolution_height,
+                args.owner_pid,
+            )
         else:
             raise ValueError(f"Unknown desktop command: {args.desktop_command}")
     except Exception as exc:

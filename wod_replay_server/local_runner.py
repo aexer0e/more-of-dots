@@ -358,6 +358,68 @@ class LocalSessionRunner:
 
         return capture
 
+    def record_replay(
+        self,
+        job_id: str,
+        *,
+        output_path: Path,
+        ffmpeg_path: Path,
+        cancel_path: Path,
+        status_path: Path,
+        playback_speed: int,
+        bitrate_kbps: int,
+        resolution_height: int,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        try:
+            command = self._runner_command(
+                [
+                    "-RecordReplay",
+                    "-JobId",
+                    job_id,
+                    "-VideoOutput",
+                    str(output_path),
+                    "-FfmpegPath",
+                    str(ffmpeg_path),
+                    "-CancelPath",
+                    str(cancel_path),
+                    "-StatusPath",
+                    str(status_path),
+                    "-PlaybackSpeed",
+                    str(playback_speed),
+                    "-VideoBitrateKbps",
+                    str(bitrate_kbps),
+                    "-VideoHeight",
+                    str(resolution_height),
+                    "-VideoMaxFrames",
+                    "0",
+                    "-MaxSeconds",
+                    str(timeout_seconds),
+                ],
+                timeout_ms=max(30_000, timeout_seconds * 1000),
+            )
+        except (OSError, ValueError) as exc:
+            return {"status": "failed", "phase": "record_replay", "message": str(exc)}
+
+        result, cleanup_events = self._run_owned_runner_command(
+            command,
+            job_id=job_id,
+            timeout_seconds=timeout_seconds + 30,
+        )
+        parsed = _parse_json_result(result.stdout) or {}
+        parsed_status = str(parsed.get("status", "")).lower()
+        status = "cancelled" if parsed_status == "cancelled" else ("succeeded" if result.returncode == 0 else "failed")
+        return {
+            "status": status,
+            "phase": "record_replay",
+            "source": "pygame-opengl-ffmpeg-main-thread",
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "runner_result": parsed,
+            "process_cleanup": cleanup_events,
+        }
+
     def probe_runtime(self, job_id: str | None = None, *, timeout_seconds: int = 90) -> dict[str, Any]:
         runner_args = ["-PythonProbe"]
         if job_id:

@@ -5,7 +5,8 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -13,11 +14,13 @@ use base64::Engine;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{
-    AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tauri_plugin_shell::ShellExt;
 
@@ -65,6 +68,18 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Default)]
 struct WindowOwnerProcesses {
     children: Mutex<HashMap<String, Child>>,
+}
+
+#[derive(Default)]
+struct ReplayRecordingControl {
+    state: Mutex<ReplayRecordingControlState>,
+}
+
+#[derive(Default)]
+struct ReplayRecordingControlState {
+    active: bool,
+    cancel_requested: bool,
+    current_cancel_paths: HashSet<PathBuf>,
 }
 
 fn spawn_owner_process(label: &str) -> Result<Child, String> {
@@ -4044,6 +4059,102 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
 }
 
+fn resolve_ffmpeg_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("ffmpeg.exe"));
+        candidates.push(resource_dir.join("bin").join("ffmpeg.exe"));
+    }
+    if let Ok(executable) = env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("ffmpeg.exe"));
+            candidates.push(parent.join("bin").join("ffmpeg.exe"));
+        }
+    }
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return Ok(path);
+    }
+
+    let output = Command::new("where.exe")
+        .arg("ffmpeg.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("Could not look for FFmpeg: {error}"))?;
+    if output.status.success() {
+        if let Some(path) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        {
+            return Ok(path);
+        }
+    }
+    Err("FFmpeg is required to record replay videos. Install FFmpeg or place ffmpeg.exe beside the app.".to_string())
+}
+
+fn safe_recording_file_name(requested_name: &str) -> String {
+    let requested = Path::new(requested_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("replay_10x.mp4");
+    let mut safe = requested
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while safe.ends_with(['.', ' ']) {
+        safe.pop();
+    }
+    if safe.is_empty() {
+        safe = "replay_10x.mp4".to_string();
+    }
+    let mut path = PathBuf::from(safe);
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+    {
+        path.set_extension("mp4");
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("replay_10x.mp4")
+        .to_string()
+}
+
+fn available_recording_path(
+    directory: &Path,
+    requested_name: &str,
+    reserved_paths: &mut HashSet<String>,
+) -> PathBuf {
+    let safe_name = safe_recording_file_name(requested_name);
+    let base = PathBuf::from(&safe_name);
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("replay_10x");
+    let mut candidate = directory.join(&base);
+    let mut suffix = 2;
+    while candidate.exists()
+        || candidate.with_extension("partial.mp4").exists()
+        || !reserved_paths.insert(path_key(&candidate))
+    {
+        candidate = directory.join(format!("{stem} ({suffix}).mp4"));
+        suffix += 1;
+    }
+    reserved_paths.insert(path_key(&candidate));
+    candidate
+}
+
 fn available_replay_download_path(directory: &Path, requested_name: &str) -> PathBuf {
     let requested = Path::new(requested_name)
         .file_name()
@@ -4303,6 +4414,23 @@ struct ReplayDownloadRequest {
     file_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayRecordingRequest {
+    file_path: String,
+    file_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayRecordingOptions {
+    destination_dir: String,
+    concurrency: usize,
+    playback_speed: u32,
+    bitrate_kbps: u32,
+    resolution_height: u32,
+}
+
 #[tauri::command]
 async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -4346,6 +4474,563 @@ async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, 
     })
     .await
     .map_err(|error| format!("Replay download task failed: {error}"))?
+}
+
+fn append_recording_manifest(
+    manifest_directory: &Path,
+    source_path: &Path,
+    video_path: &Path,
+    status: &Value,
+    options: &ReplayRecordingOptions,
+) -> Result<(), String> {
+    fs::create_dir_all(manifest_directory)
+        .map_err(|error| format!("Could not prepare replay recording app data: {error}"))?;
+    let manifest_path = manifest_directory.join("war-of-dots-replays.json");
+    let mut manifest = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"version": 1, "replays": []}));
+    let entries = manifest
+        .as_object_mut()
+        .and_then(|object| object.entry("replays").or_insert_with(|| json!([])).as_array_mut())
+        .ok_or_else(|| format!("Recording manifest is invalid: {}", manifest_path.display()))?;
+    entries.push(json!({
+        "sourceFile": source_path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+        "videoFile": video_path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+        "videoPath": video_path,
+        "speed": options.playback_speed,
+        "bitrateKbps": options.bitrate_kbps,
+        "resolutionHeight": options.resolution_height,
+        "exportedAt": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs()),
+        "recording": status,
+    }));
+    if let Some(object) = manifest.as_object_mut() {
+        object.insert(
+            "updatedAt".to_string(),
+            json!(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs())),
+        );
+    }
+    let temporary_path = manifest_directory.join("war-of-dots-replays.json.tmp");
+    let contents = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+    fs::write(&temporary_path, contents)
+        .map_err(|error| format!("Could not update replay video manifest: {error}"))?;
+    if manifest_path.exists() {
+        fs::remove_file(&manifest_path)
+            .map_err(|error| format!("Could not replace replay video manifest: {error}"))?;
+    }
+    fs::rename(&temporary_path, &manifest_path)
+        .map_err(|error| format!("Could not publish replay video manifest: {error}"))?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ReplayRecordingWork {
+    queue_index: usize,
+    replay: ReplayRecordingRequest,
+    source_path: PathBuf,
+    final_path: PathBuf,
+    partial_path: PathBuf,
+    status_path: PathBuf,
+    cancel_path: PathBuf,
+    display_name: String,
+}
+
+struct CompletedReplayRecording {
+    source_path: PathBuf,
+    final_path: PathBuf,
+    encoder_status: Value,
+}
+
+async fn record_one_replay(
+    app: AppHandle,
+    work: ReplayRecordingWork,
+    ffmpeg_path: PathBuf,
+    options: ReplayRecordingOptions,
+    total: usize,
+    concurrency: usize,
+    active_count: Arc<AtomicUsize>,
+    completed_count: Arc<AtomicUsize>,
+    failed_count: Arc<AtomicUsize>,
+    processed_count: Arc<AtomicUsize>,
+) -> Result<Option<CompletedReplayRecording>, String> {
+    {
+        let control = app.state::<ReplayRecordingControl>();
+        let mut state = control
+            .state
+            .lock()
+            .map_err(|_| "Replay recording control is unavailable.".to_string())?;
+        if state.cancel_requested {
+            return Ok(None);
+        }
+        state.current_cancel_paths.insert(work.cancel_path.clone());
+    }
+
+    let active = active_count.fetch_add(1, Ordering::Relaxed) + 1;
+    let processed = processed_count.load(Ordering::Relaxed);
+    let _ = app.emit(
+        "replay-recording-progress",
+        json!({
+            "stage": "starting",
+            "current": processed,
+            "processed": processed,
+            "succeeded": completed_count.load(Ordering::Relaxed),
+            "failed": failed_count.load(Ordering::Relaxed),
+            "total": total,
+            "active": active,
+            "queued": total.saturating_sub(processed.saturating_add(active)),
+            "percent": processed.saturating_mul(100) / total.max(1),
+            "concurrency": concurrency,
+            "queueIndex": work.queue_index,
+            "fileName": work.display_name,
+            "playbackSpeed": options.playback_speed,
+            "bitrateKbps": options.bitrate_kbps,
+            "resolutionHeight": options.resolution_height,
+        }),
+    );
+
+    let result = async {
+        let polling_done = Arc::new(AtomicBool::new(false));
+        let polling_done_for_task = Arc::clone(&polling_done);
+        let polling_app = app.clone();
+        let polling_status_path = work.status_path.clone();
+        let polling_name = work.display_name.clone();
+        let polling_active = Arc::clone(&active_count);
+        let polling_completed = Arc::clone(&completed_count);
+        let polling_failed = Arc::clone(&failed_count);
+        let polling_processed = Arc::clone(&processed_count);
+        let queue_index = work.queue_index;
+        let poll_task = tauri::async_runtime::spawn_blocking(move || {
+            let mut last_contents = String::new();
+            while !polling_done_for_task.load(Ordering::Relaxed) {
+                if let Ok(contents) = fs::read_to_string(&polling_status_path) {
+                    if contents != last_contents {
+                        last_contents = contents.clone();
+                        if let Ok(encoder) = serde_json::from_str::<Value>(&contents) {
+                            let processed = polling_processed.load(Ordering::Relaxed);
+                            let active = polling_active.load(Ordering::Relaxed);
+                            let _ = polling_app.emit(
+                                "replay-recording-progress",
+                                json!({
+                                    "stage": "recording",
+                                    "current": processed,
+                                    "processed": processed,
+                                    "succeeded": polling_completed.load(Ordering::Relaxed),
+                                    "failed": polling_failed.load(Ordering::Relaxed),
+                                    "total": total,
+                                    "active": active,
+                                    "queued": total.saturating_sub(processed.saturating_add(active)),
+                                    "percent": processed.saturating_mul(100) / total.max(1),
+                                    "concurrency": concurrency,
+                                    "queueIndex": queue_index,
+                                    "fileName": polling_name,
+                                    "encoder": encoder,
+                                }),
+                            );
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempt_succeeded = false;
+        let mut cancelled = false;
+        let mut last_error = format!("The replay recorder did not produce {}.", work.display_name);
+        for attempt in 1..=MAX_ATTEMPTS {
+            let processed = processed_count.load(Ordering::Relaxed);
+            let active = active_count.load(Ordering::Relaxed);
+            let _ = app.emit(
+                "replay-recording-progress",
+                json!({
+                    "stage": if attempt == 1 { "starting" } else { "retrying" },
+                    "current": processed,
+                    "processed": processed,
+                    "succeeded": completed_count.load(Ordering::Relaxed),
+                    "failed": failed_count.load(Ordering::Relaxed),
+                    "total": total,
+                    "active": active,
+                    "queued": total.saturating_sub(processed.saturating_add(active)),
+                    "percent": processed.saturating_mul(100) / total.max(1),
+                    "concurrency": concurrency,
+                    "queueIndex": work.queue_index,
+                    "fileName": work.display_name,
+                    "attempt": attempt,
+                    "maxAttempts": MAX_ATTEMPTS,
+                }),
+            );
+
+            let backend_result = run_backend_for_window(
+                &app,
+                "replay-recorder",
+                "record-replay",
+                vec![
+                    "--input".to_string(),
+                    work.source_path.to_string_lossy().to_string(),
+                    "--filename".to_string(),
+                    work.replay.file_name.clone(),
+                    "--output".to_string(),
+                    work.partial_path.to_string_lossy().to_string(),
+                    "--ffmpeg".to_string(),
+                    ffmpeg_path.to_string_lossy().to_string(),
+                    "--cancel-path".to_string(),
+                    work.cancel_path.to_string_lossy().to_string(),
+                    "--status-path".to_string(),
+                    work.status_path.to_string_lossy().to_string(),
+                    "--playback-speed".to_string(),
+                    options.playback_speed.to_string(),
+                    "--bitrate-kbps".to_string(),
+                    options.bitrate_kbps.to_string(),
+                    "--resolution-height".to_string(),
+                    options.resolution_height.to_string(),
+                ],
+            )
+            .await;
+
+            let cancel_requested = app
+                .state::<ReplayRecordingControl>()
+                .state
+                .lock()
+                .map_err(|_| "Replay recording control is unavailable.".to_string())?
+                .cancel_requested;
+            match backend_result {
+                Ok(response) => {
+                    let response_status = response
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if cancel_requested || response_status == "cancelled" {
+                        cancelled = true;
+                        break;
+                    }
+                    if response_status == "succeeded" && work.partial_path.is_file() {
+                        attempt_succeeded = true;
+                        break;
+                    }
+                    let detail = response
+                        .pointer("/result/stderr")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .or_else(|| response.pointer("/result/message").and_then(Value::as_str));
+                    last_error = detail.map_or_else(
+                        || format!("The replay recorder did not produce {}.", work.display_name),
+                        |message| format!("{}: {message}", work.display_name),
+                    );
+                }
+                Err(error) => {
+                    if cancel_requested {
+                        cancelled = true;
+                        break;
+                    }
+                    last_error = error;
+                }
+            }
+            let _ = fs::remove_file(&work.partial_path);
+            let _ = fs::remove_file(&work.status_path);
+        }
+        polling_done.store(true, Ordering::Relaxed);
+        let _ = poll_task.await;
+
+        if cancelled {
+            return Ok(None);
+        }
+        if !attempt_succeeded {
+            return Err(format!("{last_error} Failed after {MAX_ATTEMPTS} attempts."));
+        }
+
+        fs::rename(&work.partial_path, &work.final_path)
+            .map_err(|error| format!("Could not publish {}: {error}", work.final_path.display()))?;
+        let encoder_status = fs::read_to_string(&work.status_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+            .unwrap_or_else(|| json!({
+                "status": "completed",
+                "speedAfter": options.playback_speed,
+                "bitrateKbps": options.bitrate_kbps,
+                "resolutionHeight": options.resolution_height,
+        }));
+        let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let active_after = active_count.load(Ordering::Relaxed).saturating_sub(1);
+        let _ = app.emit(
+            "replay-recording-progress",
+            json!({
+                "stage": "completed-file",
+                "current": processed,
+                "processed": processed,
+                "succeeded": completed,
+                "failed": failed_count.load(Ordering::Relaxed),
+                "total": total,
+                "active": active_after,
+                "queued": total.saturating_sub(processed.saturating_add(active_after)),
+                "percent": processed.saturating_mul(100) / total.max(1),
+                "concurrency": concurrency,
+                "queueIndex": work.queue_index,
+                "fileName": work.display_name,
+                "outputPath": work.final_path,
+            }),
+        );
+        Ok(Some(CompletedReplayRecording {
+            source_path: work.source_path.clone(),
+            final_path: work.final_path.clone(),
+            encoder_status,
+        }))
+    }
+    .await;
+
+    let _ = fs::remove_file(&work.partial_path);
+    let _ = fs::remove_file(&work.status_path);
+    let _ = fs::remove_file(&work.cancel_path);
+    active_count.fetch_sub(1, Ordering::Relaxed);
+    if let Ok(mut state) = app.state::<ReplayRecordingControl>().state.lock() {
+        state.current_cancel_paths.remove(&work.cancel_path);
+    }
+    if let Err(error) = &result {
+        let failed = failed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let active = active_count.load(Ordering::Relaxed);
+        let _ = app.emit(
+            "replay-recording-progress",
+            json!({
+                "stage": "failed-file",
+                "current": processed,
+                "processed": processed,
+                "succeeded": completed_count.load(Ordering::Relaxed),
+                "failed": failed,
+                "total": total,
+                "active": active,
+                "queued": total.saturating_sub(processed.saturating_add(active)),
+                "percent": processed.saturating_mul(100) / total.max(1),
+                "concurrency": concurrency,
+                "queueIndex": work.queue_index,
+                "fileName": work.display_name,
+                "message": error,
+            }),
+        );
+    }
+    result
+}
+
+async fn record_replays_inner(
+    app: &AppHandle,
+    replays: Vec<ReplayRecordingRequest>,
+    options: ReplayRecordingOptions,
+) -> Result<Value, String> {
+    if replays.is_empty() {
+        return Ok(json!({"recorded": 0, "cancelled": false}));
+    }
+    for replay in &replays {
+        let source_path = PathBuf::from(&replay.file_path);
+        if !source_path.is_file() || !is_replay_file(&source_path) {
+            return Err(format!("Replay file is not readable: {}", source_path.display()));
+        }
+    }
+
+    if ![1, 2, 4, 6, 10].contains(&options.playback_speed) {
+        return Err("Playback speed must be 1x, 2x, 4x, 6x, or 10x.".to_string());
+    }
+    if ![500, 1000, 2500, 5000, 10000].contains(&options.bitrate_kbps) {
+        return Err("Video bitrate must use one of the supported presets.".to_string());
+    }
+    if ![480, 720, 1080].contains(&options.resolution_height) {
+        return Err("Video resolution must be 480p, 720p, or 1080p.".to_string());
+    }
+    let total = replays.len();
+    let concurrency = options.concurrency.clamp(1, total.min(20));
+    let destination_dir = PathBuf::from(&options.destination_dir);
+    if !destination_dir.is_dir() {
+        return Err(format!("Replay video destination is not a folder: {}", destination_dir.display()));
+    }
+    let ffmpeg_path = resolve_ffmpeg_path(app)?;
+    let _ = app.emit(
+        "replay-recording-progress",
+        json!({
+            "stage": "staging",
+            "current": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "total": total,
+            "active": 0,
+            "queued": total,
+            "percent": 0,
+            "concurrency": concurrency,
+            "playbackSpeed": options.playback_speed,
+            "bitrateKbps": options.bitrate_kbps,
+            "resolutionHeight": options.resolution_height,
+            "message": format!("Preparing up to {concurrency} isolated game runtimes"),
+        }),
+    );
+    run_backend(app, "stage-game", Vec::new()).await?;
+
+    let recording_root = app_runtime_dir(app)?.join("replay-recordings");
+    fs::create_dir_all(&recording_root).map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let mut reserved_paths = HashSet::new();
+    let work_items = replays
+        .into_iter()
+        .enumerate()
+        .map(|(index, replay)| {
+            let source_path = PathBuf::from(&replay.file_path);
+            let final_path = available_recording_path(
+                &destination_dir,
+                &replay.file_name,
+                &mut reserved_paths,
+            );
+            let partial_path = final_path.with_extension("partial.mp4");
+            let status_path = recording_root.join(format!("recording-{unique}-{index}.status.json"));
+            let cancel_path = recording_root.join(format!("recording-{unique}-{index}.cancel"));
+            let display_name = final_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("replay.mp4")
+                .to_string();
+            ReplayRecordingWork {
+                queue_index: index + 1,
+                replay,
+                source_path,
+                final_path,
+                partial_path,
+                status_path,
+                cancel_path,
+                display_name,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let active_count = Arc::new(AtomicUsize::new(0));
+    let completed_count = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
+    let processed_count = Arc::new(AtomicUsize::new(0));
+    let worker_results = stream::iter(work_items.into_iter().map(|work| {
+        record_one_replay(
+            app.clone(),
+            work,
+            ffmpeg_path.clone(),
+            options.clone(),
+            total,
+            concurrency,
+            Arc::clone(&active_count),
+            Arc::clone(&completed_count),
+            Arc::clone(&failed_count),
+            Arc::clone(&processed_count),
+        )
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut recorded = 0usize;
+    let mut failures = Vec::new();
+    for worker_result in worker_results {
+        match worker_result {
+            Ok(Some(completed)) => {
+                match append_recording_manifest(
+                    &recording_root,
+                    &completed.source_path,
+                    &completed.final_path,
+                    &completed.encoder_status,
+                    &options,
+                ) {
+                    Ok(()) => recorded += 1,
+                    Err(error) => failures.push(error),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    let cancelled = app
+        .state::<ReplayRecordingControl>()
+        .state
+        .lock()
+        .map_err(|_| "Replay recording control is unavailable.".to_string())?
+        .cancel_requested;
+    let stage = if cancelled {
+        "cancelled"
+    } else if failures.is_empty() {
+        "completed"
+    } else {
+        "completed-with-errors"
+    };
+    let processed = processed_count.load(Ordering::Relaxed);
+    let _ = app.emit(
+        "replay-recording-progress",
+        json!({
+            "stage": stage,
+            "current": processed,
+            "processed": processed,
+            "succeeded": recorded,
+            "total": total,
+            "active": 0,
+            "queued": if cancelled { total.saturating_sub(processed) } else { 0 },
+            "percent": processed.saturating_mul(100) / total.max(1),
+            "concurrency": concurrency,
+            "recorded": recorded,
+            "failed": failures.len(),
+            "destination": destination_dir,
+        }),
+    );
+    Ok(json!({
+        "recorded": recorded,
+        "failed": failures.len(),
+        "failures": failures,
+        "cancelled": cancelled,
+        "concurrency": concurrency,
+        "destination": destination_dir,
+    }))
+}
+
+#[tauri::command]
+async fn record_replays(
+    app: AppHandle,
+    replays: Vec<ReplayRecordingRequest>,
+    options: ReplayRecordingOptions,
+) -> Result<Value, String> {
+    {
+        let control = app.state::<ReplayRecordingControl>();
+        let mut state = control
+            .state
+            .lock()
+            .map_err(|_| "Replay recording control is unavailable.".to_string())?;
+        if state.active {
+            return Err("A replay recording queue is already running.".to_string());
+        }
+        state.active = true;
+        state.cancel_requested = false;
+        state.current_cancel_paths.clear();
+    }
+    let result = record_replays_inner(&app, replays, options).await;
+    if let Ok(mut state) = app.state::<ReplayRecordingControl>().state.lock() {
+        state.active = false;
+        state.cancel_requested = false;
+        state.current_cancel_paths.clear();
+    }
+    result
+}
+
+#[tauri::command]
+async fn cancel_replay_recording(app: AppHandle) -> Result<bool, String> {
+    let cancel_paths = {
+        let control = app.state::<ReplayRecordingControl>();
+        let mut state = control
+            .state
+            .lock()
+            .map_err(|_| "Replay recording control is unavailable.".to_string())?;
+        if !state.active {
+            return Ok(false);
+        }
+        state.cancel_requested = true;
+        state.current_cancel_paths.iter().cloned().collect::<Vec<_>>()
+    };
+    for path in cancel_paths {
+        fs::write(&path, b"cancel")
+            .map_err(|error| format!("Could not cancel the current replay recording: {error}"))?;
+    }
+    Ok(true)
 }
 
 #[tauri::command]
@@ -5033,9 +5718,11 @@ async fn capture_progress(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(WindowOwnerProcesses::default())
+        .manage(ReplayRecordingControl::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
@@ -5067,6 +5754,8 @@ pub fn run() {
             delete_replay,
             download_replay,
             download_replays,
+            record_replays,
+            cancel_replay_recording,
             list_maps,
             read_map,
             save_map,

@@ -138,20 +138,6 @@ export default function MapEditorApp() {
   return (
     <div className="map-editor-scope" data-screen={screen.kind}>
       <div className="app-shell">
-        {screen.kind !== 'editor' && (
-          <header className="app-header">
-            <div className="brand-block">
-              <img alt="WoD Map Editor icon" src={uiAssets.appIcon} />
-              <div>
-                <h1>Map Editor</h1>
-              </div>
-            </div>
-            <button className="secondary-button compact" type="button" onClick={() => void loadMaps()}>
-              Refresh
-            </button>
-          </header>
-        )}
-
         <main className="app-main">
           {screen.kind === 'library' && (
             <>
@@ -162,6 +148,7 @@ export default function MapEditorApp() {
                 onCreate={() => setCreateOpen(true)}
                 onDeleteSelected={(fileNames) => void handleDeleteMaps(fileNames)}
                 onEdit={(mapId) => setScreen({ kind: 'editor', mapId })}
+                onRefresh={() => void loadMaps()}
               />
             </>
           )}

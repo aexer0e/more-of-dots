@@ -237,29 +237,7 @@ type GraphDefinition = {
 type GraphWindow = {
   id: string;
   kind: GraphKind;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
   visible: boolean;
-  z: number;
-};
-type GraphDragState = {
-  id: string;
-  pointerId: number;
-  offsetX: number;
-  offsetY: number;
-};
-type GraphResizeState = {
-  id: string;
-  pointerId: number;
-  edge: string;
-  startClientX: number;
-  startClientY: number;
-  startX: number;
-  startY: number;
-  startWidth: number;
-  startHeight: number;
 };
 
 type ReplayBrowserPlayer = {
@@ -506,8 +484,6 @@ const UNIT_PROJECTION_GUARD_WEIGHT = 35;
 const UNIT_PROJECTION_POWER_SCALE = 3.12;
 const CITY_PROJECTION_GUARD_WEIGHT = 80;
 const MAX_GRAPH_TEAMS = 4;
-const GRAPH_COMPACT_SIZE = { width: 228, height: 122 };
-const GRAPH_MIN_SIZE = { width: 170, height: 96 };
 const DURATION_SLIDER_STEPS = 1000;
 const DURATION_SLIDER_MIDPOINT_SECONDS = 5 * 60;
 const SUGGESTION_LIMIT = 8;
@@ -550,11 +526,11 @@ const GRAPH_DEFINITIONS: Record<GraphKind, GraphDefinition> = {
   casualties: { kind: "casualties", title: "Casualties", approximate: true },
 };
 const DEFAULT_GRAPH_WINDOWS: GraphWindow[] = [
-  { id: "graph-troops", kind: "troops", x: 18, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: true, z: 9 },
-  { id: "graph-funds", kind: "funds", x: 258, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 10 },
-  { id: "graph-units", kind: "units", x: 498, y: 72, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 11 },
-  { id: "graph-morale", kind: "morale", x: 18, y: 206, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 12 },
-  { id: "graph-casualties", kind: "casualties", x: 258, y: 206, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 13 },
+  { id: "graph-troops", kind: "troops", visible: true },
+  { id: "graph-funds", kind: "funds", visible: false },
+  { id: "graph-units", kind: "units", visible: false },
+  { id: "graph-morale", kind: "morale", visible: false },
+  { id: "graph-casualties", kind: "casualties", visible: false },
 ];
 
 let statusPayload: BackendStatus | null = null;
@@ -596,9 +572,7 @@ const unitImageCache = new Map<string, { image: HTMLImageElement; source: string
 let projectionPathMemory = new Map<string, ProjectionPathState>();
 let projectionMemoryFrame = -1;
 let graphWindows = DEFAULT_GRAPH_WINDOWS.map((windowState) => ({ ...windowState }));
-let graphDrag: GraphDragState | null = null;
-let graphResize: GraphResizeState | null = null;
-let graphZCounter = 20;
+let analyticsOpen = true;
 let browserReplays: ReplayBrowserItem[] = [];
 let browserLoading = false;
 let browserUploading = false;
@@ -630,6 +604,7 @@ let pendingBrowserSearchFrame = 0;
 let browserOpeningPaths = new Set<string>();
 let browserGridCapped = loadBrowserGridCapped();
 let browserGridCardSize = loadBrowserGridCardSize();
+let browserFiltersOpen = false;
 let browserReplaySignature = "";
 let browserRelativeTimeTimer = 0;
 let browserDocumentEventsBound = false;
@@ -2185,14 +2160,53 @@ function renderBrowserGridSizeControl(): string {
 
 function renderBrowserNav(): string {
   return `
-    <nav class="browser-nav" aria-label="Main navigation">
-      <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
-      <button class="browser-nav-button is-locked" type="button" disabled aria-disabled="true" aria-label="Leaderboard (work in progress)" data-wip="WIP" data-browser-page="leaderboard">Leaderboard</button>
-      <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
-      <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
-      <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
-    </nav>
+    <header class="browser-shell-header">
+      <div class="browser-brand" aria-label="More of Dots">
+        <span class="browser-brand-mark" aria-hidden="true">M</span>
+        <span class="browser-brand-name">More of Dots</span>
+      </div>
+      <nav class="browser-nav" aria-label="Main navigation">
+        <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
+        <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
+        <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
+      </nav>
+      <details class="app-utility-menu">
+        <summary aria-label="Application menu" title="Application menu">
+          <span aria-hidden="true">•••</span>
+        </summary>
+        <div class="app-utility-panel">
+          <span class="app-utility-label">Application</span>
+          <strong>More of Dots</strong>
+          <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
+        </div>
+      </details>
+    </header>
   `;
+}
+
+function browserActiveFilterCount(): number {
+  let count = 0;
+  if (!browserHideUnmatched) count += 1;
+  if (browserNationGamesOnly) count += 1;
+  if (browserSelectedTypes.size !== 3) count += 1;
+  if (browserDurationRange.min !== browserDurationBounds.min || browserDurationRange.max !== browserDurationBounds.max) count += 1;
+  return count;
+}
+
+function updateBrowserFilterBadge() {
+  const summary = document.querySelector<HTMLElement>("#replayFilters > summary");
+  if (!summary) return;
+  const count = browserActiveFilterCount();
+  let badge = summary.querySelector<HTMLElement>("strong");
+  if (!count) {
+    badge?.remove();
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement("strong");
+    summary.appendChild(badge);
+  }
+  badge.textContent = String(count);
 }
 
 function renderLeaderboardPage(): string {
@@ -2536,8 +2550,27 @@ function renderReplayBrowser() {
   appRoot.innerHTML = `
     <main class="replay-browser" aria-label="War of Dots replays">
       ${renderBrowserNav()}
-      <div class="search-row">
-        <div class="search-controls">
+      <section class="replay-library-shell">
+        <header class="replay-page-toolbar">
+          <div class="replay-page-heading">
+            <span>Local library</span>
+            <h1>Replays</h1>
+          </div>
+          <div class="replay-view-actions" role="group" aria-label="Replay library view controls">
+            ${renderBrowserGridWidthToggle()}
+            ${renderBrowserGridSizeControl()}
+            <button id="refreshReplays" class="refresh-button ${browserLoading ? "is-loading" : ""}" type="button" aria-label="Refresh replays" title="Refresh replays" ${browserLoading && !browserReplays.length ? "disabled" : ""}>
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M20 12a8 8 0 0 1-13.7 5.7" />
+                <path d="M4 12A8 8 0 0 1 17.7 6.3" />
+                <path d="M17.7 2.7v3.6h-3.6" />
+                <path d="M6.3 21.3v-3.6h3.6" />
+              </svg>
+              <span>Refresh</span>
+            </button>
+          </div>
+        </header>
+        <div class="replay-search-toolbar">
           <div
             id="playerSearchBox"
             class="search-combobox"
@@ -2564,56 +2597,56 @@ function renderReplayBrowser() {
               <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions"></div>
             </div>
           </div>
-          <label class="match-mode-toggle" title="Dim non-matching replays">
-            <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
-            <span aria-hidden="true">&#128123;&#65039;</span>
-          </label>
-          <label class="match-mode-toggle nation-mode-toggle" title="World games only">
-            <input id="nationGamesToggle" type="checkbox" aria-label="World games only" ${browserNationGamesOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
-            <span aria-hidden="true">&#127760;</span>
-          </label>
-        </div>
-        <div class="filter-controls">
-          <div class="type-filters" role="group" aria-label="Match type filters">
-            ${["1v1", "3P FFA", "4P FFA"]
-              .map(
-                (type) => `
-                  <label><input class="type-filter" type="checkbox" value="${escapeHtml(type)}" ${browserSelectedTypes.has(type) ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>${escapeHtml(type.replace(" FFA", ""))}</label>
-                `,
-              )
-              .join("")}
-          </div>
-          <div class="duration-filter" aria-label="Duration filter">
-            <span id="durationMinLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.min)}</span>
-            <div id="durationSlider" class="duration-slider">
-              <div class="duration-track"></div>
-              <div id="durationRangeFill" class="duration-range-fill" style="left:${fillLeft}%;right:${fillRight}%"></div>
-              <input id="durationMin" type="range" min="0" max="${DURATION_SLIDER_STEPS}" value="${minPosition}" step="1" aria-label="Minimum duration" ${browserReplays.length ? "" : "disabled"}>
-              <input id="durationMax" type="range" min="0" max="${DURATION_SLIDER_STEPS}" value="${maxPosition}" step="1" aria-label="Maximum duration" ${browserReplays.length ? "" : "disabled"}>
+          <details id="replayFilters" class="replay-filter-panel" ${browserFiltersOpen ? "open" : ""}>
+            <summary>
+              <span>Filters</span>
+              ${browserActiveFilterCount() ? `<strong>${browserActiveFilterCount()}</strong>` : ""}
+            </summary>
+            <div class="replay-filter-drawer">
+              <div class="filter-group filter-group-modes">
+                <span class="filter-group-label">Display</span>
+                <label class="filter-check">
+                  <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
+                  <span>Dim unmatched</span>
+                </label>
+                <label class="filter-check">
+                  <input id="nationGamesToggle" type="checkbox" aria-label="World games only" ${browserNationGamesOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
+                  <span>World games only</span>
+                </label>
+              </div>
+              <div class="filter-group">
+                <span class="filter-group-label">Match type</span>
+                <div class="type-filters" role="group" aria-label="Match type filters">
+                  ${["1v1", "3P FFA", "4P FFA"]
+                    .map(
+                      (type) => `
+                        <label><input class="type-filter" type="checkbox" value="${escapeHtml(type)}" ${browserSelectedTypes.has(type) ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>${escapeHtml(type.replace(" FFA", ""))}</label>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </div>
+              <div class="filter-group filter-group-duration">
+                <span class="filter-group-label">Duration</span>
+                <div class="duration-filter" aria-label="Duration filter">
+                  <span id="durationMinLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.min)}</span>
+                  <div id="durationSlider" class="duration-slider">
+                    <div class="duration-track"></div>
+                    <div id="durationRangeFill" class="duration-range-fill" style="left:${fillLeft}%;right:${fillRight}%"></div>
+                    <input id="durationMin" type="range" min="0" max="${DURATION_SLIDER_STEPS}" value="${minPosition}" step="1" aria-label="Minimum duration" ${browserReplays.length ? "" : "disabled"}>
+                    <input id="durationMax" type="range" min="0" max="${DURATION_SLIDER_STEPS}" value="${maxPosition}" step="1" aria-label="Maximum duration" ${browserReplays.length ? "" : "disabled"}>
+                  </div>
+                  <span id="durationMaxLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.max)}</span>
+                </div>
+              </div>
             </div>
-            <span id="durationMaxLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.max)}</span>
-          </div>
+          </details>
         </div>
-      </div>
-      ${renderBrowserGrid()}
-      <div id="replayUploadDock" class="replay-upload-dock">
-        ${renderReplayUploadDockContent()}
-      </div>
-      <div class="replay-action-dock">
-        <div class="replay-action-group" role="group" aria-label="Replay browser actions">
-          ${renderBrowserGridWidthToggle()}
-          ${renderBrowserGridSizeControl()}
-          <button id="refreshReplays" class="refresh-button ${browserLoading ? "is-loading" : ""}" type="button" aria-label="Refresh replays" title="Refresh replays" ${browserLoading && !browserReplays.length ? "disabled" : ""}>
-            <svg aria-hidden="true" viewBox="0 0 24 24">
-              <path d="M20 12a8 8 0 0 1-13.7 5.7" />
-              <path d="M4 12A8 8 0 0 1 17.7 6.3" />
-              <path d="M17.7 2.7v3.6h-3.6" />
-              <path d="M6.3 21.3v-3.6h3.6" />
-            </svg>
-            <span>Refresh</span>
-          </button>
+        <div id="replayUploadDock" class="replay-context-bar ${browserSelectedReplayPaths.size ? "has-selection" : ""}">
+          ${renderReplayUploadDockContent()}
         </div>
-      </div>
+        ${renderBrowserGrid()}
+      </section>
       ${renderReplayDeleteDialog()}
       ${renderReplayRecordingDialog()}
       ${renderReplayRecordingNotice()}
@@ -2755,6 +2788,9 @@ function bindBrowserEvents() {
   document.querySelector<HTMLDetailsElement>(".user-fields-section")?.addEventListener("toggle", (event) => {
     leaderboardDetailsOpen = (event.currentTarget as HTMLDetailsElement).open;
   });
+  document.querySelector<HTMLDetailsElement>("#replayFilters")?.addEventListener("toggle", (event) => {
+    browserFiltersOpen = (event.currentTarget as HTMLDetailsElement).open;
+  });
   document.querySelector<HTMLButtonElement>("#refreshRegion")?.addEventListener("click", () => {
     void loadRegionStatus();
   });
@@ -2803,10 +2839,12 @@ function bindBrowserEvents() {
   document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("pointerdown", handleBrowserSuggestionPointerDown);
   document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("change", (event) => {
     browserHideUnmatched = !(event.target as HTMLInputElement).checked;
+    updateBrowserFilterBadge();
     scheduleBrowserSearch();
   });
   document.querySelector<HTMLInputElement>("#nationGamesToggle")?.addEventListener("change", (event) => {
     browserNationGamesOnly = (event.target as HTMLInputElement).checked;
+    updateBrowserFilterBadge();
     refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
     scheduleBrowserSearch();
   });
@@ -2814,6 +2852,7 @@ function bindBrowserEvents() {
     input.addEventListener("change", () => {
       if (input.checked) browserSelectedTypes.add(input.value);
       else browserSelectedTypes.delete(input.value);
+      updateBrowserFilterBadge();
       refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
       scheduleBrowserSearch();
     });
@@ -2847,6 +2886,7 @@ function bindBrowserEvents() {
       }
     }
     updateDurationSliderUi(minPosition, maxPosition);
+    updateBrowserFilterBadge();
     refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
     scheduleBrowserSearch();
   };
@@ -4051,33 +4091,6 @@ function formatGraphValue(kind: GraphKind, value: unknown): string {
   return formatStat(value, GRAPH_DEFINITIONS[kind].approximate === true);
 }
 
-function graphAreaSize(): { width: number; height: number } {
-  const area = document.querySelector<HTMLElement>(".viewer-area");
-  return {
-    width: Math.max(1, area?.clientWidth ?? window.innerWidth),
-    height: Math.max(1, area?.clientHeight ?? window.innerHeight),
-  };
-}
-
-function clampGraphWindow(windowState: GraphWindow) {
-  const area = graphAreaSize();
-  const margin = 8;
-  windowState.width = Math.max(GRAPH_MIN_SIZE.width, Math.min(area.width - margin * 2, windowState.width));
-  windowState.height = Math.max(GRAPH_MIN_SIZE.height, Math.min(area.height - margin * 2, windowState.height));
-  const maxX = Math.max(margin, area.width - windowState.width - margin);
-  const maxY = Math.max(margin, area.height - windowState.height - margin);
-  windowState.x = Math.max(margin, Math.min(maxX, windowState.x));
-  windowState.y = Math.max(margin, Math.min(maxY, windowState.y));
-}
-
-function raiseGraphWindow(id: string) {
-  const windowState = graphWindows.find((candidate) => candidate.id === id);
-  if (!windowState) return;
-  windowState.z = ++graphZCounter;
-  const element = document.querySelector<HTMLElement>(`[data-graph-window-id="${id}"]`);
-  if (element) element.style.zIndex = String(windowState.z);
-}
-
 function visibleGraphKinds(): Set<GraphKind> {
   return new Set(graphWindows.filter((windowState) => windowState.visible).map((windowState) => windowState.kind));
 }
@@ -4086,8 +4099,7 @@ function showGraphWindow(kind: GraphKind) {
   const windowState = graphWindows.find((candidate) => candidate.kind === kind);
   if (!windowState) return;
   windowState.visible = true;
-  clampGraphWindow(windowState);
-  raiseGraphWindow(windowState.id);
+  analyticsOpen = true;
   renderGraphLayer();
 }
 
@@ -4110,11 +4122,12 @@ function renderGraphLayer() {
   const topbar = document.querySelector<HTMLElement>(".topbar");
   if (topbar) topbar.innerHTML = renderGraphPalette();
 
-  const viewer = document.querySelector<HTMLElement>(".viewer-area");
-  if (viewer) {
-    document.querySelectorAll<HTMLElement>("[data-graph-window-id]").forEach((element) => element.remove());
-    viewer.insertAdjacentHTML("beforeend", renderGraphWindows(sample));
-  }
+  const workspace = document.querySelector<HTMLElement>(".viewer-workspace");
+  workspace?.classList.toggle("has-analytics", analyticsOpen);
+  const dock = document.querySelector<HTMLElement>("#analyticsDock");
+  if (dock) dock.hidden = !analyticsOpen;
+  const graphList = document.querySelector<HTMLElement>("#analyticsGraphs");
+  if (graphList) graphList.innerHTML = renderGraphWindows(sample);
 
   bindGraphEvents();
   renderGraphCanvases(sample);
@@ -4123,41 +4136,45 @@ function renderGraphLayer() {
 function renderGraphPalette(): string {
   const visible = visibleGraphKinds();
   return `
-    <div class="graph-palette-zone" aria-label="Graph windows">
+    <div class="graph-palette-zone" aria-label="Replay analytics">
       <div class="graph-palette">
-        <div class="graph-palette-buttons">
-        ${Object.values(GRAPH_DEFINITIONS)
-          .map(
-            (definition) => `
-              <button
-                type="button"
-                data-graph-toggle="${definition.kind}"
-                class="${visible.has(definition.kind) ? "active" : ""}"
-                aria-pressed="${visible.has(definition.kind) ? "true" : "false"}"
-              >${escapeHtml(definition.title)}</button>
-            `,
-          )
-          .join("")}
+        <div class="graph-palette-heading">
+          <span>Analytics</span>
+          <button id="analyticsToggle" class="analytics-toggle" type="button" aria-expanded="${analyticsOpen}" aria-controls="analyticsDock">
+            ${analyticsOpen ? "Hide" : "Show"}
+          </button>
         </div>
+        ${analyticsOpen ? `<div class="graph-palette-buttons">
+          ${Object.values(GRAPH_DEFINITIONS)
+            .map(
+              (definition) => `
+                <button
+                  type="button"
+                  data-graph-toggle="${definition.kind}"
+                  class="${visible.has(definition.kind) ? "active" : ""}"
+                  aria-pressed="${visible.has(definition.kind) ? "true" : "false"}"
+                >${escapeHtml(definition.title)}</button>
+              `,
+            )
+            .join("")}
+        </div>` : ""}
       </div>
     </div>
   `;
 }
 
 function renderGraphWindows(sample: Sample | null): string {
-  return graphWindows
+  const rendered = graphWindows
     .filter((windowState) => windowState.visible)
     .map((windowState) => {
-      clampGraphWindow(windowState);
       const definition = GRAPH_DEFINITIONS[windowState.kind];
       return `
         <section
           class="graph-window"
           data-graph-window-id="${escapeHtml(windowState.id)}"
-          style="left:${windowState.x}px;top:${windowState.y}px;width:${windowState.width}px;height:${windowState.height}px;z-index:${windowState.z}"
           aria-label="${escapeHtml(definition.title)} graph"
         >
-          <header class="graph-titlebar" data-graph-drag="${escapeHtml(windowState.id)}">
+          <header class="graph-titlebar">
             <strong>${escapeHtml(definition.title)}</strong>
             <div class="graph-actions">
               <button class="graph-close" type="button" data-graph-close="${escapeHtml(windowState.id)}" aria-label="Close ${escapeHtml(definition.title)} graph"></button>
@@ -4166,13 +4183,11 @@ function renderGraphWindows(sample: Sample | null): string {
           <div class="graph-body">
             <canvas class="graph-canvas" data-graph-id="${escapeHtml(windowState.id)}"></canvas>
           </div>
-          ${["n", "e", "s", "w", "ne", "nw", "se", "sw"]
-            .map((edge) => `<span class="graph-resize-handle ${edge}" data-graph-resize="${escapeHtml(windowState.id)}" data-edge="${edge}"></span>`)
-            .join("")}
         </section>
       `;
     })
     .join("");
+  return rendered || `<div class="analytics-empty"><strong>No graphs shown</strong><span>Choose a metric above to add it here.</span></div>`;
 }
 
 function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWindow, sample: Sample | null) {
@@ -5334,16 +5349,22 @@ function render() {
   appRoot.innerHTML = `
     <main class="app-shell">
       <section class="viewer-area" aria-label="Replay viewer">
-        <canvas id="replayCanvas" aria-label="Replay canvas"></canvas>
-        <input id="fileInput" type="file" accept=".rep,application/gzip">
         ${
           activeStats
             ? `<div class="topbar">${renderGraphPalette()}</div>`
             : ""
         }
-        ${renderOverlay()}
+        <div class="viewer-workspace ${activeStats && analyticsOpen ? "has-analytics" : ""}">
+          <div class="viewer-canvas-stage">
+            <canvas id="replayCanvas" aria-label="Replay canvas"></canvas>
+            <input id="fileInput" type="file" accept=".rep,application/gzip">
+            ${renderOverlay()}
+          </div>
+          ${activeStats ? `<aside id="analyticsDock" class="analytics-dock" aria-label="Replay analytics" ${analyticsOpen ? "" : "hidden"}>
+            <div id="analyticsGraphs" class="analytics-graphs">${renderGraphWindows(sample)}</div>
+          </aside>` : ""}
+        </div>
         ${activeStats ? renderTimeline(sample) : ""}
-        ${activeStats ? renderGraphWindows(sample) : ""}
       </section>
     </main>
   `;
@@ -5388,6 +5409,10 @@ function bindPointerActivation(element: HTMLElement | null, handler: (event: Poi
 }
 
 function bindGraphEvents() {
+  bindPointerActivation(document.querySelector<HTMLButtonElement>("#analyticsToggle"), () => {
+    analyticsOpen = !analyticsOpen;
+    renderGraphLayer();
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-graph-toggle]").forEach((button) => {
     bindPointerActivation(button, () => {
       const kind = button.dataset.graphToggle as GraphKind | undefined;
@@ -5401,146 +5426,6 @@ function bindGraphEvents() {
       if (id) closeGraphWindow(id);
     });
   });
-
-  document.querySelectorAll<HTMLElement>("[data-graph-window-id]").forEach((element) => {
-    element.addEventListener("pointerdown", () => {
-      const id = element.dataset.graphWindowId;
-      if (id) raiseGraphWindow(id);
-    });
-  });
-
-  document.querySelectorAll<HTMLElement>("[data-graph-drag]").forEach((handle) => {
-    handle.addEventListener("pointerdown", (event) => {
-      const id = handle.dataset.graphDrag;
-      const element = id ? document.querySelector<HTMLElement>(`[data-graph-window-id="${id}"]`) : null;
-      if (!id || !element || (event.target instanceof HTMLElement && event.target.closest("button"))) return;
-      const rect = element.getBoundingClientRect();
-      graphDrag = {
-        id,
-        pointerId: event.pointerId,
-        offsetX: event.clientX - rect.left,
-        offsetY: event.clientY - rect.top,
-      };
-      handle.setPointerCapture(event.pointerId);
-      raiseGraphWindow(id);
-      event.preventDefault();
-    });
-
-    handle.addEventListener("pointermove", (event) => {
-      if (!graphDrag || graphDrag.pointerId !== event.pointerId) return;
-      const windowState = graphWindows.find((candidate) => candidate.id === graphDrag?.id);
-      const element = document.querySelector<HTMLElement>(`[data-graph-window-id="${graphDrag.id}"]`);
-      const area = document.querySelector<HTMLElement>(".viewer-area");
-      if (!windowState || !element || !area) return;
-      const areaRect = area.getBoundingClientRect();
-      windowState.x = event.clientX - areaRect.left - graphDrag.offsetX;
-      windowState.y = event.clientY - areaRect.top - graphDrag.offsetY;
-      clampGraphWindow(windowState);
-      element.style.left = `${windowState.x}px`;
-      element.style.top = `${windowState.y}px`;
-      renderGraphCanvases(sampleAtFrame());
-    });
-
-    const stopDrag = (event: PointerEvent) => {
-      if (!graphDrag || graphDrag.pointerId !== event.pointerId) return;
-      try {
-        handle.releasePointerCapture(event.pointerId);
-      } catch {
-        // Pointer capture may already be released by the browser.
-      }
-      graphDrag = null;
-    };
-    handle.addEventListener("pointerup", stopDrag);
-    handle.addEventListener("pointercancel", stopDrag);
-  });
-
-  document.querySelectorAll<HTMLElement>("[data-graph-resize]").forEach((handle) => {
-    handle.addEventListener("pointerdown", (event) => {
-      const id = handle.dataset.graphResize;
-      const edge = handle.dataset.edge ?? "";
-      const windowState = graphWindows.find((candidate) => candidate.id === id);
-      if (!id || !windowState || !edge) return;
-      graphResize = {
-        id,
-        pointerId: event.pointerId,
-        edge,
-        startClientX: event.clientX,
-        startClientY: event.clientY,
-        startX: windowState.x,
-        startY: windowState.y,
-        startWidth: windowState.width,
-        startHeight: windowState.height,
-      };
-      handle.setPointerCapture(event.pointerId);
-      raiseGraphWindow(id);
-      event.preventDefault();
-      event.stopPropagation();
-    });
-
-    handle.addEventListener("pointermove", (event) => {
-      if (!graphResize || graphResize.pointerId !== event.pointerId) return;
-      resizeGraphWindow(event);
-    });
-
-    const stopResize = (event: PointerEvent) => {
-      if (!graphResize || graphResize.pointerId !== event.pointerId) return;
-      try {
-        handle.releasePointerCapture(event.pointerId);
-      } catch {
-        // Pointer capture may already be released by the browser.
-      }
-      graphResize = null;
-    };
-    handle.addEventListener("pointerup", stopResize);
-    handle.addEventListener("pointercancel", stopResize);
-  });
-}
-
-function resizeGraphWindow(event: PointerEvent) {
-  if (!graphResize) return;
-  const windowState = graphWindows.find((candidate) => candidate.id === graphResize?.id);
-  const element = document.querySelector<HTMLElement>(`[data-graph-window-id="${graphResize.id}"]`);
-  if (!windowState || !element) return;
-
-  const dx = event.clientX - graphResize.startClientX;
-  const dy = event.clientY - graphResize.startClientY;
-  const area = graphAreaSize();
-  const margin = 8;
-  const maxWidth = Math.max(GRAPH_MIN_SIZE.width, area.width - margin * 2);
-  const maxHeight = Math.max(GRAPH_MIN_SIZE.height, area.height - margin * 2);
-
-  let x = graphResize.startX;
-  let y = graphResize.startY;
-  let width = graphResize.startWidth;
-  let height = graphResize.startHeight;
-
-  if (graphResize.edge.includes("e")) width = graphResize.startWidth + dx;
-  if (graphResize.edge.includes("s")) height = graphResize.startHeight + dy;
-  if (graphResize.edge.includes("w")) {
-    width = graphResize.startWidth - dx;
-    x = graphResize.startX + dx;
-  }
-  if (graphResize.edge.includes("n")) {
-    height = graphResize.startHeight - dy;
-    y = graphResize.startY + dy;
-  }
-
-  width = Math.max(GRAPH_MIN_SIZE.width, Math.min(maxWidth, width));
-  height = Math.max(GRAPH_MIN_SIZE.height, Math.min(maxHeight, height));
-  if (graphResize.edge.includes("w")) x = graphResize.startX + graphResize.startWidth - width;
-  if (graphResize.edge.includes("n")) y = graphResize.startY + graphResize.startHeight - height;
-
-  windowState.x = x;
-  windowState.y = y;
-  windowState.width = width;
-  windowState.height = height;
-  clampGraphWindow(windowState);
-
-  element.style.left = `${windowState.x}px`;
-  element.style.top = `${windowState.y}px`;
-  element.style.width = `${windowState.width}px`;
-  element.style.height = `${windowState.height}px`;
-  renderGraphCanvases(sampleAtFrame());
 }
 
 function bindSeekBar() {
@@ -6321,7 +6206,6 @@ if (appMode === "browser") {
   });
 } else {
   window.addEventListener("resize", () => {
-    graphWindows.filter((windowState) => windowState.visible).forEach(clampGraphWindow);
     renderCanvas();
   });
   if (isStaticReplayPlayer) {

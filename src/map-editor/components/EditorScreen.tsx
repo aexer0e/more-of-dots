@@ -141,7 +141,6 @@ type HoverTarget =
 
 const BRIDGE_COLOR = '#643C0A';
 const BRIDGE_WIDTH = 9;
-const FLOATING_HELP_DISMISS_MS = 5000;
 const MAP_RESOLUTION_OPTIONS = [
   { label: '960x540', width: 960, height: 540 },
   { label: '1920x1080', width: 1920, height: 1080 },
@@ -676,7 +675,9 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   const [terrainShapeFilled, setTerrainShapeFilled] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [expandedPanels, setExpandedPanels] = useState<Record<PanelKey, boolean>>({ map: true, terrain: true, units: true });
+  const [expandedPanels, setExpandedPanels] = useState<Record<PanelKey, boolean>>({ map: false, terrain: true, units: false });
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 900);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'dirty'>('saved');
   const [ready, setReady] = useState(false);
@@ -684,8 +685,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   const [leavePromptError, setLeavePromptError] = useState('');
   const [hoverTarget, setHoverTarget] = useState<HoverTarget | null>(null);
   const [shapePointCount, setShapePointCount] = useState(0);
-  const [dockUnitHelpRight, setDockUnitHelpRight] = useState(false);
-  const [showFloatingControls, setShowFloatingControls] = useState(true);
   const [isPanDragging, setIsPanDragging] = useState(false);
   const [isSpacePanActive, setIsSpacePanActive] = useState(false);
   const [selectedEntities, setSelectedEntities] = useState<SelectedEntityRef[]>([]);
@@ -770,15 +769,12 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   const futureRef = useRef<HistoryEntry[]>([]);
 
   // save state
-  const floatingControlsTimerRef = useRef<number | null>(null);
-  const lastToolControlSignatureRef = useRef<string | null>(null);
   const dirtyRef = useRef(false);
   const leavePromptResolverRef = useRef<((result: LeaveResult) => void) | null>(null);
   const mountedRef = useRef(true);
 
   const counts = useMemo(() => createDraftCounts(draft), [draft]);
   const teamCount = teamsForMap(draft);
-  const selectionBounds = useMemo(() => selectionBoundsFromRects(selectionRects), [selectionRects]);
   const canvasStackStyle = useMemo(
     () => ({
       '--editor-pan-x': `${pan.x}px`,
@@ -787,23 +783,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     } as CSSProperties),
     [pan.x, pan.y, zoom],
   );
-  const selectionActionPlacement = selectionBounds && selectionBounds.top > 70 ? 'above' : 'below';
-  const selectionActionStyle = useMemo(() => {
-    if (selectedTool !== 'select' || selectedEntities.length === 0 || !selectionBounds) {
-      return null;
-    }
-
-    const centerX = (selectionBounds.left + selectionBounds.right) / 2;
-    const leftPercent = Math.max(12, Math.min(88, (centerX / CANVAS_WIDTH) * 100));
-    const anchorY = selectionActionPlacement === 'above'
-      ? (selectionBounds.top / CANVAS_HEIGHT) * 100
-      : (selectionBounds.bottom / CANVAS_HEIGHT) * 100;
-
-    return {
-      left: `${leftPercent}%`,
-      top: `${Math.max(3, Math.min(97, anchorY))}%`,
-    } as CSSProperties;
-  }, [selectedEntities.length, selectedTool, selectionActionPlacement, selectionBounds]);
 
   const requestDraw = useCallback(() => {
     if (frameRef.current !== null) return;
@@ -905,10 +884,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
         cancelAnimationFrame(frameRef.current);
         frameRef.current = null; // critical: prevent permanently stuck "frame pending" after remount
       }
-      if (floatingControlsTimerRef.current !== null) {
-        clearTimeout(floatingControlsTimerRef.current);
-        floatingControlsTimerRef.current = null;
-      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -916,6 +891,18 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   useEffect(() => {
     document.title = `${draft.name || 'Untitled map'} - WoD Map Editor`;
   }, [draft.name]);
+
+  useEffect(() => {
+    let wasWide = window.innerWidth > 900;
+    const handleResponsiveSidebar = () => {
+      const isWide = window.innerWidth > 900;
+      if (isWide === wasWide) return;
+      wasWide = isWide;
+      setSidebarOpen(isWide);
+    };
+    window.addEventListener('resize', handleResponsiveSidebar);
+    return () => window.removeEventListener('resize', handleResponsiveSidebar);
+  }, []);
 
   // Ensure draw after layout commits
   useLayoutEffect(() => {
@@ -1093,34 +1080,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     if (selectedTool !== 'select' && (selectedEntitiesRef.current.length > 0 || selectionRectsRef.current.length > 0)) {
       clearSelection();
     }
-  }, [selectedTool]);
-
-  useEffect(() => {
-    if (!showFloatingControls) {
-      setDockUnitHelpRight(false);
-    }
-  }, [showFloatingControls]);
-
-  useEffect(() => {
-    const nextSignature = toolControlSignature(selectedTool);
-    const shouldRedisplay = lastToolControlSignatureRef.current !== nextSignature;
-    lastToolControlSignatureRef.current = nextSignature;
-
-    if (!shouldRedisplay) {
-      return;
-    }
-
-    if (floatingControlsTimerRef.current !== null) {
-      clearTimeout(floatingControlsTimerRef.current);
-    }
-
-    setShowFloatingControls(true);
-    floatingControlsTimerRef.current = window.setTimeout(() => {
-      floatingControlsTimerRef.current = null;
-      if (mountedRef.current) {
-        setShowFloatingControls(false);
-      }
-    }, FLOATING_HELP_DISMISS_MS);
   }, [selectedTool]);
 
   // ────────────────────────────────────────────────────────────
@@ -1676,7 +1635,11 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   }
 
   function togglePanel(panel: PanelKey) {
-    setExpandedPanels((current) => ({ ...current, [panel]: !current[panel] }));
+    setExpandedPanels((current) => ({
+      map: panel === 'map' ? !current.map : false,
+      terrain: panel === 'terrain' ? !current.terrain : false,
+      units: panel === 'units' ? !current.units : false,
+    }));
   }
 
   function syncHoverTarget(next: HoverTarget | null) {
@@ -2737,30 +2700,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     requestDraw();
   }
 
-  function handleStagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
-    if (!showFloatingControls || floatingControlItems.length === 0 || !stageRef.current) {
-      if (dockUnitHelpRight) {
-        setDockUnitHelpRight(false);
-      }
-      return;
-    }
-
-    const rect = stageRef.current.getBoundingClientRect();
-    const localX = event.clientX - rect.left;
-    const localY = event.clientY - rect.top;
-    const shouldDockRight = localX <= 248 && localY <= 176;
-
-    if (shouldDockRight !== dockUnitHelpRight) {
-      setDockUnitHelpRight(shouldDockRight);
-    }
-  }
-
-  function handleStagePointerLeave() {
-    if (dockUnitHelpRight) {
-      setDockUnitHelpRight(false);
-    }
-  }
-
   // ────────────────────────────────────────────────────────────
   // Background / reset / close
   // ────────────────────────────────────────────────────────────
@@ -2914,7 +2853,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
     return <p className="tool-note">This terrain tool has no extra options.</p>;
   }, [brushSize, selectedTool, terrainRectFilled, terrainShapeFilled]);
-  const floatingControlItems = useMemo<ControlHint[]>(() => floatingControlItemsForTool(selectedTool), [selectedTool]);
   const helpItems = useMemo<ControlHint[]>(() => {
     const items: ControlHint[] = [
       { id: 'zoom', icon: ZoomIn, label: 'Wheel', action: 'Zoom into the area under the cursor.' },
@@ -2985,30 +2923,40 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
   return (
     <>
-    <section className="editor-shell">
-      <aside className="editor-sidebar">
-        <div className="sidebar-header">
+    <section className={`editor-shell ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'}`}>
+      <header className="editor-command-bar">
+        <div className="editor-command-leading">
+          <button
+            aria-expanded={sidebarOpen}
+            aria-controls="mapEditorSidebar"
+            className="editor-sidebar-toggle secondary-button compact"
+            type="button"
+            onClick={() => setSidebarOpen((current) => !current)}
+          >
+            Tools
+          </button>
           <button className="ghost-button" type="button" onClick={handleClose} title="Back to library">
             ← Library
           </button>
+        </div>
+        <div className="editor-map-identity">
+          <strong>{draft.name || draft.fileName || 'Untitled map'}</strong>
+          <span>{draft.width}x{draft.height} · {teamCount} teams · {MODE_LABELS[draft.data.mode]}</span>
+        </div>
+        <div className="editor-command-actions">
           <div className={`save-badge ${saveState}`}>
             <span className="dot" />
             <span>{saveState === 'saving' ? 'Saving…' : saveState === 'dirty' ? 'Unsaved' : 'Saved'}</span>
           </div>
+          <button className="icon-button" type="button" disabled={!historyState.canUndo} onClick={handleUndo} title="Undo (Ctrl+Z)">↶</button>
+          <button className="icon-button" type="button" disabled={!historyState.canRedo} onClick={handleRedo} title="Redo (Ctrl+Y)">↷</button>
+          <button className="primary-button compact" type="button" disabled={saveState === 'saving' || saveState === 'saved'} onClick={() => { void persistNow(); }}>
+            {saveState === 'saving' ? 'Saving...' : 'Save'}
+          </button>
         </div>
+      </header>
 
-        <div className="map-meta-card">
-          <div className="meta-text">
-            <p className="eyebrow">Editing</p>
-            <h2>{draft.name || draft.fileName || 'Untitled map'}</h2>
-            <span>{draft.fileName} · {draft.width}x{draft.height} · {teamCount} teams · {MODE_LABELS[draft.data.mode]}</span>
-          </div>
-          <div className="meta-actions">
-            <button className="icon-button" type="button" disabled={!historyState.canUndo} onClick={handleUndo} title="Undo (Ctrl+Z)">↶</button>
-            <button className="icon-button" type="button" disabled={!historyState.canRedo} onClick={handleRedo} title="Redo (Ctrl+Y)">↷</button>
-          </div>
-        </div>
-
+      <aside id="mapEditorSidebar" className="editor-sidebar">
         <div className="sidebar-panels">
           <section className="control-card control-panel">
             <button
@@ -3165,6 +3113,10 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
         </div>
       </aside>
 
+      {sidebarOpen ? (
+        <button className="editor-sidebar-scrim" type="button" aria-label="Close tools" onClick={() => setSidebarOpen(false)} />
+      ) : null}
+
       <div className="editor-stage">
         <div className="stage-topbar">
           <div className="stage-tool-summary">
@@ -3172,67 +3124,64 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
             <p className="stage-context">{stageContext}</p>
           </div>
           <div className="stage-topbar-actions">
-            <div className="stage-help">
-              <button aria-label="Show editor controls" className="stage-help-trigger" type="button">
+            <div className={`stage-help ${helpOpen ? 'is-open' : ''}`}>
+              <button
+                aria-label="Show editor controls"
+                aria-expanded={helpOpen}
+                className="stage-help-trigger"
+                type="button"
+                onClick={() => setHelpOpen((current) => !current)}
+              >
                 <Info aria-hidden="true" className="stage-help-trigger-icon" strokeWidth={2.2} />
               </button>
-              <div className="stage-help-card" role="note">
-                <p className="stage-help-title">Controls</p>
-                <div className="stage-help-list">
-                  {helpItems.map((item) => (
-                    <div key={item.id} className="help-row">
-                      <span className="help-row-glyph"><ControlGlyph icon={item.icon} /></span>
-                      <div className="help-row-copy">
-                        <div className="help-row-head">
-                          <span className="help-row-label">{item.label}</span>
-                          {item.keys?.length ? (
-                            <span className="help-row-keys">
-                              {item.keys.map((key) => (
-                                <span key={`${item.id}-${key}`} className="keycap">{key}</span>
-                              ))}
-                            </span>
-                          ) : null}
-                        </div>
-                        <span className="help-row-action">{item.action}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
             </div>
           </div>
         </div>
 
-        <div className="stage-frame" ref={stageRef} onPointerLeave={handleStagePointerLeave} onPointerMove={handleStagePointerMove}>
-          {floatingControlItems.length > 0 ? (
-            <div className={`stage-floating-help ${dockUnitHelpRight ? 'dock-right' : 'dock-left'} ${showFloatingControls ? 'is-visible' : 'is-hidden'}`} role="note">
-              {floatingControlItems.map((item) => (
-                <div key={item.id} className="help-row stage-floating-help-row">
+        {helpOpen ? (
+          <div className="stage-help-drawer" role="note">
+            <div className="stage-help-drawer-heading">
+              <strong>Editor controls</strong>
+              <button className="ghost-button" type="button" onClick={() => setHelpOpen(false)}>Close</button>
+            </div>
+            <div className="stage-help-list">
+              {helpItems.map((item) => (
+                <div key={item.id} className="help-row">
                   <span className="help-row-glyph"><ControlGlyph icon={item.icon} /></span>
                   <div className="help-row-copy">
-                    <span className="stage-floating-help-text"><strong>{item.label}</strong> {item.action}</span>
+                    <div className="help-row-head">
+                      <span className="help-row-label">{item.label}</span>
+                      {item.keys?.length ? (
+                        <span className="help-row-keys">
+                          {item.keys.map((key) => (
+                            <span key={`${item.id}-${key}`} className="keycap">{key}</span>
+                          ))}
+                        </span>
+                      ) : null}
+                    </div>
+                    <span className="help-row-action">{item.action}</span>
                   </div>
                 </div>
               ))}
             </div>
-          ) : null}
+          </div>
+        ) : null}
+
+        {selectedTool === 'select' && selectedEntities.length > 0 ? (
+          <div className="stage-selection-bar" aria-label="Selected map objects">
+            <span><strong>{selectedEntities.length}</strong> selected</span>
+            <div className="selection-action-bar">
+              <button className="secondary-button" type="button" disabled={selectedUnitCount < 2} onClick={spaceSelectedUnitsEvenly}>
+                Space evenly
+              </button>
+              <button className="danger-button" type="button" onClick={deleteSelectedEntities}>Delete</button>
+              <button className="ghost-button" type="button" onClick={clearSelection}>Unselect</button>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="stage-frame" ref={stageRef}>
           <div className="canvas-stack" style={canvasStackStyle}>
-            {selectionActionStyle ? (
-              <div
-                className={`selection-action-bar floating ${selectionActionPlacement}`}
-                style={selectionActionStyle}
-              >
-                <button className="secondary-button" type="button" disabled={selectedUnitCount < 2} onClick={spaceSelectedUnitsEvenly}>
-                  Space units evenly
-                </button>
-                <button className="danger-button" type="button" onClick={deleteSelectedEntities}>
-                  Delete
-                </button>
-                <button className="ghost-button" type="button" onClick={clearSelection}>
-                  Unselect
-                </button>
-              </div>
-            ) : null}
             <canvas ref={canvasRef} className="map-canvas base" onContextMenu={(e) => e.preventDefault()} />
             <canvas
               ref={overlayRef}
@@ -3246,26 +3195,26 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
             />
             {!ready && <div className="canvas-loading"><span className="loading-pulse" /></div>}
           </div>
-          {liveTeamSummaries.length > 0 ? (
-            <div className="stage-map-live-summary" role="status" aria-live="polite" aria-label="Live team map summary">
-              {liveTeamSummaries.map((summary) => {
-                const teamColor = teamColorForIndex(summary.teamIndex);
-                const line = formatTeamMapSummary(summary);
-
-                return (
-                  <p
-                    key={`${teamColor}-${summary.teamIndex}`}
-                    className="stage-map-live-summary-line"
-                    style={{ '--team-summary-accent': teamAccent(summary.teamIndex, teamCount) } as CSSProperties}
-                    title={`${TEAM_LABELS[teamColor]}: ${line}`}
-                  >
-                    {line}
-                  </p>
-                );
-              })}
-            </div>
-          ) : null}
         </div>
+        {liveTeamSummaries.length > 0 ? (
+          <div className="stage-map-live-summary" role="status" aria-live="polite" aria-label="Live team map summary">
+            {liveTeamSummaries.map((summary) => {
+              const teamColor = teamColorForIndex(summary.teamIndex);
+              const line = formatTeamMapSummary(summary);
+
+              return (
+                <p
+                  key={`${teamColor}-${summary.teamIndex}`}
+                  className="stage-map-live-summary-line"
+                  style={{ '--team-summary-accent': teamAccent(summary.teamIndex, teamCount) } as CSSProperties}
+                  title={`${TEAM_LABELS[teamColor]}: ${line}`}
+                >
+                  {line}
+                </p>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
     </section>
     {leavePromptOpen ? (

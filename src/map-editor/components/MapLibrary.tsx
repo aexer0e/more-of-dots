@@ -10,6 +10,7 @@ interface MapLibraryProps {
   onCreate: () => void;
   onDeleteSelected: (fileNames: string[]) => void;
   onEdit: (mapId: string) => void;
+  onRefresh: () => void;
 }
 
 function thumbnailCoordinateX(map: StoredMap, x: number) {
@@ -131,6 +132,7 @@ export function MapLibrary({
   onCreate,
   onDeleteSelected,
   onEdit,
+  onRefresh,
 }: MapLibraryProps) {
   const [selecting, setSelecting] = useState(false);
   const [selectedMapIds, setSelectedMapIds] = useState<Set<string>>(() => new Set());
@@ -174,9 +176,14 @@ export function MapLibrary({
     <section className="library-shell">
       <div className="library-toolbar">
         <div className="library-toolbar-copy">
+          <span className="eyebrow">Map editor</span>
           <h2>Game Maps</h2>
+          <p>Create, review, and edit maps stored in War of Dots.</p>
         </div>
         <div className="library-toolbar-actions">
+          <button className="secondary-button" type="button" onClick={onRefresh}>
+            Refresh
+          </button>
           <button className="primary-button" type="button" onClick={onCreate}>
             New Map
           </button>

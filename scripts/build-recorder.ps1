@@ -86,6 +86,18 @@ if (-not (Test-Path -LiteralPath $RecorderExe -PathType Leaf)) {
 Invoke-RecorderSigning -Path $RecorderExe
 Copy-Item -LiteralPath (Join-Path $Root 'scripts\recorder-third-party-notices.txt') -Destination (Join-Path $DistRoot 'THIRD-PARTY-NOTICES.txt') -Force
 
+# Dump what the built recorder says about itself. The manifest is generated from
+# this rather than from assumptions in this script, and recording it here lets the
+# manifest be produced somewhere that cannot run a Windows recorder build.
+$CapabilitiesPath = Join-Path $RecorderOutputRoot 'recorder-capabilities.json'
+$CapabilitiesJson = & $RecorderExe --desktop-command recorder-capabilities
+if ($LASTEXITCODE -ne 0) { throw 'The built recorder did not report its capabilities.' }
+$Capabilities = $CapabilitiesJson | ConvertFrom-Json
+if ($Capabilities.version -ne $Version) {
+    throw "The built recorder reports $($Capabilities.version) but RECORDER_VERSION is $Version."
+}
+$CapabilitiesJson | Out-File -LiteralPath $CapabilitiesPath -Encoding utf8
+
 $Ffmpeg = $env:WOD_FFMPEG_PATH
 if (-not $Ffmpeg) {
     $FfmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue

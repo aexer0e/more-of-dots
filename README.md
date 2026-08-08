@@ -19,7 +19,21 @@ The export dialog installs the recorder itself when one is missing or out of dat
 
 The recorder carries its own `wod_replay_server/RECORDER_VERSION`, independent of the app's `VERSION`. Bump it only when the recorder payload changes; otherwise every app patch would push the full installer again. `command_recorder_capabilities` reports it, and the manifest is generated from what the built recorder says rather than from what the build script assumes.
 
-Releases attach `recorder.json` and `recorder.json.sig` even when the recorder was not rebuilt, carrying the previous pair forward unchanged. The manifest's download URL is pinned to the tag that produced the installer, never to `latest`.
+Releases attach `recorder.json` and `recorder.json.sig` even when the recorder was not rebuilt, carrying the previous pair forward unchanged, so a release without a new recorder keeps offering the last good one. The manifest's download URL is pinned to the tag that produced the installer, never to `latest`.
+
+### Publishing a new recorder
+
+The installer embeds game binaries that are deliberately outside source control, so it is built on a machine that already holds the vault and uploaded to the drafted release by hand. Signing happens in Actions, because the release keypair exists only as a secret there.
+
+```powershell
+npm run build:recorder
+gh release upload v<app-version> `
+  "recorder-dist/More.of.Dots.Recorder_<recorder-version>_x64-setup.exe" `
+  "recorder-dist/recorder-capabilities.json"
+gh workflow run recorder.yml -f tag=v<app-version>
+```
+
+The `Publish recorder assets` workflow signs the installer, generates and signs `recorder.json`, attaches both, and removes the capabilities dump it used as a courier for the version and protocol numbers. Publish the release once those assets are on it.
 
 Build the two release artifacts separately:
 

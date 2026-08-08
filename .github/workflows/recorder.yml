@@ -1,0 +1,91 @@
+name: Publish recorder assets
+
+# The recorder installer embeds ~500 MB of game binaries that are deliberately
+# outside source control, so it is built on a machine that already holds the
+# vault and uploaded to the release by hand. This job does the part that needs
+# the release keypair: it signs that installer, writes the manifest the app
+# polls, and signs the manifest too. The private key never leaves Actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag that already has the recorder installer attached (e.g. v1.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-recorder-${{ inputs.tag }}
+
+jobs:
+  publish:
+    name: Sign and publish
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Download the uploaded recorder
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $recorderVersion = (Get-Content wod_replay_server/RECORDER_VERSION -Raw).Trim()
+          $installer = "More.of.Dots.Recorder_${recorderVersion}_x64-setup.exe"
+          New-Item -ItemType Directory -Force -Path recorder-dist | Out-Null
+          gh release download '${{ inputs.tag }}' --dir recorder-dist --clobber `
+            --pattern $installer --pattern 'recorder-capabilities.json'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Upload $installer and recorder-capabilities.json to ${{ inputs.tag }} before running this."
+          }
+          "RECORDER_INSTALLER=recorder-dist/$installer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Sign the recorder and write the manifest
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          npx --yes tauri signer sign --private-key="$env:TAURI_SIGNING_PRIVATE_KEY" --password="$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$env:RECORDER_INSTALLER"
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the recorder installer failed.' }
+          $name = Split-Path -Leaf $env:RECORDER_INSTALLER
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$name"
+          ./scripts/recorder-manifest.ps1 -InstallerPath $env:RECORDER_INSTALLER -Url $url `
+            -CapabilitiesPath recorder-dist/recorder-capabilities.json
+          npx --yes tauri signer sign --private-key="$env:TAURI_SIGNING_PRIVATE_KEY" --password="$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" recorder-dist/recorder.json
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the recorder manifest failed.' }
+
+      - name: Attach the manifest to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload '${{ inputs.tag }}' `
+            "recorder-dist/recorder.json#Recorder update manifest" `
+            "recorder-dist/recorder.json.sig#Recorder update manifest signature" --clobber
+          # The capabilities dump was only a courier for the version and protocol
+          # numbers. Leaving it on the release would imply it is part of the product.
+          gh release delete-asset '${{ inputs.tag }}' recorder-capabilities.json --yes
+
+      - name: Summarize
+        shell: pwsh
+        run: |
+          $manifest = Get-Content recorder-dist/recorder.json -Raw | ConvertFrom-Json
+          "Published recorder $($manifest.recorder_version) for ${{ inputs.tag }}." | Write-Host
+          "Game builds: $($manifest.game_versions -join ', ')" | Write-Host
+          "Installer: $([Math]::Round($manifest.install.size / 1MB, 1)) MB" | Write-Host

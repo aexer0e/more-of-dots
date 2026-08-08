@@ -17,6 +17,7 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
     [Parameter(Mandatory = $true)][string]$Url,
     [string]$RecorderExe,
+    [string]$CapabilitiesPath,
     [string]$SignaturePath,
     [string]$OutputPath
 )
@@ -25,17 +26,24 @@ $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 $Installer = (Resolve-Path -LiteralPath $InstallerPath).Path
-if (-not $RecorderExe) {
-    $RecorderExe = Join-Path $Root 'recorder-dist\more-of-dots-recorder\more-of-dots-recorder.exe'
-}
-$RecorderExe = (Resolve-Path -LiteralPath $RecorderExe).Path
 if (-not $OutputPath) {
     $OutputPath = Join-Path (Split-Path -Parent $Installer) 'recorder.json'
 }
 
-$CapabilitiesJson = & $RecorderExe --desktop-command recorder-capabilities
-if ($LASTEXITCODE -ne 0) { throw 'The built recorder did not report its capabilities.' }
-$Capabilities = $CapabilitiesJson | ConvertFrom-Json
+# Capabilities come from the recorder itself either way. -CapabilitiesPath takes
+# the dump the build already wrote, so the manifest can be produced somewhere that
+# cannot run a Windows recorder build, such as a signing job in CI.
+if ($CapabilitiesPath) {
+    $Capabilities = (Get-Content -LiteralPath (Resolve-Path -LiteralPath $CapabilitiesPath).Path -Raw) | ConvertFrom-Json
+} else {
+    if (-not $RecorderExe) {
+        $RecorderExe = Join-Path $Root 'recorder-dist\more-of-dots-recorder\more-of-dots-recorder.exe'
+    }
+    $RecorderExe = (Resolve-Path -LiteralPath $RecorderExe).Path
+    $CapabilitiesJson = & $RecorderExe --desktop-command recorder-capabilities
+    if ($LASTEXITCODE -ne 0) { throw 'The built recorder did not report its capabilities.' }
+    $Capabilities = $CapabilitiesJson | ConvertFrom-Json
+}
 
 $Version = $Capabilities.version
 if (-not $Version) { throw 'The built recorder did not report a version.' }

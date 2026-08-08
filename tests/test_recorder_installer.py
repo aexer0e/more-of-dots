@@ -16,6 +16,7 @@ BUILD = (ROOT / "scripts" / "build-recorder.ps1").read_text(encoding="utf-8")
 MANIFEST = (ROOT / "scripts" / "recorder-manifest.ps1").read_text(encoding="utf-8")
 UPDATE = (ROOT / "src-tauri" / "src" / "recorder_update.rs").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+RECORDER_WORKFLOW = (ROOT / ".github" / "workflows" / "recorder.yml").read_text(encoding="utf-8")
 
 
 def test_upgrade_clears_the_previous_payload() -> None:
@@ -58,8 +59,29 @@ def test_manifest_requires_a_signature() -> None:
 def test_release_signs_with_single_token_arguments() -> None:
     # `-p "$env:X"` collapses to nothing when the secret is empty, which shifts
     # the file argument into the password slot and hangs on a prompt.
-    assert '--private-key="$env:TAURI_SIGNING_PRIVATE_KEY"' in WORKFLOW
-    assert '--password="$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD"' in WORKFLOW
+    for workflow in (WORKFLOW, RECORDER_WORKFLOW):
+        assert '--private-key="$env:TAURI_SIGNING_PRIVATE_KEY"' in workflow
+        assert '--password="$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD"' in workflow
+
+
+def test_recorder_can_be_signed_without_a_local_key() -> None:
+    # The release keypair only exists as an Actions secret, so the signing step
+    # has to run there. The installer is built and uploaded separately because it
+    # embeds game binaries that are deliberately outside source control.
+    assert "workflow_dispatch" in RECORDER_WORKFLOW
+    assert "gh release download" in RECORDER_WORKFLOW
+    assert "-CapabilitiesPath recorder-dist/recorder-capabilities.json" in RECORDER_WORKFLOW
+    assert "recorder-dist/recorder.json.sig#Recorder update manifest signature" in RECORDER_WORKFLOW
+
+
+def test_manifest_accepts_a_capabilities_dump() -> None:
+    # A signing job cannot run a Windows recorder build, so the version and
+    # protocol numbers travel in the dump the build already produced.
+    assert "$CapabilitiesPath" in MANIFEST
+    assert "recorder-capabilities.json" in BUILD
+    # The build cross-checks the dump against RECORDER_VERSION, so a mislabelled
+    # build fails at packaging time rather than on a user's machine.
+    assert 'throw "The built recorder reports $($Capabilities.version) but RECORDER_VERSION is $Version."' in BUILD
 
 
 def test_release_publishes_a_manifest_on_every_release() -> None:

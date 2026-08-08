@@ -69,3 +69,33 @@ jobs:
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
           args: --bundles nsis --config build/tauri.version.conf.json
+
+      - name: Download authorized recorder build vault
+        if: vars.WOD_RECORDER_VAULT_URL != '' && vars.WOD_RECORDER_VAULT_SHA256 != ''
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'wod-recorder-vault.zip'
+          $vault = Join-Path $env:RUNNER_TEMP 'wod-recorder-vault'
+          Invoke-WebRequest -UseBasicParsing -Uri '${{ vars.WOD_RECORDER_VAULT_URL }}' -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne '${{ vars.WOD_RECORDER_VAULT_SHA256 }}'.ToLowerInvariant()) {
+            throw 'Recorder build vault failed its SHA-256 integrity check.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $vault
+          "WOD_BUNDLED_VERSION_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build recorder NSIS installer
+        if: vars.WOD_RECORDER_VAULT_URL != '' && vars.WOD_RECORDER_VAULT_SHA256 != ''
+        shell: pwsh
+        run: |
+          $env:WOD_FFMPEG_PATH = (Get-Command ffmpeg.exe -ErrorAction Stop).Source
+          npm run build:recorder
+
+      - name: Attach recorder installer to draft release
+        if: vars.WOD_RECORDER_VAULT_URL != '' && vars.WOD_RECORDER_VAULT_SHA256 != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          gh release upload "v$version" "recorder-dist/More.of.Dots.Recorder_${version}_x64-setup.exe#More of Dots Recorder (Windows x64)" --clobber

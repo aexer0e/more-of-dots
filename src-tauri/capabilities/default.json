@@ -5,16 +5,6 @@
   "windows": ["main", "replayPlayer", "replay-player-*"],
   "permissions": [
     "core:default",
-    "dialog:allow-open",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        {
-          "name": "binaries/wod-replay-server",
-          "sidecar": true,
-          "args": true
-        }
-      ]
-    }
+    "dialog:allow-open"
   ]
 }

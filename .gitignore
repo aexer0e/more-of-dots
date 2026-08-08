@@ -22,11 +22,13 @@ runtime/
 # JavaScript/Tauri build output
 node_modules/
 dist/
+recorder-dist/
 build/
 src-tauri/target/
 src-tauri/binaries/*.exe
 src-tauri/gen/
 wod-replay-server.spec
+more-of-dots-recorder.spec
 tools/python-probe-dll/target/
 
 # Local tooling noise

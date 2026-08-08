@@ -101,45 +101,42 @@ def test_region_commands_are_registered_with_tauri() -> None:
 
     assert "region_status" in handler
     assert "select_region" in handler
-    assert "leaderboard_status" in handler
-    assert "leaderboard_submit" in handler
-    assert "leaderboard_list" in handler
 
 
-def test_packaged_python_probe_resources_are_discoverable() -> None:
+def test_recorder_payload_is_not_bundled_with_main_app() -> None:
     root = Path(__file__).resolve().parents[1]
     source = _desktop_source()
     tauri_config = json.loads((root / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
     package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    recorder_build = (root / "scripts" / "build-recorder.ps1").read_text(encoding="utf-8")
+    recorder_installer = (root / "scripts" / "recorder-installer.nsi").read_text(encoding="utf-8")
 
-    assert "_up_" in source
-    assert 'join("python-probe-dll")' in source
-    assert 'find_file_by_name(&resource_dir, "wod_python_probe.dll", 8)' in source
-    assert 'find_file_by_name(&resource_dir, "invoke-python-probe.ps1", 8)' in source
-    assert "../tools/python-probe-dll/target/release/wod_python_probe.dll" in tauri_config["bundle"]["resources"]
-    assert "../scripts/invoke-python-probe.ps1" in tauri_config["bundle"]["resources"]
-    assert "npm run build:sidecar" in tauri_config["build"]["beforeBuildCommand"]
+    assert "fn resolve_recorder_path()" in source
+    assert 'find_file_by_name(recorder_dir, "wod_python_probe.dll", 8)' in source
+    assert 'find_file_by_name(recorder_dir, "invoke-python-probe.ps1", 8)' in source
+    assert "externalBin" not in tauri_config["bundle"]
+    assert "resources" not in tauri_config["bundle"]
+    assert tauri_config["build"]["beforeBuildCommand"] == "npm run build:web"
+    assert "build:sidecar" not in package["scripts"]
+    assert "build:recorder" in package["scripts"]
+    assert "--onedir" in recorder_build
+    assert "wod_python_probe.dll" in recorder_build
+    assert "invoke-python-probe.ps1" in recorder_build
+    assert "DepotDownloader" not in recorder_build
+    assert "BUNDLED_VERSIONS_DIR" in recorder_build
+    assert "supported_versions.json" in recorder_build
+    assert "recorder-installer.nsi" in recorder_build
+    assert 'WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MoreOfDotsRecorder"' in recorder_installer
+    assert 'RMDir /r "$INSTDIR"' in recorder_installer
+    assert 'StrCmp $INSTDIR "$LOCALAPPDATA\\Programs\\More of Dots Recorder"' in recorder_installer
     assert package["scripts"]["build"] == "node scripts/version.mjs tauri build && npm run size:audit"
 
 
 def test_frontend_has_region_browser_page() -> None:
     frontend = (Path(__file__).resolve().parents[1] / "src" / "main.ts").read_text(encoding="utf-8")
 
-    assert 'type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";' in frontend
-    assert 'data-browser-page="leaderboard">Leaderboard' in frontend
-    assert 'invoke<LeaderboardStatusPayload>("leaderboard_status")' in frontend
-    assert 'invoke<{ lastSync?: LeaderboardSyncState }>("leaderboard_submit")' in frontend
-    assert 'invoke<LeaderboardListPayload>("leaderboard_list")' in frontend
-    assert "renderLeaderboardRows" in frontend
-    assert "score-chart-area" in frontend
-    assert "score-chart-callout" in frontend
-    assert "is-current" in frontend
-    assert "<span>Rank</span>" in frontend
-    assert "<span>WIN RATE</span>" in frontend
-    assert "win-rate-ring" in frontend
-    assert "leaderboardSubmitError" in frontend
-    assert "War of Dots is probably still running in another installation or session" in frontend
-    assert "Public rank" not in frontend
+    assert 'type BrowserPage = "replays" | "region" | "mapEditor";' in frontend
+    assert "leaderboard" not in frontend.lower()
     assert 'data-browser-page="region"' in frontend
     assert 'invoke<RegionStatusPayload>("region_status")' in frontend
     assert 'invoke<RegionStatusPayload>("select_region", { region })' in frontend

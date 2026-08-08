@@ -16,23 +16,6 @@ declare global {
   }
 }
 
-type RunnerState = {
-  available: boolean;
-  game_exe_exists: boolean;
-  game_python_capture_available: boolean;
-  desktop_strategy: string;
-  window_strategy: string;
-};
-
-type BackendStatus = {
-  status: string;
-  runtime_dir: string;
-  steam_game_dir: string;
-  steam_game_exists: boolean;
-  capture_source: string;
-  runner: RunnerState;
-};
-
 type Job = {
   job_id: string;
   filename?: string;
@@ -271,6 +254,7 @@ type ReplayBrowserPlayer = {
 type ReplayBrowserItem = {
   fileName: string;
   filePath: string;
+  version?: string | null;
   players: ReplayBrowserPlayer[];
   draw: boolean;
   length: string;
@@ -287,6 +271,8 @@ type ReplayBrowserPayload = {
 
 type ReplayRecordingProgressEvent = {
   stage: string;
+  step?: string;
+  sourcePath?: string;
   current?: number;
   processed?: number;
   total?: number;
@@ -310,6 +296,11 @@ type ReplayRecordingProgressEvent = {
     end_tick?: number;
     frame_count?: number;
     speed_after?: number;
+    step?: string;
+    phase?: string;
+    current_seconds?: number;
+    total_seconds?: number;
+    progress_percent?: number;
   };
 };
 
@@ -319,12 +310,9 @@ type ReplayRecordingSetup = {
   playbackSpeedIndex: number;
   bitrateIndex: number;
   resolutionIndex: number;
-};
-
-type ReplayRecordingNotice = {
-  tone: "success" | "error" | "neutral";
-  title: string;
-  detail: string;
+  replays: ReplayBrowserItem[];
+  readiness: "checking" | "ready" | "error";
+  error: string;
 };
 
 type BrowserSuggestion = {
@@ -358,83 +346,7 @@ type BrowserRenderedCard = {
   winnerNameElement: HTMLElement | null;
   visible: boolean;
 };
-type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";
-type UserCheckpoint = {
-  fetchedAt: number;
-  source?: string | null;
-  fields: Record<string, unknown>;
-  score?: number | null;
-  username?: string | null;
-};
-type UserDataPayload = {
-  fetchedAt: number;
-  username?: string | null;
-  score?: number | null;
-  source?: string | null;
-  lookupError?: string | null;
-  userData: unknown;
-  messages: unknown[];
-  checkpoints: UserCheckpoint[];
-  checkpointFile?: string;
-};
-type ScorePoint = {
-  time: number;
-  score: number;
-  label: string;
-};
-type LeaderboardLocalStats = {
-  username: string;
-  normalizedUsername: string;
-  score: number;
-  officialRank?: number | null;
-  games?: number | null;
-  wins?: number | null;
-  losses?: number | null;
-  region?: string | null;
-  source?: string | null;
-  fetchedAt?: number | null;
-};
-type LeaderboardSyncState = {
-  status: "synced" | "not-submitted" | "sync-failed" | string;
-  syncedAt?: number | null;
-  username?: string | null;
-  publicRank?: number | null;
-  publicScore?: number | null;
-  message?: string | null;
-  error?: string | null;
-};
-type LeaderboardStatusPayload = {
-  configured: boolean;
-  canSubmit: boolean;
-  submitReason: string;
-  hasPassword: boolean;
-  loginUsername?: string | null;
-  local?: LeaderboardLocalStats | null;
-  lastSync?: LeaderboardSyncState | null;
-};
-type LeaderboardRow = {
-  rank: number;
-  username: string;
-  normalizedUsername?: string | null;
-  score: number;
-  officialRank?: number | null;
-  games?: number | null;
-  wins?: number | null;
-  losses?: number | null;
-  region?: string | null;
-  updatedAt?: number | null;
-  lastSeen?: number | null;
-};
-type LeaderboardListPayload = {
-  configured: boolean;
-  rows: LeaderboardRow[];
-  message?: string | null;
-};
-type UserField = {
-  key: string;
-  label: string;
-  value: unknown;
-};
+type BrowserPage = "replays" | "region" | "mapEditor";
 type RegionName = "NA" | "EU" | "ASIA";
 type RegionStatusPayload = {
   gameRunning: boolean;
@@ -521,13 +433,14 @@ const BROWSER_GRID_CARD_SIZE_MIN = 120;
 const BROWSER_GRID_CARD_SIZE_MAX = 480;
 const BROWSER_GRID_CARD_SIZE_DEFAULT = 300;
 const BROWSER_GRID_CARD_SIZE_STEP = 10;
+const RECORDING_DIRECTORY_STORAGE_KEY = "moreOfDotsRecordingDirectory";
 const BROWSER_REPLAY_PLAYBACK_ENABLED = false;
 const RECORDING_SPEED_OPTIONS = [1, 2, 4, 6, 10] as const;
 const RECORDING_BITRATE_OPTIONS = [0.5, 1, 2.5, 5, 10] as const;
 const RECORDING_RESOLUTION_OPTIONS = [480, 720, 1080] as const;
 const RECORDING_DEFAULT_SPEED_INDEX = RECORDING_SPEED_OPTIONS.length - 1;
 const RECORDING_DEFAULT_BITRATE_INDEX = 3;
-const RECORDING_DEFAULT_RESOLUTION_INDEX = 1;
+const RECORDING_DEFAULT_RESOLUTION_INDEX = 2;
 const REGION_NAMES: RegionName[] = ["NA", "EU", "ASIA"];
 const REGION_LABELS: Record<RegionName, string> = {
   NA: "North America",
@@ -557,14 +470,11 @@ const DEFAULT_GRAPH_WINDOWS: GraphWindow[] = [
   { id: "graph-casualties", kind: "casualties", x: 258, y: 206, width: GRAPH_COMPACT_SIZE.width, height: GRAPH_COMPACT_SIZE.height, visible: false, z: 13 },
 ];
 
-let statusPayload: BackendStatus | null = null;
 let jobs: Job[] = [];
 let activeJob: Job | null = null;
 let activeStats: Stats | null = null;
 let boundsCache: Bounds | null = null;
 let phase: Phase = "booting";
-let selectedFileName = "";
-let notice: { tone: "info" | "success" | "error"; text: string } | null = null;
 let progress: ProgressState = { value: 0, label: "Starting", detail: "Opening the local replay backend.", facts: [] };
 let progressTimer = 0;
 let captureProgressTimer = 0;
@@ -612,9 +522,12 @@ let browserBulkDownloadInFlight = false;
 let browserRecordingInFlight = false;
 let browserRecordingCancelling = false;
 let browserRecordingProgress: ReplayRecordingProgressEvent | null = null;
+let browserRecordingItemProgress = new Map<string, ReplayRecordingProgressEvent>();
 let browserRecordingChoosingDirectory = false;
 let browserRecordingSetup: ReplayRecordingSetup | null = null;
-let browserRecordingNotice: ReplayRecordingNotice | null = null;
+let browserRecordingReplays = new Map<string, ReplayBrowserItem>();
+let recordingQueueRoot: HTMLDivElement | null = null;
+const recordingQueueRows = new Map<string, HTMLElement>();
 let browserError = "";
 let browserSearch = "";
 let browserHideUnmatched = true;
@@ -636,16 +549,6 @@ let browserDocumentEventsBound = false;
 let currentLaunchSignature = "";
 let browserPage: BrowserPage = "replays";
 let mapEditorRoot: Root | null = null;
-let userDataPayload: UserDataPayload | null = null;
-let userDataLoading = false;
-let userDataError = "";
-let leaderboardStatusPayload: LeaderboardStatusPayload | null = null;
-let leaderboardRows: LeaderboardRow[] = [];
-let leaderboardLoading = false;
-let leaderboardSubmitting = false;
-let leaderboardError = "";
-let leaderboardSubmitError = "";
-let leaderboardDetailsOpen = false;
 let regionStatusPayload: RegionStatusPayload | null = null;
 let regionLoading = false;
 let regionApplying: RegionName | "" = "";
@@ -736,7 +639,32 @@ function ensureAppUpdateRoot(): HTMLDivElement {
   if (appUpdateRoot) return appUpdateRoot;
   appUpdateRoot = document.createElement("div");
   appUpdateRoot.id = "appUpdateRoot";
+  appUpdateRoot.innerHTML = `
+    <aside class="app-update-toast" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <span class="app-update-icon" aria-hidden="true"></span>
+      <span class="app-update-copy">
+        <strong></strong>
+        <small></small>
+        <div class="app-update-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
+      </span>
+      <span class="app-update-actions">
+        <button class="app-update-primary" type="button" data-update-action="install" hidden>Update</button>
+        <button type="button" data-update-action="later" hidden>Later</button>
+        <button class="app-update-primary" type="button" data-update-action="retry" hidden>Retry</button>
+        <button type="button" data-update-action="close" hidden>Close</button>
+      </span>
+    </aside>
+  `;
   document.body.appendChild(appUpdateRoot);
+  appUpdateRoot.addEventListener("click", (event) => {
+    const action = event.target instanceof Element
+      ? event.target.closest<HTMLButtonElement>("[data-update-action]")?.dataset.updateAction
+      : undefined;
+    if (action === "install") void installAppUpdate();
+    else if (action === "later") dismissAppUpdate();
+    else if (action === "retry") void checkForAppUpdate(true);
+    else if (action === "close") closeAppUpdateUi();
+  });
   return appUpdateRoot;
 }
 
@@ -755,9 +683,14 @@ function appUpdateProgressPercent(): number | null {
   return clamp((appUpdateDownloaded / appUpdateTotal) * 100, 0, 100);
 }
 
+// Patches the toast in place so download progress does not rebuild the subtree,
+// which used to restart the enter animation on every reported chunk.
 function renderAppUpdateUi() {
   updateAppVersionControls();
   const root = ensureAppUpdateRoot();
+  const toast = root.querySelector<HTMLElement>(".app-update-toast");
+  if (!toast) return;
+
   const visible =
     appUpdateStatus === "available" ||
     appUpdateStatus === "downloading" ||
@@ -765,10 +698,8 @@ function renderAppUpdateUi() {
     appUpdateStatus === "error" ||
     appUpdateStatus === "current" ||
     (appUpdateStatus === "checking" && appUpdateManual);
-  if (!visible) {
-    root.replaceChildren();
-    return;
-  }
+  toast.hidden = !visible;
+  if (!visible) return;
 
   const progress = appUpdateProgressPercent();
   const busy = appUpdateStatus === "downloading" || appUpdateStatus === "installing";
@@ -799,31 +730,35 @@ function renderAppUpdateUi() {
             : appUpdateStatus === "current"
               ? `${appVersionLabel()} is the latest version.`
               : "The app is still usable. You can try again.");
-  const progressMarkup = busy
-    ? `<div class="app-update-progress ${progress === null ? "is-indeterminate" : ""}" role="progressbar" ${
-        progress === null ? "" : `aria-valuenow="${Math.round(progress)}" aria-valuemin="0" aria-valuemax="100"`
-      }><span style="${progress === null ? "" : `width:${progress}%`}"></span></div>`
-    : "";
-  const actions =
-    appUpdateStatus === "available"
-      ? `<button class="app-update-primary" type="button" data-update-install>Update</button><button type="button" data-update-later>Later</button>`
-      : appUpdateStatus === "error"
-        ? `<button class="app-update-primary" type="button" data-update-retry>Retry</button><button type="button" data-update-close>Close</button>`
-        : appUpdateStatus === "current"
-          ? `<button type="button" data-update-close>Close</button>`
-          : "";
 
-  root.innerHTML = `
-    <aside class="app-update-toast is-${appUpdateStatus}" role="${appUpdateStatus === "error" ? "alert" : "status"}" aria-live="polite" aria-atomic="true">
-      <span class="app-update-icon" aria-hidden="true"></span>
-      <span class="app-update-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small>${progressMarkup}</span>
-      ${actions ? `<span class="app-update-actions">${actions}</span>` : ""}
-    </aside>
-  `;
-  root.querySelector<HTMLButtonElement>("[data-update-install]")?.addEventListener("click", () => void installAppUpdate());
-  root.querySelector<HTMLButtonElement>("[data-update-later]")?.addEventListener("click", dismissAppUpdate);
-  root.querySelector<HTMLButtonElement>("[data-update-retry]")?.addEventListener("click", () => void checkForAppUpdate(true));
-  root.querySelector<HTMLButtonElement>("[data-update-close]")?.addEventListener("click", closeAppUpdateUi);
+  const toastClass = `app-update-toast is-${appUpdateStatus}`;
+  if (toast.className !== toastClass) toast.className = toastClass;
+  setAttribute(toast, "role", appUpdateStatus === "error" ? "alert" : "status");
+  setText(toast.querySelector(".app-update-copy strong"), title);
+  setText(toast.querySelector(".app-update-copy small"), detail);
+
+  const bar = toast.querySelector<HTMLElement>(".app-update-progress");
+  if (bar) {
+    bar.hidden = !busy;
+    bar.classList.toggle("is-indeterminate", progress === null);
+    if (progress === null) bar.removeAttribute("aria-valuenow");
+    else setAttribute(bar, "aria-valuenow", String(Math.round(progress)));
+    const fill = bar.querySelector<HTMLElement>("span");
+    const width = progress === null ? "" : `${progress}%`;
+    if (fill && fill.style.width !== width) fill.style.width = width;
+  }
+
+  const shown: Record<string, boolean> = {
+    install: appUpdateStatus === "available",
+    later: appUpdateStatus === "available",
+    retry: appUpdateStatus === "error",
+    close: appUpdateStatus === "error" || appUpdateStatus === "current",
+  };
+  toast.querySelectorAll<HTMLButtonElement>("[data-update-action]").forEach((button) => {
+    button.hidden = !shown[button.dataset.updateAction ?? ""];
+  });
+  const actions = toast.querySelector<HTMLElement>(".app-update-actions");
+  if (actions) actions.hidden = !Object.values(shown).some(Boolean);
 }
 
 function closeAppUpdateUi() {
@@ -1043,400 +978,6 @@ function replayScoreDelta(replay: ReplayBrowserItem): number | null {
 function formatScoreDelta(delta: number): string {
   const sign = delta > 0 ? "+" : "-";
   return `${sign}${Math.abs(delta).toLocaleString()} elo`;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function prettifyFieldLabel(path: string): string {
-  const tail = path.split(".").at(-1) ?? path;
-  return tail
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/\b\w/g, (letter) => letter.toLocaleUpperCase());
-}
-
-function flattenUserFields(value: unknown, prefix = "", fields: UserField[] = []): UserField[] {
-  if (value === null || value === undefined) return fields;
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => flattenUserFields(item, prefix ? `${prefix}.${index}` : String(index), fields));
-    return fields;
-  }
-  if (isPlainObject(value)) {
-    Object.entries(value).forEach(([key, item]) => {
-      flattenUserFields(item, prefix ? `${prefix}.${key}` : key, fields);
-    });
-    return fields;
-  }
-  fields.push({ key: prefix || "value", label: prettifyFieldLabel(prefix || "value"), value });
-  return fields;
-}
-
-function compactUserValue(value: unknown): string {
-  if (typeof value === "boolean") return value ? "true" : "false";
-  if (typeof value === "number" && Number.isFinite(value)) return value.toLocaleString();
-  if (typeof value === "string") return value;
-  return JSON.stringify(value ?? null);
-}
-
-function fieldNumber(fields: UserField[], patterns: RegExp[]): number | null {
-  for (const pattern of patterns) {
-    const field = fields.find((candidate) => pattern.test(candidate.key) || pattern.test(candidate.label));
-    const value = Number(field?.value);
-    if (Number.isFinite(value)) return value;
-  }
-  return null;
-}
-
-function fieldText(fields: UserField[], patterns: RegExp[]): string {
-  for (const pattern of patterns) {
-    const field = fields.find((candidate) => pattern.test(candidate.key) || pattern.test(candidate.label));
-    if (field?.value !== null && field?.value !== undefined && String(field.value).trim()) return String(field.value);
-  }
-  return "";
-}
-
-function userDataFields(payload: UserDataPayload | null): UserField[] {
-  if (!payload) return [];
-  const primary = flattenUserFields(payload.userData);
-  if (primary.length) return primary;
-  return flattenUserFields(payload.messages);
-}
-
-function formatUserDate(seconds: unknown): string {
-  const value = Number(seconds);
-  if (!Number.isFinite(value) || value <= 0) return "-";
-  return new Date(value * 1000).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatScoreChartDate(seconds: number, spanSeconds: number): string {
-  const date = new Date(seconds * 1000);
-  if (spanSeconds <= 26 * 60 * 60) {
-    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-  }
-  const options: Intl.DateTimeFormatOptions = {
-    month: "short",
-    day: "numeric",
-  };
-  if (spanSeconds > 300 * 24 * 60 * 60) options.year = "2-digit";
-  return date.toLocaleDateString(undefined, options);
-}
-
-function formatCompactScore(value: number): string {
-  const absolute = Math.abs(value);
-  if (absolute >= 1_000_000) {
-    const divisor = 1_000_000;
-    return `${(value / divisor).toFixed(absolute >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`;
-  }
-  if (absolute >= 10_000) {
-    return `${Math.round(value / 1_000).toLocaleString()}K`;
-  }
-  if (absolute >= 1_000) {
-    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K`;
-  }
-  return Math.round(value).toLocaleString();
-}
-
-function formatChartRange(seconds: number): string {
-  if (seconds >= 2 * 24 * 60 * 60) return `${Math.round(seconds / (24 * 60 * 60)).toLocaleString()} days`;
-  if (seconds >= 24 * 60 * 60) return "1 day";
-  if (seconds >= 2 * 60 * 60) return `${Math.round(seconds / (60 * 60)).toLocaleString()} hours`;
-  if (seconds >= 60 * 60) return "1 hour";
-  if (seconds < 60) return "<1 min";
-  return `${Math.max(1, Math.round(seconds / 60)).toLocaleString()} min`;
-}
-
-function normalizeLeaderboardName(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    .toLocaleLowerCase()
-    .replace(/[^a-z0-9_.-]/g, "");
-}
-
-function leaderboardStatsFromUserData(payload: UserDataPayload | null): LeaderboardLocalStats | null {
-  const fields = userDataFields(payload);
-  const score = Number(payload?.score ?? fieldNumber(fields, [/(^|\.)(score|elo|rating)$/i]));
-  const username =
-    payload?.username ||
-    fieldText(fields, [/(^|\.)(username|userName|name|displayName|playerName)$/i]) ||
-    leaderboardStatusPayload?.local?.username ||
-    "";
-  const normalizedUsername = normalizeLeaderboardName(username);
-  if (!Number.isFinite(score) || !username || !normalizedUsername) return leaderboardStatusPayload?.local ?? null;
-
-  const officialRank = fieldNumber(fields, [/(^|\.)(rank|ratingRank|leaderboardRank|officialRank|position|place)$/i]);
-  const wins = fieldNumber(fields, [/number[_\s-]*of[_\s-]*wins/i, /(^|\.)(wins|winCount|win_count|victories)$/i]);
-  const total = fieldNumber(fields, [
-    /number[_\s-]*of[_\s-]*games/i,
-    /games[_\s-]*played/i,
-    /(^|\.)(games|matches|played|gameCount|game_count|matchCount|match_count|totalGames|total_games|gamesPlayed|games_played)$/i,
-  ]);
-  const losses = total !== null && wins !== null ? Math.max(0, total - wins) : fieldNumber(fields, [/(^|\.)(losses|lossCount|defeats)$/i]);
-  return {
-    username,
-    normalizedUsername,
-    score,
-    officialRank,
-    games: total,
-    wins,
-    losses,
-    region: regionStatusPayload?.selectedRegion ?? leaderboardStatusPayload?.local?.region ?? null,
-    source: payload?.source ?? leaderboardStatusPayload?.local?.source ?? null,
-    fetchedAt: payload?.fetchedAt ?? leaderboardStatusPayload?.local?.fetchedAt ?? null,
-  };
-}
-
-function currentLeaderboardStats(): LeaderboardLocalStats | null {
-  return leaderboardStatsFromUserData(userDataPayload) ?? leaderboardStatusPayload?.local ?? null;
-}
-
-function formatOptionalNumber(value: unknown): string {
-  const number = Number(value);
-  return Number.isFinite(number) ? number.toLocaleString() : "-";
-}
-
-function leaderboardRowTime(row: LeaderboardRow): number | null {
-  const time = Number(row.updatedAt ?? row.lastSeen);
-  return Number.isFinite(time) && time > 0 ? time : null;
-}
-
-function friendlyLeaderboardError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error || "Leaderboard sync failed.");
-  if (message.toLocaleLowerCase().includes("already claimed by another install")) {
-    return "This player name is active elsewhere. War of Dots is probably still running in another installation or session. Close the other game, then press Refresh to try again.";
-  }
-  return message;
-}
-
-function leaderboardSyncLabel(status: LeaderboardStatusPayload | null): { label: string; tone: string; detail: string } {
-  if (leaderboardSubmitting) return { label: "Syncing", tone: "info", detail: "Submitting the latest score snapshot." };
-  if (leaderboardSubmitError) return { label: "Could not sync", tone: "bad", detail: leaderboardSubmitError };
-  if (!status?.configured) return { label: "Not submitted", tone: "warn", detail: status?.submitReason || "Set WOD_LEADERBOARD_URL to publish rankings." };
-  if (!status.hasPassword) return { label: "Missing login", tone: "warn", detail: status.submitReason };
-  if (status.lastSync?.status === "synced") {
-    return { label: "Synced", tone: "good", detail: status.lastSync.syncedAt ? `Updated ${formatUserDate(status.lastSync.syncedAt)}` : "Latest score submitted." };
-  }
-  if (status.lastSync?.status === "sync-failed") {
-    return { label: "Could not sync", tone: "bad", detail: friendlyLeaderboardError(status.lastSync.error || status.submitReason) };
-  }
-  return { label: status.canSubmit ? "Not submitted" : "Not submitted", tone: status.canSubmit ? "info" : "warn", detail: status.submitReason };
-}
-
-function renderLeaderboardRows(currentName: string): string {
-  if (leaderboardLoading && !leaderboardRows.length) {
-    return `<div class="leaderboard-state">Loading public leaderboard...</div>`;
-  }
-  if (leaderboardError) {
-    return `<div class="leaderboard-state is-error">${escapeHtml(leaderboardError)}</div>`;
-  }
-  if (!leaderboardRows.length) {
-    const message = leaderboardStatusPayload?.configured
-      ? "No public scores have been submitted yet."
-      : "Leaderboard backend is not configured yet.";
-    return `<div class="leaderboard-state">${escapeHtml(message)}</div>`;
-  }
-
-  return `
-    <div class="leaderboard-table" role="table" aria-label="Public leaderboard">
-      <div class="leaderboard-table-head" role="row">
-        <span>Rank</span>
-        <span>Player</span>
-        <span>Score</span>
-        <span>Games</span>
-        <span>Wins</span>
-        <span>Region</span>
-        <span>Updated</span>
-      </div>
-      ${leaderboardRows
-        .map((row) => {
-          const normalized = normalizeLeaderboardName(row.normalizedUsername || row.username);
-          const isCurrent = Boolean(currentName && normalized === currentName);
-          const rank = Number(row.officialRank ?? row.rank);
-          const hasRank = Number.isFinite(rank) && rank > 0;
-          const topClass = hasRank && rank <= 3 ? ` is-top-${rank}` : "";
-          return `
-            <div class="leaderboard-row${topClass}${isCurrent ? " is-current" : ""}" role="row">
-              <span class="leaderboard-rank" data-label="Rank">${hasRank ? `#${escapeHtml(rank.toLocaleString())}` : "-"}</span>
-              <strong class="leaderboard-player" data-label="Player">${escapeHtml(row.username || "Unknown")}</strong>
-              <span class="leaderboard-score" data-label="Score">${escapeHtml(formatOptionalNumber(row.score))}</span>
-              <span data-label="Games">${escapeHtml(formatOptionalNumber(row.games))}</span>
-              <span data-label="Wins">${escapeHtml(formatOptionalNumber(row.wins))}</span>
-              <span data-label="Region">${escapeHtml(row.region || "-")}</span>
-              <span data-label="Updated">${escapeHtml(formatUserDate(leaderboardRowTime(row)))}</span>
-            </div>
-          `;
-        })
-        .join("")}
-    </div>
-  `;
-}
-
-function userScorePoints(payload: UserDataPayload | null): ScorePoint[] {
-  if (!payload) return [];
-  const points = payload.checkpoints
-    .map((checkpoint) => ({
-      time: Number(checkpoint.fetchedAt),
-      score: Number(checkpoint.score ?? checkpoint.fields?.score),
-      label: checkpoint.username || "Checkpoint",
-    }))
-    .filter((point) => Number.isFinite(point.time) && point.time > 0 && Number.isFinite(point.score));
-  const currentScore = Number(payload.score);
-  if (Number.isFinite(currentScore)) {
-    const currentTime = Number(payload.fetchedAt || Math.floor(Date.now() / 1000));
-    const last = points.at(-1);
-    if (!last || last.time !== currentTime || last.score !== currentScore) {
-      points.push({ time: currentTime, score: currentScore, label: "Current" });
-    }
-  }
-  return points.sort((left, right) => left.time - right.time);
-}
-
-function renderScoreChart(payload: UserDataPayload | null): string {
-  const points = userScorePoints(payload);
-  if (points.length < 2) {
-    return `<div class="score-chart-empty">Score history will appear after at least two scored checkpoints.</div>`;
-  }
-
-  const width = 760;
-  const height = 292;
-  const padding = { left: 68, right: 34, top: 28, bottom: 52 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const minTime = Math.min(...points.map((point) => point.time));
-  const maxTime = Math.max(...points.map((point) => point.time));
-  const minScore = Math.min(...points.map((point) => point.score));
-  const maxScore = Math.max(...points.map((point) => point.score));
-  const timeSpan = Math.max(1, maxTime - minTime);
-  const scoreSpread = Math.max(0, maxScore - minScore);
-  const scorePadding = Math.max(12, Math.round(scoreSpread * 0.18), scoreSpread === 0 ? 24 : 0);
-  const lowScore = minScore - scorePadding;
-  const highScore = maxScore + scorePadding;
-  const scoreSpan = Math.max(1, highScore - lowScore);
-  const x = (time: number) => padding.left + ((time - minTime) / timeSpan) * plotWidth;
-  const y = (score: number) => padding.top + (1 - (score - lowScore) / scoreSpan) * plotHeight;
-  const plotted = points.map((point) => ({
-    ...point,
-    x: x(point.time),
-    y: y(point.score),
-  }));
-  const path = plotted.map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
-  const last = points.at(-1)!;
-  const first = points[0]!;
-  const delta = last.score - first.score;
-  const best = points.reduce((winner, point) => (point.score > winner.score ? point : winner), points[0]!);
-  const range = Math.max(0, maxTime - minTime);
-  const chartBottom = height - padding.bottom;
-  const areaPath = `${path} L${plotted.at(-1)!.x.toFixed(1)} ${chartBottom} L${plotted[0]!.x.toFixed(1)} ${chartBottom} Z`;
-  const horizontalTicks = Array.from({ length: 5 }, (_, index) => lowScore + (scoreSpan * index) / 4);
-  const timeTickCount = range > 4 * 24 * 60 * 60 ? 4 : 3;
-  const timeTicks =
-    maxTime > minTime
-      ? Array.from({ length: timeTickCount }, (_, index) => minTime + ((maxTime - minTime) * index) / (timeTickCount - 1))
-      : [minTime];
-  const sparsePoints =
-    plotted.length > 80
-      ? plotted.filter((_, index) => index === 0 || index === plotted.length - 1 || index % Math.ceil(plotted.length / 60) === 0)
-      : plotted;
-  const lastX = x(last.time);
-  const lastY = y(last.score);
-  const calloutWidth = 118;
-  const calloutHeight = 34;
-  const calloutX = clamp(lastX + 14, padding.left + 6, width - padding.right - calloutWidth - 6);
-  const calloutY = clamp(lastY - calloutHeight - 14, padding.top + 4, chartBottom - calloutHeight - 4);
-  const deltaLabel = delta > 0 ? `+${delta.toLocaleString()}` : delta.toLocaleString();
-
-  return `
-    <div class="score-chart-meta">
-      <div>
-        <span>Current</span>
-        <strong>${escapeHtml(last.score.toLocaleString())}</strong>
-      </div>
-      <div>
-        <span>Change</span>
-        <strong class="${delta >= 0 ? "is-gain" : "is-loss"}">${escapeHtml(deltaLabel)}</strong>
-      </div>
-      <div>
-        <span>Best</span>
-        <strong>${escapeHtml(best.score.toLocaleString())}</strong>
-      </div>
-      <div>
-        <span>Range</span>
-        <strong>${escapeHtml(formatChartRange(range || timeSpan))}</strong>
-      </div>
-    </div>
-    <div class="score-chart-wrap">
-      <svg class="score-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Score over time">
-        <defs>
-          <linearGradient id="scoreChartLine" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stop-color="#67b7ff" />
-            <stop offset="100%" stop-color="#72ef97" />
-          </linearGradient>
-          <linearGradient id="scoreChartArea" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#67b7ff" stop-opacity="0.34" />
-            <stop offset="100%" stop-color="#67b7ff" stop-opacity="0.02" />
-          </linearGradient>
-        </defs>
-        <g class="score-chart-grid">
-          ${horizontalTicks
-            .map(
-              (tick) =>
-                `<line x1="${padding.left}" y1="${y(tick).toFixed(1)}" x2="${width - padding.right}" y2="${y(tick).toFixed(1)}" />`,
-            )
-            .join("")}
-          ${timeTicks
-            .map((tick) => `<line x1="${x(tick).toFixed(1)}" y1="${padding.top}" x2="${x(tick).toFixed(1)}" y2="${chartBottom}" />`)
-            .join("")}
-        </g>
-        <g class="score-chart-axis">
-          <line x1="${padding.left}" y1="${chartBottom}" x2="${width - padding.right}" y2="${chartBottom}" />
-          <line x1="${padding.left}" y1="${padding.top}" x2="${padding.left}" y2="${chartBottom}" />
-          ${horizontalTicks
-            .map(
-              (tick) =>
-                `<text x="${padding.left - 12}" y="${(y(tick) + 4).toFixed(1)}" text-anchor="end">${escapeHtml(formatCompactScore(tick))}</text>`,
-            )
-            .join("")}
-          ${timeTicks
-            .map(
-              (tick, index) =>
-                `<text x="${x(tick).toFixed(1)}" y="${height - 18}" text-anchor="${index === 0 ? "start" : index === timeTicks.length - 1 ? "end" : "middle"}">${escapeHtml(formatScoreChartDate(tick, range || timeSpan))}</text>`,
-            )
-            .join("")}
-        </g>
-        <path class="score-chart-area" d="${areaPath}" />
-        <path class="score-chart-line" d="${path}" />
-        <g class="score-chart-points">
-          ${sparsePoints
-            .map(
-              (point) =>
-                `<circle class="score-chart-point" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="3"><title>${escapeHtml(
-                  `${point.label}: ${point.score.toLocaleString()} on ${formatUserDate(point.time)}`,
-                )}</title></circle>`,
-            )
-            .join("")}
-        </g>
-        <circle class="score-chart-highlight is-best" cx="${x(best.time).toFixed(1)}" cy="${y(best.score).toFixed(1)}" r="6">
-          <title>${escapeHtml(`Best: ${best.score.toLocaleString()} on ${formatUserDate(best.time)}`)}</title>
-        </circle>
-        <line class="score-chart-callout-line" x1="${lastX.toFixed(1)}" y1="${lastY.toFixed(1)}" x2="${calloutX.toFixed(1)}" y2="${(calloutY + calloutHeight / 2).toFixed(1)}" />
-        <circle class="score-chart-highlight is-current" cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="7">
-          <title>${escapeHtml(`Current: ${last.score.toLocaleString()} on ${formatUserDate(last.time)}`)}</title>
-        </circle>
-        <g class="score-chart-callout">
-          <rect class="score-chart-callout-box" x="${calloutX.toFixed(1)}" y="${calloutY.toFixed(1)}" width="${calloutWidth}" height="${calloutHeight}" rx="8" />
-          <text class="score-chart-callout-label" x="${(calloutX + 10).toFixed(1)}" y="${(calloutY + 13).toFixed(1)}">Current</text>
-          <text class="score-chart-callout-value" x="${(calloutX + 10).toFixed(1)}" y="${(calloutY + 27).toFixed(1)}">${escapeHtml(last.score.toLocaleString())}</text>
-        </g>
-      </svg>
-    </div>
-  `;
 }
 
 function playerColorClass(player: ReplayBrowserPlayer, fallbackIndex: number): string {
@@ -1769,30 +1310,11 @@ function replayRecordingFileName(replay: ReplayBrowserItem, playbackSpeed: numbe
   return `${timestamp}_${playerNames || "replay"}_${playbackSpeed}x_${resolutionHeight}p.mp4`;
 }
 
-function replayRecordingButtonLabel(): string {
-  if (browserRecordingChoosingDirectory) return "Choosing folder...";
-  if (browserRecordingCancelling) return "Stopping...";
-  const progress = browserRecordingProgress;
-  if (!browserRecordingInFlight || !progress) return "Record";
-  if (progress.stage === "staging") return "Preparing...";
-  const current = replayRecordingProcessed(progress);
-  const total = progress.total ?? browserSelectedReplayPaths.size;
-  const percent = replayRecordingPercent(progress);
-  return `Stop ${percent}% · ${current}/${total}`;
-}
-
 function replayRecordingProcessed(progress = browserRecordingProgress): number {
   if (!progress) return 0;
   const total = Math.max(0, progress.total ?? browserSelectedReplayPaths.size);
   const processed = progress.processed ?? progress.current ?? ((progress.succeeded ?? progress.recorded ?? 0) + (progress.failed ?? 0));
   return Math.max(0, Math.min(total, processed));
-}
-
-function replayRecordingPercent(progress = browserRecordingProgress): number {
-  if (!progress) return 0;
-  const total = Math.max(0, progress.total ?? browserSelectedReplayPaths.size);
-  if (!total) return 0;
-  return Math.max(0, Math.min(100, Math.floor((replayRecordingProcessed(progress) * 100) / total)));
 }
 
 function mergeReplayRecordingProgress(next: ReplayRecordingProgressEvent): ReplayRecordingProgressEvent {
@@ -1808,28 +1330,223 @@ function mergeReplayRecordingProgress(next: ReplayRecordingProgressEvent): Repla
   };
 }
 
-function renderReplayRecordingProgress(): string {
-  const progress = browserRecordingProgress;
-  if (!browserRecordingInFlight || !progress) return "";
-  const total = Math.max(0, progress.total ?? browserSelectedReplayPaths.size);
-  const processed = replayRecordingProcessed(progress);
-  const succeeded = Math.max(0, progress.succeeded ?? progress.recorded ?? Math.max(0, processed - (progress.failed ?? 0)));
-  const failed = Math.max(0, progress.failed ?? 0);
-  const active = Math.max(0, progress.active ?? 0);
-  const queued = Math.max(0, progress.queued ?? total - processed - active);
-  const percent = replayRecordingPercent(progress);
-  const attempt = progress.attempt && progress.maxAttempts && progress.attempt > 1
-    ? ` · retry ${progress.attempt}/${progress.maxAttempts}`
-    : "";
-  const status = progress.stage === "staging"
-    ? "Preparing"
-    : `${succeeded} saved${failed ? ` · ${failed} failed` : ""}${active ? ` · ${active} active` : ""}${queued ? ` · ${queued} queued` : ""}${attempt}`;
-  return `
-    <div class="replay-recording-progress" role="progressbar" aria-label="Replay export progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${processed} of ${total} replays processed">
-      <span class="replay-recording-progress-copy"><strong>${percent}%</strong><small>${escapeHtml(status)}</small></span>
-      <span class="replay-recording-progress-track" aria-hidden="true"><span style="width:${percent}%"></span></span>
-    </div>
+function replayRecordingItemStep(progress: ReplayRecordingProgressEvent): string {
+  const rawStep = progress.step || progress.encoder?.step || progress.stage;
+  const normalized = rawStep.trim().toLocaleLowerCase();
+  if (normalized === "queued-file" || normalized === "staging") return "waiting-in-queue";
+  if (normalized === "starting") return "preparing";
+  if (normalized === "completed-file") return "completed";
+  if (normalized === "failed-file") return "failed";
+  return normalized;
+}
+
+function replayRecordingStepLabel(step: string): string {
+  switch (step) {
+    case "waiting-in-queue": return "Waiting in queue";
+    case "waiting-for-game-slot": return "Waiting for game slot";
+    case "preparing": return "Preparing";
+    case "retrying": return "Retrying";
+    case "opening-game": return "Opening game";
+    case "starting-replay": return "Starting replay";
+    case "recording": return "Recording";
+    case "exporting": return "Exporting";
+    case "completed": return "Completed";
+    case "cancelled": return "Cancelled";
+    case "failed": return "Failed";
+    default: return step.replaceAll("-", " ").replace(/^./, (letter) => letter.toLocaleUpperCase());
+  }
+}
+
+function replayRecordingItemTiming(progress: ReplayRecordingProgressEvent, replay: ReplayBrowserItem) {
+  const encoder = progress.encoder;
+  const tick = Number(encoder?.tick);
+  const endTick = Number(encoder?.end_tick);
+  const explicitCurrent = Number(encoder?.current_seconds);
+  const explicitTotal = Number(encoder?.total_seconds);
+  const currentSeconds = Number.isFinite(explicitCurrent)
+    ? explicitCurrent
+    : Number.isFinite(tick) ? tick / GAME_TICKS_PER_SECOND : 0;
+  const totalSeconds = Number.isFinite(explicitTotal) && explicitTotal > 0
+    ? explicitTotal
+    : Number.isFinite(endTick) && endTick > 0 ? endTick / GAME_TICKS_PER_SECOND : replay.durationSeconds;
+  const explicitPercent = Number(encoder?.progress_percent);
+  const percent = Number.isFinite(explicitPercent)
+    ? explicitPercent
+    : totalSeconds > 0 ? (currentSeconds / totalSeconds) * 100 : 0;
+  return {
+    currentSeconds: Math.max(0, Math.min(totalSeconds || currentSeconds, currentSeconds)),
+    totalSeconds: Math.max(0, totalSeconds),
+    percent: Math.max(0, Math.min(100, percent)),
+  };
+}
+
+function replayRecordingIsTerminal(progress: ReplayRecordingProgressEvent): boolean {
+  return ["completed", "failed", "cancelled"].includes(replayRecordingItemStep(progress));
+}
+
+function replayRecordingItemPercent(progress: ReplayRecordingProgressEvent, replay: ReplayBrowserItem): number {
+  const step = replayRecordingItemStep(progress);
+  const timing = replayRecordingItemTiming(progress, replay);
+  if (step === "completed" || step === "exporting") return 100;
+  if (step === "recording") return timing.percent;
+  if (step === "starting-replay") return 8;
+  if (step === "opening-game") return 5;
+  if (step === "preparing" || step === "retrying") return 2;
+  return 0;
+}
+
+function replayRecordingItemTitle(replay: ReplayBrowserItem): string {
+  return replay.players.map((player) => player.name).join(" vs ") || replay.fileName || "Replay";
+}
+
+function recordingQueueItems() {
+  return Array.from(browserRecordingItemProgress.entries())
+    .map(([sourcePath, progress]) => ({ sourcePath, progress, replay: browserRecordingReplays.get(sourcePath) }))
+    .filter((item): item is { sourcePath: string; progress: ReplayRecordingProgressEvent; replay: ReplayBrowserItem } => Boolean(item.replay));
+}
+
+function setText(element: Element | null | undefined, value: string) {
+  if (element && element.textContent !== value) element.textContent = value;
+}
+
+function setAttribute(element: Element | null | undefined, name: string, value: string) {
+  if (element && element.getAttribute(name) !== value) element.setAttribute(name, value);
+}
+
+const RECORDING_QUEUE_ICON_OPEN = `<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>`;
+const RECORDING_QUEUE_ICON_CLEAR = `<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>`;
+
+function createRecordingQueueRow(): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "recording-queue-item";
+  row.innerHTML = `
+    <span class="recording-queue-state" aria-hidden="true"></span>
+    <span class="recording-queue-copy">
+      <strong></strong>
+      <small><b></b><span></span></small>
+      <span class="recording-queue-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i></i></span>
+    </span>
+    <span class="recording-queue-actions">
+      <button type="button" data-recording-action="open" title="Open output folder" aria-label="Open output folder" hidden>${RECORDING_QUEUE_ICON_OPEN}</button>
+      <button type="button" data-recording-action="clear" title="Clear" hidden>${RECORDING_QUEUE_ICON_CLEAR}</button>
+    </span>
   `;
+  return row;
+}
+
+function updateRecordingQueueRow(
+  row: HTMLElement,
+  progress: ReplayRecordingProgressEvent,
+  replay: ReplayBrowserItem,
+) {
+  const step = replayRecordingItemStep(progress);
+  const timing = replayRecordingItemTiming(progress, replay);
+  const percent = replayRecordingItemPercent(progress, replay);
+  const showClock = (step === "recording" || step === "exporting") && timing.totalSeconds > 0;
+  const detail = showClock
+    ? `${formatDurationSeconds(timing.currentSeconds)} / ${formatDurationSeconds(timing.totalSeconds)}`
+    : progress.attempt && progress.maxAttempts && progress.attempt > 1
+      ? `Attempt ${progress.attempt}/${progress.maxAttempts}`
+      : progress.message || progress.fileName || replay.fileName;
+  const title = replayRecordingItemTitle(replay);
+  const stepLabel = replayRecordingStepLabel(step);
+  const terminal = replayRecordingIsTerminal(progress);
+
+  const stepClass = `recording-queue-item is-${step}`;
+  if (row.className !== stepClass) row.className = stepClass;
+
+  const name = row.querySelector("strong");
+  setText(name, title);
+  setAttribute(name, "title", title);
+
+  setText(row.querySelector("small b"), stepLabel);
+  const detailNode = row.querySelector("small span");
+  setText(detailNode, detail);
+  setAttribute(detailNode, "title", detail);
+
+  const track = row.querySelector<HTMLElement>(".recording-queue-track");
+  setAttribute(track, "aria-label", `${stepLabel} ${Math.round(percent)} percent`);
+  setAttribute(track, "aria-valuenow", String(Math.round(percent)));
+  const bar = track?.querySelector<HTMLElement>("i");
+  const width = `${percent.toFixed(2)}%`;
+  if (bar && bar.style.width !== width) bar.style.width = width;
+
+  const openButton = row.querySelector<HTMLButtonElement>('[data-recording-action="open"]');
+  if (openButton) openButton.hidden = !(step === "completed" && progress.outputPath);
+  const clearButton = row.querySelector<HTMLButtonElement>('[data-recording-action="clear"]');
+  if (clearButton) {
+    clearButton.hidden = !terminal;
+    setAttribute(clearButton, "aria-label", `Clear ${title}`);
+  }
+}
+
+function ensureRecordingQueueRoot(): HTMLDivElement {
+  if (recordingQueueRoot) return recordingQueueRoot;
+  recordingQueueRoot = document.createElement("div");
+  recordingQueueRoot.id = "recordingQueueRoot";
+  recordingQueueRoot.innerHTML = `
+    <aside class="recording-queue" aria-label="Replay recording queue" hidden>
+      <header class="recording-queue-header">
+        <span><strong>Replay exports</strong><small></small></span>
+        <button id="stopReplayRecordingQueue" class="recording-queue-stop" type="button" hidden>
+          <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>
+          <span></span>
+        </button>
+      </header>
+      <div class="recording-queue-list"></div>
+    </aside>
+  `;
+  document.body.appendChild(recordingQueueRoot);
+  bindRecordingQueueEvents(recordingQueueRoot);
+  return recordingQueueRoot;
+}
+
+// Patches the queue in place. Rebuilding the subtree on every progress event made
+// the panel flash and restarted its transitions several times a second.
+function refreshRecordingQueueUi() {
+  const root = ensureRecordingQueueRoot();
+  const panel = root.querySelector<HTMLElement>(".recording-queue");
+  const list = root.querySelector<HTMLElement>(".recording-queue-list");
+  if (!panel || !list) return;
+
+  const items = recordingQueueItems();
+  panel.hidden = items.length === 0;
+  if (!items.length) {
+    list.replaceChildren();
+    recordingQueueRows.clear();
+    return;
+  }
+
+  const activeCount = items.filter(({ progress }) => !replayRecordingIsTerminal(progress)).length;
+  setText(root.querySelector(".recording-queue-header small"), activeCount ? `${activeCount} active` : `${items.length - activeCount} finished`);
+
+  const stop = root.querySelector<HTMLButtonElement>("#stopReplayRecordingQueue");
+  if (stop) {
+    stop.hidden = !browserRecordingInFlight;
+    stop.disabled = browserRecordingCancelling;
+    setText(stop.querySelector("span"), browserRecordingCancelling ? "Stopping..." : "Stop");
+  }
+
+  list.classList.toggle("is-scrollable", items.length > 5);
+
+  const seen = new Set<string>();
+  items.forEach(({ sourcePath, progress, replay }, index) => {
+    seen.add(sourcePath);
+    let row = recordingQueueRows.get(sourcePath);
+    if (!row) {
+      row = createRecordingQueueRow();
+      row.dataset.sourcePath = sourcePath;
+      recordingQueueRows.set(sourcePath, row);
+    }
+    updateRecordingQueueRow(row, progress, replay);
+    if (list.children[index] !== row) list.insertBefore(row, list.children[index] ?? null);
+  });
+
+  recordingQueueRows.forEach((row, sourcePath) => {
+    if (seen.has(sourcePath)) return;
+    row.remove();
+    recordingQueueRows.delete(sourcePath);
+  });
 }
 
 function renderReplaySelectButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
@@ -1842,7 +1559,7 @@ function renderReplaySelectButton(replay: ReplayBrowserItem, label: string, repl
       aria-pressed="${isSelected}"
       aria-label="${escapeHtml(`${isSelected ? "Deselect" : "Select"} replay: ${label}`)}"
       title="${isSelected ? "Deselect replay" : "Select replay"}"
-      ${browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory ? "disabled" : ""}
+      ${browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingChoosingDirectory ? "disabled" : ""}
     >
       <svg aria-hidden="true" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="8.5" />
@@ -1984,11 +1701,11 @@ function renderRecordingScale(values: readonly number[], formatter: (value: numb
 function renderReplayRecordingDialog(): string {
   const setup = browserRecordingSetup;
   if (!setup) return "";
-  const selectedCount = browserSelectedReplayPaths.size;
+  const selectedCount = setup.replays.length;
   const maxConcurrency = Math.min(20, Math.max(1, selectedCount));
   const playbackSpeed = RECORDING_SPEED_OPTIONS[setup.playbackSpeedIndex] ?? 10;
   const bitrate = RECORDING_BITRATE_OPTIONS[setup.bitrateIndex] ?? 5;
-  const resolution = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 720;
+  const resolution = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 1080;
   const needsPowerWarning = setup.concurrency > 5;
   return `
     <div id="replayRecordingModal" class="recording-setup-backdrop" role="presentation">
@@ -2009,7 +1726,7 @@ function renderReplayRecordingDialog(): string {
 
         <div class="recording-destination">
           <span class="recording-destination-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg></span>
-          <span><small>Export folder</small><strong title="${escapeHtml(setup.destinationDir)}">${escapeHtml(setup.destinationDir)}</strong></span>
+          <span><small>Export folder</small><strong title="${escapeHtml(setup.destinationDir)}">${escapeHtml(setup.destinationDir || "Loading Videos folder...")}</strong></span>
           <button id="changeRecordingFolder" type="button">Change</button>
         </div>
 
@@ -2056,10 +1773,13 @@ function renderReplayRecordingDialog(): string {
           <span><strong>Powerful PC recommended</strong><small>More than 5 simultaneous games can heavily load your CPU, GPU, memory, and storage.</small></span>
         </div>
 
+        ${setup.readiness === "checking" ? `<div class="recording-setup-status" role="status">Checking recorder...</div>` : ""}
+        ${setup.readiness === "error" ? `<div class="recording-setup-status is-error" role="alert">${escapeHtml(setup.error)}</div>` : ""}
+
         <footer class="recording-setup-actions">
           <span class="recording-setup-summary"><strong>${playbackSpeed}× · ${resolution}p · ${bitrate} Mbps</strong><small>Videos include a 2-second result-screen hold.</small></span>
           <button id="cancelRecordingSetup" class="recording-setup-cancel" type="button">Cancel</button>
-          <button id="startConfiguredRecording" class="recording-setup-start" type="button">
+          <button id="startConfiguredRecording" class="recording-setup-start" type="button" ${setup.readiness === "ready" && setup.destinationDir ? "" : "disabled"}>
             <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="12" rx="2"/><path d="m17 10 4-2v8l-4-2"/></svg>
             Start recording
           </button>
@@ -2069,24 +1789,13 @@ function renderReplayRecordingDialog(): string {
   `;
 }
 
-function renderReplayRecordingNotice(): string {
-  const notice = browserRecordingNotice;
-  if (!notice) return "";
-  return `
-    <aside class="recording-notice is-${notice.tone}" role="status">
-      <span><strong>${escapeHtml(notice.title)}</strong><small>${escapeHtml(notice.detail)}</small></span>
-      <button id="dismissRecordingNotice" type="button" aria-label="Dismiss notification">×</button>
-    </aside>
-  `;
-}
-
 function selectedBrowserReplays(): ReplayBrowserItem[] {
   return browserReplays.filter((replay) => browserSelectedReplayPaths.has(replay.filePath));
 }
 
 function renderReplayUploadDockContent(animateSelection = false): string {
   const selectedCount = browserSelectedReplayPaths.size;
-  const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory;
+  const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingChoosingDirectory;
   if (!selectedCount) {
     return `
       <input id="replayUploadInput" type="file" accept=".rep" multiple hidden>
@@ -2106,7 +1815,6 @@ function renderReplayUploadDockContent(animateSelection = false): string {
   return `
     <div class="replay-action-group replay-selection-actions ${animateSelection ? "is-entering" : ""}" role="group" aria-label="Actions for ${selectedCount} selected ${selectedCount === 1 ? "replay" : "replays"}">
       <span class="replay-selection-count" aria-live="polite"><strong>${selectedCount}</strong> selected</span>
-      ${renderReplayRecordingProgress()}
       <button id="unselectAllReplays" class="refresh-button unselect-button" type="button" ${selectionBusy ? "disabled" : ""}>
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" /></svg>
         <span>Unselect all</span>
@@ -2115,11 +1823,11 @@ function renderReplayUploadDockContent(animateSelection = false): string {
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" /></svg>
         <span>${browserBulkDownloadInFlight ? "Saving..." : "Download"}</span>
       </button>
-      <button id="${browserRecordingInFlight ? "cancelReplayRecording" : "recordSelectedReplays"}" class="refresh-button selection-record-button ${browserRecordingInFlight ? "is-recording" : ""}" type="button" ${browserRecordingCancelling || browserRecordingChoosingDirectory ? "disabled" : ""} title="${browserRecordingInFlight ? "Stop all active recordings cleanly" : "Export selected replays as MP4 videos"}">
+      <button id="recordSelectedReplays" class="refresh-button selection-record-button" type="button" ${browserRecordingInFlight || browserRecordingChoosingDirectory ? "disabled" : ""} title="${browserRecordingInFlight ? "Wait for the current replay exports to finish" : "Export selected replays as MP4 videos"}">
         <svg aria-hidden="true" viewBox="0 0 24 24">
-          ${browserRecordingInFlight ? '<rect x="7" y="7" width="10" height="10" rx="1" />' : '<rect x="3" y="6" width="14" height="12" rx="2" /><path d="m17 10 4-2v8l-4-2" />'}
+          <rect x="3" y="6" width="14" height="12" rx="2" /><path d="m17 10 4-2v8l-4-2" />
         </svg>
-        <span>${escapeHtml(replayRecordingButtonLabel())}</span>
+        <span>${browserRecordingInFlight ? "Recorder busy" : "Record"}</span>
       </button>
       <button id="deleteSelectedReplays" class="refresh-button selection-delete-button" type="button" ${selectionBusy ? "disabled" : ""}>
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5M14 11v5" /></svg>
@@ -2187,161 +1895,10 @@ function renderBrowserNav(): string {
   return `
     <nav class="browser-nav" aria-label="Main navigation">
       <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
-      <button class="browser-nav-button is-locked" type="button" disabled aria-disabled="true" aria-label="Leaderboard (work in progress)" data-wip="WIP" data-browser-page="leaderboard">Leaderboard</button>
       <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
       <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
       <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
     </nav>
-  `;
-}
-
-function renderLeaderboardPage(): string {
-  const fields = userDataFields(userDataPayload);
-  const stats = currentLeaderboardStats();
-  const score = Number(stats?.score);
-  const username = stats?.username || "Unknown user";
-  const currentName = normalizeLeaderboardName(stats?.normalizedUsername || stats?.username);
-  const officialRank = stats?.officialRank ?? null;
-  const winsNumber = Number(stats?.wins);
-  const gamesNumber = Number(stats?.games);
-  const winRate =
-    Number.isFinite(winsNumber) && Number.isFinite(gamesNumber) && gamesNumber > 0
-      ? clamp((winsNumber / gamesNumber) * 100, 0, 100)
-      : null;
-  const winRateValue = winRate === null ? "0" : winRate.toFixed(2);
-  const winRateLabel = winRate === null ? "-" : `${Math.round(winRate)}%`;
-  const winsLabel = Number.isFinite(winsNumber) ? winsNumber.toLocaleString() : "-";
-  const gamesLabel = Number.isFinite(gamesNumber) ? gamesNumber.toLocaleString() : "-";
-  const lossesNumber = Number(stats?.losses);
-  const lossesLabel = Number.isFinite(lossesNumber) ? lossesNumber.toLocaleString() : "-";
-  const sync = leaderboardSyncLabel(leaderboardStatusPayload);
-  const syncIcon = sync.tone === "good"
-    ? `<path d="m5 12 4 4L19 6" />`
-    : sync.tone === "bad"
-      ? `<path d="M12 8v5m0 4h.01" /><path d="M10.3 3.7 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z" />`
-      : `<path d="M12 7v5l3 2" /><circle cx="12" cy="12" r="9" />`;
-  const fieldRows = fields.length
-    ? fields
-        .map(
-          (field) => `
-            <div class="user-field">
-              <dt title="${escapeHtml(field.key)}">${escapeHtml(field.label)}</dt>
-              <dd>${escapeHtml(compactUserValue(field.value))}</dd>
-            </div>
-          `,
-        )
-        .join("")
-    : `<div class="state-message">No user fields returned yet.</div>`;
-
-  return `
-    <section class="leaderboard-page" aria-label="Leaderboard">
-      <div class="leaderboard-actions">
-        <div class="leaderboard-heading">
-          <span class="leaderboard-eyebrow">Competitive profile</span>
-          <h1>Your standing</h1>
-          <p>Track your War of Dots performance and see where you rank worldwide.</p>
-        </div>
-        <button id="refreshUserData" class="refresh-user-button leaderboard-refresh ${userDataLoading || leaderboardLoading || leaderboardSubmitting ? "is-loading" : ""}" type="button" aria-label="Refresh player stats and leaderboard" ${userDataLoading || leaderboardSubmitting ? "disabled" : ""}>
-          <svg aria-hidden="true" viewBox="0 0 24 24">
-            <path d="M20 12a8 8 0 0 1-13.7 5.7" />
-            <path d="M4 12A8 8 0 0 1 17.7 6.3" />
-            <path d="M17.7 2.7v3.6h-3.6" />
-            <path d="M6.3 21.3v-3.6h3.6" />
-          </svg>
-          <span>Refresh</span>
-        </button>
-      </div>
-      <div class="leaderboard-sync is-${escapeHtml(sync.tone)}" role="${sync.tone === "bad" ? "alert" : "status"}" aria-live="polite">
-        <span class="leaderboard-sync-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24">${syncIcon}</svg>
-        </span>
-        <span class="leaderboard-sync-copy">
-          <strong>${escapeHtml(sync.label)}</strong>
-          <small>${escapeHtml(sync.detail)}</small>
-        </span>
-        <em>${userDataPayload ? `Stats read ${escapeHtml(formatUserDate(userDataPayload.fetchedAt))}` : "Waiting for player data"}</em>
-      </div>
-      ${
-        userDataError
-          ? `<div class="state-message user-data-error">${escapeHtml(userDataError)}</div>`
-          : ""
-      }
-      ${
-        userDataLoading && !userDataPayload
-          ? `<div class="state-message">Fetching user data...</div>`
-          : `
-            <div class="leaderboard-standing">
-              <div class="standing-hero">
-                <div class="standing-name">
-                  <span class="standing-avatar" aria-hidden="true">${escapeHtml(username.trim().slice(0, 1).toLocaleUpperCase() || "?")}</span>
-                  <span class="standing-identity">
-                    <small>Player profile</small>
-                    <strong>${escapeHtml(username)}</strong>
-                    <em>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `Global rank #${escapeHtml(Number(officialRank).toLocaleString())}` : "Global rank pending"}</em>
-                  </span>
-                </div>
-                <div class="standing-metrics">
-                  <div class="standing-metric is-score">
-                    <span>Score</span>
-                    <strong>${Number.isFinite(score) ? escapeHtml(score.toLocaleString()) : "-"}</strong>
-                    <small>Current rating</small>
-                  </div>
-                  <div class="standing-metric">
-                    <span>Rank</span>
-                    <strong>${officialRank !== null && Number.isFinite(Number(officialRank)) ? `#${escapeHtml(Number(officialRank).toLocaleString())}` : "-"}</strong>
-                    <small>Worldwide</small>
-                  </div>
-                  <div class="standing-metric">
-                    <span>Games</span>
-                    <strong>${escapeHtml(gamesLabel)}</strong>
-                    <small>${escapeHtml(`${winsLabel} wins · ${lossesLabel} losses`)}</small>
-                  </div>
-                </div>
-              </div>
-              <div class="standing-win-card" style="--win-rate:${escapeHtml(winRateValue)}">
-                <div class="win-card-heading">
-                  <span>WIN RATE</span>
-                  <strong>${escapeHtml(winRateLabel)}</strong>
-                </div>
-                <div class="win-rate-ring" aria-label="Win rate ${escapeHtml(winRateLabel)}">
-                  <div>
-                    <strong>${escapeHtml(winsLabel)}</strong>
-                    <span>Wins</span>
-                  </div>
-                </div>
-                <p>${winRate === null ? "Play more matches to unlock your win-rate breakdown." : `${escapeHtml(winsLabel)} wins across ${escapeHtml(gamesLabel)} recorded games.`}</p>
-              </div>
-            </div>
-            <section class="public-leaderboard">
-              <div class="section-heading">
-                <div>
-                  <span>Global rankings</span>
-                  <h2>Top players</h2>
-                </div>
-                <strong>${leaderboardRows.length ? `${escapeHtml(String(leaderboardRows.length))} players` : "Global board"}</strong>
-              </div>
-              ${renderLeaderboardRows(currentName)}
-            </section>
-            <section class="score-history">
-              <div class="section-heading">
-                <div>
-                  <span>Performance</span>
-                  <h2>Score over time</h2>
-                </div>
-                <strong>${escapeHtml(String(userScorePoints(userDataPayload).length))} checkpoints</strong>
-              </div>
-              ${renderScoreChart(userDataPayload)}
-            </section>
-            <details class="user-fields-section" ${leaderboardDetailsOpen ? "open" : ""}>
-              <summary>
-                <span>Details</span>
-                <strong>${escapeHtml(String(fields.length))} fields</strong>
-              </summary>
-              <dl class="user-fields">${fieldRows}</dl>
-            </details>
-          `
-      }
-    </section>
   `;
 }
 
@@ -2512,16 +2069,6 @@ function renderReplayBrowser() {
     return;
   }
   unmountMapEditor();
-  if (browserPage === "leaderboard") {
-    appRoot.innerHTML = `
-      <main class="replay-browser" aria-label="War of Dots leaderboard">
-        ${renderBrowserNav()}
-        ${renderLeaderboardPage()}
-      </main>
-    `;
-    bindBrowserEvents();
-    return;
-  }
   if (browserPage === "region") {
     appRoot.innerHTML = `
       <main class="replay-browser" aria-label="War of Dots region selector">
@@ -2616,7 +2163,6 @@ function renderReplayBrowser() {
       </div>
       ${renderReplayDeleteDialog()}
       ${renderReplayRecordingDialog()}
-      ${renderReplayRecordingNotice()}
     </main>
   `;
   hydrateBrowserCards();
@@ -2645,7 +2191,6 @@ async function confirmMapEditorLeave() {
 }
 
 async function switchBrowserPage(nextPage: BrowserPage) {
-  if (nextPage === "leaderboard") return;
   if (browserPage === nextPage) return;
   if (!(await confirmMapEditorLeave())) return;
   browserPage = nextPage;
@@ -2666,7 +2211,7 @@ function refreshBrowserSelectionUi() {
     if (!button) return;
     const label = replay.players.map((player) => player.name).join(" versus ");
     button.classList.toggle("is-selected", isSelected);
-    button.disabled = browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory;
+    button.disabled = browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingChoosingDirectory;
     button.setAttribute("aria-pressed", String(isSelected));
     button.setAttribute("aria-label", `${isSelected ? "Deselect" : "Select"} replay: ${label}`);
     button.title = isSelected ? "Deselect replay" : "Select replay";
@@ -2683,7 +2228,7 @@ function refreshBrowserSelectionUi() {
 }
 
 function toggleBrowserReplaySelection(replay: ReplayBrowserItem, selectRange = false) {
-  if (browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory) return;
+  if (browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingChoosingDirectory) return;
 
   const shouldSelect = !browserSelectedReplayPaths.has(replay.filePath);
   const visibleReplayPaths = Array.from(document.querySelectorAll<HTMLElement>("#replayGrid .replay-card:not([hidden])"))
@@ -2707,7 +2252,7 @@ function toggleBrowserReplaySelection(replay: ReplayBrowserItem, selectRange = f
 }
 
 function clearBrowserReplaySelection() {
-  if (browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingInFlight || browserRecordingChoosingDirectory) return;
+  if (browserDeleteInFlight || browserBulkDownloadInFlight || browserRecordingChoosingDirectory) return;
   browserSelectedReplayPaths.clear();
   browserSelectionAnchorPath = null;
   refreshBrowserSelectionUi();
@@ -2730,10 +2275,41 @@ function bindReplayUploadDockEvents() {
   document.querySelector<HTMLButtonElement>("#recordSelectedReplays")?.addEventListener("click", () => {
     void recordSelectedReplays();
   });
-  document.querySelector<HTMLButtonElement>("#cancelReplayRecording")?.addEventListener("click", () => {
-    void cancelReplayRecording();
-  });
   document.querySelector<HTMLButtonElement>("#deleteSelectedReplays")?.addEventListener("click", openReplayDeleteDialog);
+}
+
+// Bound once against the persistent queue root, so patching rows never rebinds.
+function bindRecordingQueueEvents(root: HTMLElement) {
+  root.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+
+    if (target.closest("#stopReplayRecordingQueue")) {
+      void cancelReplayRecording();
+      return;
+    }
+
+    const button = target.closest<HTMLButtonElement>("[data-recording-action]");
+    const sourcePath = button?.closest<HTMLElement>(".recording-queue-item")?.dataset.sourcePath;
+    if (!button || !sourcePath) return;
+    const progress = browserRecordingItemProgress.get(sourcePath);
+    if (!progress) return;
+
+    if (button.dataset.recordingAction === "open") {
+      if (!progress.outputPath) return;
+      void invoke<boolean>("open_recording_output_directory", { outputPath: progress.outputPath }).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error || "Could not open the output folder.");
+        window.alert(`Could not open the output folder.\n\n${message}`);
+      });
+      return;
+    }
+
+    if (button.dataset.recordingAction === "clear" && replayRecordingIsTerminal(progress)) {
+      browserRecordingItemProgress.delete(sourcePath);
+      browserRecordingReplays.delete(sourcePath);
+      refreshRecordingQueueUi();
+    }
+  });
 }
 
 function bindBrowserEvents() {
@@ -2744,16 +2320,9 @@ function bindBrowserEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const page = button.dataset.browserPage;
-      const nextPage: BrowserPage =
-        page === "leaderboard" ? "leaderboard" : page === "region" ? "region" : page === "mapEditor" ? "mapEditor" : "replays";
+      const nextPage: BrowserPage = page === "region" ? "region" : page === "mapEditor" ? "mapEditor" : "replays";
       void switchBrowserPage(nextPage);
     });
-  });
-  document.querySelector<HTMLButtonElement>("#refreshUserData")?.addEventListener("click", () => {
-    void refreshLeaderboard();
-  });
-  document.querySelector<HTMLDetailsElement>(".user-fields-section")?.addEventListener("toggle", (event) => {
-    leaderboardDetailsOpen = (event.currentTarget as HTMLDetailsElement).open;
   });
   document.querySelector<HTMLButtonElement>("#refreshRegion")?.addEventListener("click", () => {
     void loadRegionStatus();
@@ -2992,12 +2561,8 @@ function bindBrowserEvents() {
     if (!browserRecordingSetup) return;
     const input = event.currentTarget as HTMLInputElement;
     browserRecordingSetup.resolutionIndex = Number(input.value);
-    input.setAttribute("aria-valuetext", `${RECORDING_RESOLUTION_OPTIONS[browserRecordingSetup.resolutionIndex] ?? 720}p`);
+    input.setAttribute("aria-valuetext", `${RECORDING_RESOLUTION_OPTIONS[browserRecordingSetup.resolutionIndex] ?? 1080}p`);
     updateRecordingSetupUi();
-  });
-  document.querySelector<HTMLButtonElement>("#dismissRecordingNotice")?.addEventListener("click", () => {
-    browserRecordingNotice = null;
-    renderReplayBrowser();
   });
   if (!browserDocumentEventsBound) {
     document.addEventListener("pointerdown", handleBrowserOutsidePointerDown);
@@ -3005,110 +2570,23 @@ function bindBrowserEvents() {
   }
 }
 
-async function loadUserData(options: { quiet?: boolean } = {}) {
-  if (userDataLoading) return;
-  userDataLoading = true;
-  userDataError = "";
-  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
-  try {
-    userDataPayload = await invoke<UserDataPayload>("fetch_user_data");
-  } catch (error) {
-    userDataError = error instanceof Error ? error.message : String(error || "Could not fetch user data.");
-  } finally {
-    userDataLoading = false;
-    if (browserPage === "leaderboard") renderReplayBrowser();
-  }
-}
-
-async function loadLeaderboardStatus(options: { quiet?: boolean } = {}) {
-  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
-  try {
-    leaderboardStatusPayload = await invoke<LeaderboardStatusPayload>("leaderboard_status");
-  } catch (error) {
-    leaderboardError = error instanceof Error ? error.message : String(error || "Could not read leaderboard status.");
-  } finally {
-    if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
-  }
-}
-
-async function loadLeaderboardRows(options: { quiet?: boolean } = {}) {
-  if (leaderboardLoading) return;
-  leaderboardLoading = true;
-  if (!options.quiet) leaderboardError = "";
-  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
-  try {
-    const payload = await invoke<LeaderboardListPayload>("leaderboard_list");
-    leaderboardRows = payload.rows ?? [];
-    if (!payload.configured && payload.message) leaderboardError = payload.message;
-  } catch (error) {
-    leaderboardError = error instanceof Error ? error.message : String(error || "Could not load leaderboard.");
-  } finally {
-    leaderboardLoading = false;
-    if (browserPage === "leaderboard") renderReplayBrowser();
-  }
-}
-
-async function submitLeaderboardSnapshot(options: { quiet?: boolean } = {}) {
-  if (leaderboardSubmitting) return;
-  leaderboardSubmitting = true;
-  leaderboardSubmitError = "";
-  if (!options.quiet && browserPage === "leaderboard") renderReplayBrowser();
-  try {
-    const payload = await invoke<{ lastSync?: LeaderboardSyncState }>("leaderboard_submit");
-    leaderboardSubmitError = "";
-    if (payload.lastSync && leaderboardStatusPayload) {
-      leaderboardStatusPayload = { ...leaderboardStatusPayload, lastSync: payload.lastSync };
-    }
-  } catch (error) {
-    leaderboardSubmitError = friendlyLeaderboardError(error || "Could not submit leaderboard score.");
-  } finally {
-    leaderboardSubmitting = false;
-    await loadLeaderboardStatus({ quiet: true });
-    if (browserPage === "leaderboard") renderReplayBrowser();
-  }
-}
-
-async function refreshLeaderboard() {
-  leaderboardError = "";
-  leaderboardSubmitError = "";
-  const userDataTask = loadUserData();
-  const statusTask = loadLeaderboardStatus({ quiet: true });
-  await Promise.allSettled([userDataTask, statusTask]);
-  await loadLeaderboardStatus({ quiet: true });
-  if (leaderboardStatusPayload?.canSubmit) {
-    await submitLeaderboardSnapshot({ quiet: true });
-  }
-  await loadLeaderboardRows({ quiet: true });
-  if (browserPage === "leaderboard") renderReplayBrowser();
-}
-
-function ensureLeaderboardLoaded() {
-  if (!leaderboardStatusPayload) {
-    void loadLeaderboardStatus({ quiet: true });
-  }
-  if (!userDataPayload && !userDataLoading) {
-    void loadUserData({ quiet: true }).then(() => {
-      void loadLeaderboardStatus({ quiet: true });
-    });
-  }
-  if (!leaderboardRows.length && !leaderboardLoading) {
-    void loadLeaderboardRows({ quiet: true });
-  }
-  if (browserPage === "leaderboard") renderReplayBrowser();
-}
-
 async function loadRegionStatus(options: { quiet?: boolean } = {}) {
   if (regionLoading) return;
   regionLoading = true;
   if (!options.quiet) regionError = "";
   if (!options.quiet && browserPage === "region") renderReplayBrowser();
+  // The region page polls every 5s. Re-render only when something actually moved,
+  // otherwise the whole page rebuilds on a timer and visibly flashes.
+  const previous = JSON.stringify(regionStatusPayload);
+  const previousError = regionError;
   try {
     regionStatusPayload = await invoke<RegionStatusPayload>("region_status");
   } catch (error) {
     if (!options.quiet) regionError = error instanceof Error ? error.message : String(error || "Could not load region status.");
   } finally {
     regionLoading = false;
-    if (browserPage === "region") renderReplayBrowser();
+    const changed = JSON.stringify(regionStatusPayload) !== previous || regionError !== previousError;
+    if (browserPage === "region" && (changed || !options.quiet)) renderReplayBrowser();
   }
 }
 
@@ -3191,7 +2669,7 @@ async function deleteReplayFromBrowser() {
 
 async function downloadSelectedReplays() {
   const replays = selectedBrowserReplays();
-  if (!replays.length || browserBulkDownloadInFlight || browserDeleteInFlight || browserRecordingInFlight) return;
+  if (!replays.length || browserBulkDownloadInFlight || browserDeleteInFlight) return;
   browserBulkDownloadInFlight = true;
   refreshBrowserSelectionUi();
   try {
@@ -3227,6 +2705,22 @@ async function chooseRecordingDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+function savedRecordingDirectory(): string {
+  try {
+    return window.localStorage.getItem(RECORDING_DIRECTORY_STORAGE_KEY)?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberRecordingDirectory(directory: string) {
+  try {
+    window.localStorage.setItem(RECORDING_DIRECTORY_STORAGE_KEY, directory);
+  } catch {
+    // Recording still works when preference storage is unavailable.
+  }
+}
+
 async function recordSelectedReplays() {
   const replays = selectedBrowserReplays();
   if (
@@ -3236,29 +2730,51 @@ async function recordSelectedReplays() {
     browserBulkDownloadInFlight ||
     browserDeleteInFlight
   ) return;
-  browserRecordingChoosingDirectory = true;
-  refreshBrowserSelectionUi();
+  const setup: ReplayRecordingSetup = {
+    destinationDir: savedRecordingDirectory(),
+    concurrency: Math.min(2, replays.length, 20),
+    playbackSpeedIndex: RECORDING_DEFAULT_SPEED_INDEX,
+    bitrateIndex: RECORDING_DEFAULT_BITRATE_INDEX,
+    resolutionIndex: RECORDING_DEFAULT_RESOLUTION_INDEX,
+    replays: [...replays],
+    readiness: "checking",
+    error: "",
+  };
+  browserRecordingSetup = setup;
+  renderReplayBrowser();
+  refreshRecordingQueueUi();
+  window.requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#recordingConcurrency")?.focus());
   try {
-    const destinationDir = await chooseRecordingDirectory();
-    if (!destinationDir) return;
-    browserRecordingSetup = {
-      destinationDir,
-      concurrency: Math.min(2, replays.length, 20),
-      playbackSpeedIndex: RECORDING_DEFAULT_SPEED_INDEX,
-      bitrateIndex: RECORDING_DEFAULT_BITRATE_INDEX,
-      resolutionIndex: RECORDING_DEFAULT_RESOLUTION_INDEX,
-    };
-    browserRecordingNotice = null;
+    const [recorder, vault, defaultDirectory] = await Promise.all([
+      invoke<{
+      protocol_versions: number[];
+      supported_versions: {
+        versions: string[];
+        target_game_version: string;
+        compatible_replay_versions: string[];
+      };
+      }>("recorder_status"),
+      invoke<{ versions: Array<{ game_version: string }> }>("list_recorder_versions"),
+      setup.destinationDir ? Promise.resolve(setup.destinationDir) : invoke<string>("recording_default_directory"),
+    ]);
+    if (!recorder.protocol_versions.includes(1)) {
+      throw new Error("The installed recorder does not support protocol version 1. Update More of Dots Recorder.");
+    }
+    const targetGameVersion = recorder.supported_versions.target_game_version;
+    const installedVersions = new Set(vault.versions.map((version) => version.game_version));
+    if (!installedVersions.has(targetGameVersion)) {
+      throw new Error(`Bundled game data is missing for ${targetGameVersion}. Repair or reinstall More of Dots Recorder.`);
+    }
+    if (browserRecordingSetup !== setup) return;
+    setup.destinationDir = defaultDirectory;
+    setup.readiness = "ready";
+    rememberRecordingDirectory(defaultDirectory);
   } catch (error) {
-    browserRecordingNotice = {
-      tone: "error",
-      title: "Could not choose an export folder",
-      detail: error instanceof Error ? error.message : String(error),
-    };
+    if (browserRecordingSetup !== setup) return;
+    setup.readiness = "error";
+    setup.error = error instanceof Error ? error.message : String(error);
   } finally {
-    browserRecordingChoosingDirectory = false;
-    renderReplayBrowser();
-    window.requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#recordingConcurrency")?.focus());
+    if (browserRecordingSetup === setup) renderReplayBrowser();
   }
 }
 
@@ -3268,14 +2784,11 @@ async function changeRecordingDirectory() {
     const destinationDir = await chooseRecordingDirectory();
     if (!destinationDir || !browserRecordingSetup) return;
     browserRecordingSetup.destinationDir = destinationDir;
+    rememberRecordingDirectory(destinationDir);
     renderReplayBrowser();
   } catch (error) {
-    browserRecordingNotice = {
-      tone: "error",
-      title: "Could not change the export folder",
-      detail: error instanceof Error ? error.message : String(error),
-    };
-    renderReplayBrowser();
+    const message = error instanceof Error ? error.message : String(error);
+    window.alert(`Could not change the export folder.\n\n${message}`);
   }
 }
 
@@ -3290,7 +2803,7 @@ function updateRecordingSetupUi() {
   if (!setup) return;
   const speed = RECORDING_SPEED_OPTIONS[setup.playbackSpeedIndex] ?? 10;
   const bitrate = RECORDING_BITRATE_OPTIONS[setup.bitrateIndex] ?? 5;
-  const resolution = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 720;
+  const resolution = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 1080;
   const concurrencyOutput = document.querySelector<HTMLOutputElement>("#recordingConcurrencyValue");
   const speedOutput = document.querySelector<HTMLOutputElement>("#recordingSpeedValue");
   const bitrateOutput = document.querySelector<HTMLOutputElement>("#recordingBitrateValue");
@@ -3306,14 +2819,25 @@ function updateRecordingSetupUi() {
 
 async function startConfiguredRecording() {
   const setup = browserRecordingSetup;
-  const replays = selectedBrowserReplays();
-  if (!setup || !replays.length || browserRecordingInFlight) return;
+  const replays = setup?.replays ?? [];
+  if (!setup || setup.readiness !== "ready" || !replays.length || browserRecordingInFlight) return;
   const playbackSpeed = RECORDING_SPEED_OPTIONS[setup.playbackSpeedIndex] ?? 10;
   const bitrateMbps = RECORDING_BITRATE_OPTIONS[setup.bitrateIndex] ?? 5;
-  const resolutionHeight = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 720;
+  const resolutionHeight = RECORDING_RESOLUTION_OPTIONS[setup.resolutionIndex] ?? 1080;
   browserRecordingSetup = null;
   browserRecordingInFlight = true;
   browserRecordingCancelling = false;
+  rememberRecordingDirectory(setup.destinationDir);
+  replays.forEach((replay, index) => {
+    browserRecordingReplays.set(replay.filePath, replay);
+    browserRecordingItemProgress.set(replay.filePath, {
+      stage: "queued-file",
+      step: "waiting-in-queue",
+      sourcePath: replay.filePath,
+      queueIndex: index + 1,
+      total: replays.length,
+    });
+  });
   browserRecordingProgress = {
     stage: "staging",
     current: 0,
@@ -3326,7 +2850,10 @@ async function startConfiguredRecording() {
     percent: 0,
     concurrency: setup.concurrency,
   };
+  browserSelectedReplayPaths.clear();
+  browserSelectionAnchorPath = null;
   renderReplayBrowser();
+  refreshRecordingQueueUi();
   try {
     const result = await invoke<{
       recorded?: number;
@@ -3340,6 +2867,7 @@ async function startConfiguredRecording() {
       replays: replays.map((replay) => ({
         filePath: replay.filePath,
         fileName: replayRecordingFileName(replay, playbackSpeed, resolutionHeight),
+        version: replay.version,
       })),
       options: {
         destinationDir: setup.destinationDir,
@@ -3349,50 +2877,34 @@ async function startConfiguredRecording() {
         resolutionHeight,
       },
     });
-    if (!result.cancelled && (result.failed ?? 0) > 0) {
-      const firstFailure = result.failures?.[0] ?? "One or more recordings failed.";
-      browserRecordingNotice = {
-        tone: "error",
-        title: `Recorded ${result.recorded ?? 0} of ${replays.length} replays`,
-        detail: `${result.failed} failed: ${firstFailure}${result.destination ? ` · Completed videos: ${result.destination}` : ""}`,
-      };
-    } else if (!result.cancelled && (result.recorded ?? 0) > 0 && result.destination) {
-      browserRecordingNotice = {
-        tone: "success",
-        title: `Recorded ${result.recorded} ${result.recorded === 1 ? "replay" : "replays"}`,
-        detail: `${playbackSpeed}× · ${resolutionHeight}p · ${bitrateMbps} Mbps · ${result.destination}`,
-      };
-    } else if (result.cancelled) {
-      browserRecordingNotice = {
-        tone: "neutral",
-        title: "Recording stopped",
-        detail: `${result.recorded ?? 0} completed ${result.recorded === 1 ? "video was" : "videos were"} kept. Partial videos were discarded.`,
-      };
-    }
+    void result;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error || "Could not record the selected replays.");
-    browserRecordingNotice = {
-      tone: "error",
-      title: `Could not record the selected ${replays.length === 1 ? "replay" : "replays"}`,
-      detail: message,
-    };
+    replays.forEach((replay) => {
+      const sourcePath = replay.filePath;
+      const itemProgress = browserRecordingItemProgress.get(sourcePath);
+      if (!itemProgress) return;
+      if (["completed", "failed", "cancelled"].includes(replayRecordingItemStep(itemProgress))) return;
+      browserRecordingItemProgress.set(sourcePath, { ...itemProgress, stage: "failed-file", step: "failed", message });
+    });
   } finally {
     browserRecordingInFlight = false;
     browserRecordingCancelling = false;
     browserRecordingProgress = null;
-    renderReplayBrowser();
+    refreshRecordingQueueUi();
+    refreshRecordingQueueUi();
   }
 }
 
 async function cancelReplayRecording() {
   if (!browserRecordingInFlight || browserRecordingCancelling) return;
   browserRecordingCancelling = true;
-  refreshBrowserSelectionUi();
+  refreshRecordingQueueUi();
   try {
     await invoke<boolean>("cancel_replay_recording");
   } catch (error) {
     browserRecordingCancelling = false;
-    refreshBrowserSelectionUi();
+    refreshRecordingQueueUi();
     const message = error instanceof Error ? error.message : String(error || "Could not stop replay recording.");
     window.alert(`Could not stop replay recording.\n\n${message}`);
   }
@@ -3970,7 +3482,7 @@ function fundsMetricValue(metric: TeamMetric): number | null {
   return raw;
 }
 
-function casualtiesMetricValue(sample: Sample, metric: TeamMetric): number | null {
+function casualtiesMetricValue(metric: TeamMetric): number | null {
   const estimate = numeric(metric.casualties_estimate);
   if (estimate !== null) return estimate;
 
@@ -4024,7 +3536,7 @@ function graphMetricValue(kind: GraphKind, sample: Sample, teamIndex: number): n
           ? metric.alive_units ?? teamAliveUnitCount(sample, teamIndex)
           : kind === "morale"
             ? teamMoraleTotal(sample, teamIndex)
-            : casualtiesMetricValue(sample, metric);
+            : casualtiesMetricValue(metric);
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -4113,7 +3625,7 @@ function renderGraphLayer() {
   const viewer = document.querySelector<HTMLElement>(".viewer-area");
   if (viewer) {
     document.querySelectorAll<HTMLElement>("[data-graph-window-id]").forEach((element) => element.remove());
-    viewer.insertAdjacentHTML("beforeend", renderGraphWindows(sample));
+    viewer.insertAdjacentHTML("beforeend", renderGraphWindows());
   }
 
   bindGraphEvents();
@@ -4144,7 +3656,7 @@ function renderGraphPalette(): string {
   `;
 }
 
-function renderGraphWindows(sample: Sample | null): string {
+function renderGraphWindows(): string {
   return graphWindows
     .filter((windowState) => windowState.visible)
     .map((windowState) => {
@@ -4198,7 +3710,7 @@ function drawMetricGraphCanvas(canvas: HTMLCanvasElement, windowState: GraphWind
   const currentTick = Number(sample.tick);
   if (!Number.isFinite(currentTick)) return;
   const minTick = currentTick - GAME_TICKS_PER_SECOND * GRAPH_HISTORY_SECONDS;
-  const series = teams.map((team, index) => ({
+  const series = teams.map((team) => ({
     team,
     color: team.color_hex ?? teamColor(Number(team.index)),
     points: graphMetricHistory(windowState.kind, Number(team.index), sample),
@@ -5343,7 +4855,7 @@ function render() {
         }
         ${renderOverlay()}
         ${activeStats ? renderTimeline(sample) : ""}
-        ${activeStats ? renderGraphWindows(sample) : ""}
+        ${activeStats ? renderGraphWindows() : ""}
       </section>
     </main>
   `;
@@ -5630,17 +5142,6 @@ function setProgress(value: number, label: string, detail: string, facts: string
   updateProgressUi();
 }
 
-function startProgressDrift(limit: number) {
-  window.clearInterval(progressTimer);
-  progressTimer = window.setInterval(() => {
-    if (phase !== "loading") return;
-    if (progress.value < limit) {
-      progress.value += Math.max(0.25, (limit - progress.value) * 0.045);
-      updateProgressUi();
-    }
-  }, 140);
-}
-
 function stopProgressDrift() {
   window.clearInterval(progressTimer);
   progressTimer = 0;
@@ -5687,15 +5188,6 @@ function isPartialCapture(stats: Stats | null): boolean {
   if (!stats) return false;
   if (stats.summary?.partial === true) return true;
   return !captureReachedReplayEnd(stats);
-}
-
-function replaySubtitle(): string {
-  if (!activeStats) return "Choose a replay to capture from the hidden game.";
-  const sampleCount = Number(activeStats.summary?.sample_count ?? activeStats.samples.length);
-  const lastTick = lastCapturedTick(activeStats);
-  const endTick = replayEndTick(activeStats);
-  const mode = liveCaptureActive || isPartialCapture(activeStats) ? "live capture" : "complete capture";
-  return `${captureSource(activeJob, activeStats)} - ${mode} - ${formatStat(sampleCount)} samples - tick ${formatStat(lastTick)} / ${formatStat(endTick)}`;
 }
 
 function setActiveStats(stats: Stats, job: Job | null, { firstPartial = false } = {}) {
@@ -5993,36 +5485,18 @@ function startCaptureProgressPolling(filename: string, startedAfterMs: number) {
 
 async function refreshBackend({ quiet = false } = {}) {
   try {
-    const [status, jobPayload] = await Promise.all([invoke<BackendStatus>("backend_status"), invoke<{ jobs: Job[] }>("list_jobs")]);
-    statusPayload = status;
+    const jobPayload = await invoke<{ jobs: Job[] }>("list_jobs");
     jobs = jobPayload.jobs;
     if (phase === "booting") phase = "idle";
   } catch (error) {
-    statusPayload = null;
-    if (!quiet) notice = { tone: "error", text: error instanceof Error ? error.message : String(error) };
     if (phase === "booting") phase = "idle";
   }
   if (!quiet) render();
 }
 
-async function ensureGameRuntime() {
-  await refreshBackend({ quiet: true });
-  if (!statusPayload?.steam_game_exists || statusPayload.runner.game_exe_exists) return;
-
-  setProgress(24, "Preparing game runtime", "Copying the Steam install into the app runtime. This only happens when needed.");
-  startProgressDrift(42);
-  try {
-    await invoke<Record<string, unknown>>("stage_game");
-    await refreshBackend({ quiet: true });
-  } catch (error) {
-    throw new Error(`Could not prepare the game runtime: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
 async function loadReplayFile(file: File) {
   pausePlayback();
   phase = "loading";
-  selectedFileName = file.name;
   activeJob = null;
   activeStats = null;
   boundsCache = null;
@@ -6033,7 +5507,6 @@ async function loadReplayFile(file: File) {
   resetMapImage();
   frameIndex = 0;
   playbackTick = 0;
-  notice = null;
   setProgress(3, "Reading replay", "Loading the replay file from disk.");
   render();
   await nextPaint();
@@ -6043,9 +5516,7 @@ async function loadReplayFile(file: File) {
     setProgress(14, "Replay loaded", `${file.name} is ready for hidden game capture.`);
     await nextPaint();
 
-    await ensureGameRuntime();
-
-    setProgress(28, "Launching hidden game", "Starting War of Dots on the automation desktop.");
+    setProgress(24, "Resolving game version", "The separate recorder is loading the exact game build required by this replay.");
     await nextPaint();
 
     stopProgressDrift();
@@ -6078,28 +5549,20 @@ async function loadReplayFile(file: File) {
     stopProgressDrift();
     await nextPaint();
     phase = "ready";
-    notice = captureReachedReplayEnd(stats)
-      ? { tone: "success", text: "Game-backed capture loaded. Playback started." }
-      : {
-          tone: "info",
-          text: `Game-backed capture is partial through tick ${formatStat(lastCapturedTick(stats))}; seeking is capped to captured samples.`,
-        };
     render();
     startPlayback();
     void releaseLoadedJobArtifacts(job.job_id);
     void refreshBackend({ quiet: true });
   } catch (error) {
+    console.error("Replay capture failed", error);
     liveCaptureActive = false;
     stopCaptureProgressPolling();
     stopProgressDrift();
-    const message = error instanceof Error ? error.message : String(error);
     const capturedStats = activeStats as Stats | null;
     if (capturedStats?.samples.length && isAuthoritativeCapture(activeJob, capturedStats)) {
       phase = "ready";
-      notice = { tone: "error", text: `${message} Keeping the real samples captured so far.` };
     } else {
       phase = "error";
-      notice = { tone: "error", text: message };
     }
     render();
   }
@@ -6108,7 +5571,6 @@ async function loadReplayFile(file: File) {
 async function loadReplayPath(filePath: string, fileName: string) {
   pausePlayback();
   phase = "loading";
-  selectedFileName = fileName;
   activeJob = null;
   activeStats = null;
   boundsCache = null;
@@ -6119,15 +5581,12 @@ async function loadReplayPath(filePath: string, fileName: string) {
   resetMapImage();
   frameIndex = 0;
   playbackTick = 0;
-  notice = null;
   setProgress(8, "Replay selected", `${fileName} is ready for hidden game capture.`);
   render();
   await nextPaint();
 
   try {
-    await ensureGameRuntime();
-
-    setProgress(28, "Launching hidden game", "Starting War of Dots on the automation desktop.");
+    setProgress(24, "Resolving game version", "The separate recorder is loading the exact game build required by this replay.");
     await nextPaint();
 
     stopProgressDrift();
@@ -6159,28 +5618,20 @@ async function loadReplayPath(filePath: string, fileName: string) {
     stopProgressDrift();
     await nextPaint();
     phase = "ready";
-    notice = captureReachedReplayEnd(stats)
-      ? { tone: "success", text: "Game-backed capture loaded. Playback started." }
-      : {
-          tone: "info",
-          text: `Game-backed capture is partial through tick ${formatStat(lastCapturedTick(stats))}; seeking is capped to captured samples.`,
-        };
     render();
     startPlayback();
     void releaseLoadedJobArtifacts(job.job_id);
     void refreshBackend({ quiet: true });
   } catch (error) {
+    console.error("Replay capture failed", error);
     liveCaptureActive = false;
     stopCaptureProgressPolling();
     stopProgressDrift();
-    const message = error instanceof Error ? error.message : String(error);
     const capturedStats = activeStats as Stats | null;
     if (capturedStats?.samples.length && isAuthoritativeCapture(activeJob, capturedStats)) {
       phase = "ready";
-      notice = { tone: "error", text: `${message} Keeping the real samples captured so far.` };
     } else {
       phase = "error";
-      notice = { tone: "error", text: message };
     }
     render();
   }
@@ -6281,7 +5732,6 @@ async function loadLaunchRequest() {
     await loadReplayLaunchRequest(request, { force: true });
   } catch (error) {
     phase = "error";
-    notice = { tone: "error", text: error instanceof Error ? error.message : String(error) };
     render();
   }
 }
@@ -6303,11 +5753,30 @@ if (appMode === "browser") {
   void listen<ReplayRecordingProgressEvent>("replay-recording-progress", (event) => {
     if (!browserRecordingInFlight) return;
     browserRecordingProgress = mergeReplayRecordingProgress(event.payload);
-    refreshBrowserSelectionUi();
+    if (event.payload.sourcePath) {
+      const previous = browserRecordingItemProgress.get(event.payload.sourcePath);
+      browserRecordingItemProgress.set(event.payload.sourcePath, {
+        ...previous,
+        ...event.payload,
+        encoder: event.payload.encoder ?? previous?.encoder,
+      });
+    } else if (["cancelled", "completed"].includes(event.payload.stage)) {
+      browserRecordingItemProgress.forEach((itemProgress, sourcePath) => {
+        const currentStep = replayRecordingItemStep(itemProgress);
+        if (["completed", "failed", "cancelled"].includes(currentStep)) return;
+        browserRecordingItemProgress.set(sourcePath, {
+          ...itemProgress,
+          stage: event.payload.stage,
+          step: event.payload.stage,
+        });
+      });
+    }
+    refreshRecordingQueueUi();
   }).catch((error) => {
     console.error("Replay recording progress listener failed", error);
   });
   renderReplayBrowser();
+  refreshRecordingQueueUi();
   void initializeAppUpdater();
   void loadBrowserReplays();
   startBrowserRelativeTimeUpdates();
@@ -6328,8 +5797,8 @@ if (appMode === "browser") {
     void listen<ReplayLaunchRequest>("replay-launch", (event) => {
       void loadReplayLaunchRequest(event.payload, { force: true });
     }).catch((error) => {
+      console.error("Replay launch listener failed", error);
       phase = "error";
-      notice = { tone: "error", text: `Replay launch listener failed: ${error instanceof Error ? error.message : String(error)}` };
       render();
     });
     window.addEventListener("focus", () => {

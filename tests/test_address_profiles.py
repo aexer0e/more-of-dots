@@ -69,5 +69,5 @@ def test_missing_profile_includes_calibration_hint(tmp_path: Path) -> None:
     game = tmp_path / "game.exe"
     game.write_bytes(b"fake game")
 
-    with pytest.raises(MissingAddressProfile, match="calibrate-memory"):
+    with pytest.raises(MissingAddressProfile, match="local-runner.ps1 -Calibrate"):
         load_matching_profile(tmp_path / "profiles", game)

@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,7 +21,6 @@ use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
     WindowEvent,
 };
-use tauri_plugin_shell::ShellExt;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -41,28 +39,10 @@ const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
 const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
+const REPLAY_INDEX_VERSION: u32 = 2;
 const RED_BLUE_EVENT_LABEL: &str = "World";
-const USER_DATA_CHECKPOINT_FILE_NAME: &str = "user-data-checkpoints.json";
-const LEADERBOARD_SYNC_FILE_NAME: &str = "leaderboard-sync.json";
-const DEFAULT_USER_DATA_URL: &str = "ws://cs.war-of-dots.com:9056";
-const DEFAULT_USER_DATA_VERSION: &str = "1.2.18.3";
-const USER_DATA_WAIT: Duration = Duration::from_millis(700);
-const USER_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const USER_DATA_EXPORT_WAIT: Duration = Duration::from_secs(8);
-const LEADERBOARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-const DEFAULT_LEADERBOARD_URL: &str = "https://more-of-dots-leaderboard.moreofdots.workers.dev";
 const REGION_SELECTION_WAIT: Duration = Duration::from_secs(8);
 const REGION_NAMES: [&str; 3] = ["NA", "EU", "ASIA"];
-const USER_DATA_PERMISSIONS: &[&str] = &[
-    "authorize",
-    "registration_emailverification",
-    "registration_emailconfirmation",
-    "registration_steamid",
-    "login_emailverification",
-    "login_emailconfirmation",
-    "login_steamid",
-];
-
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Default)]
@@ -170,6 +150,8 @@ struct PlayerSummary {
 struct ReplaySummary {
     file_name: String,
     file_path: String,
+    #[serde(default)]
+    version: Option<String>,
     players: Vec<PlayerSummary>,
     #[serde(default)]
     draw: bool,
@@ -254,63 +236,6 @@ struct ReplayUploadResult {
     backup_path: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
-struct UserDataCheckpoint {
-    fetched_at: u64,
-    username: Option<String>,
-    source: String,
-    fields: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
-struct UserDataCheckpointStore {
-    version: u32,
-    initialized_at: u64,
-    checkpoints: Vec<UserDataCheckpoint>,
-}
-
-struct UserScoreLookup {
-    score: i64,
-    username: Option<String>,
-    user_data: Value,
-    messages: Vec<Value>,
-    source: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
-struct LeaderboardSyncState {
-    status: String,
-    synced_at: Option<u64>,
-    username: Option<String>,
-    public_rank: Option<i64>,
-    public_score: Option<i64>,
-    message: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
-struct LeaderboardPublicStats {
-    username: String,
-    normalized_username: String,
-    score: i64,
-    official_rank: Option<i64>,
-    games: Option<i64>,
-    wins: Option<i64>,
-    losses: Option<i64>,
-    region: Option<String>,
-    source: String,
-    fetched_at: u64,
-}
-
-struct GameLogin {
-    username: Option<String>,
-    password: Option<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegionSelection {
@@ -323,19 +248,6 @@ struct RegionSelection {
 struct WindowsGameProcess {
     process_id: Option<u32>,
     executable_path: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UserDataLookupMode {
-    Automatic,
-    Manual,
-}
-
-#[derive(Clone, Copy)]
-enum UserDataFrameFormat {
-    Wrapped,
-    Binary,
-    Text,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -387,14 +299,6 @@ fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn replay_index_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_runtime_dir(app)?.join(REPLAY_INDEX_FILE_NAME))
-}
-
-fn user_data_checkpoint_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_runtime_dir(app)?.join(USER_DATA_CHECKPOINT_FILE_NAME))
-}
-
-fn leaderboard_sync_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_runtime_dir(app)?.join(LEADERBOARD_SYNC_FILE_NAME))
 }
 
 fn region_selection_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -631,13 +535,16 @@ fn collect_replay_candidates(app: &AppHandle) -> Result<Vec<ReplayCandidate>, St
 fn load_replay_index(path: &Path) -> ReplayIndexStore {
     let Some(value) = read_json_file(path) else {
         return ReplayIndexStore {
-            version: 1,
+            version: REPLAY_INDEX_VERSION,
             entries: BTreeMap::new(),
         };
     };
-    let mut store = serde_json::from_value::<ReplayIndexStore>(value).unwrap_or_default();
-    if store.version == 0 {
-        store.version = 1;
+    let store = serde_json::from_value::<ReplayIndexStore>(value).unwrap_or_default();
+    if store.version != REPLAY_INDEX_VERSION {
+        return ReplayIndexStore {
+            version: REPLAY_INDEX_VERSION,
+            entries: BTreeMap::new(),
+        };
     }
     store
 }
@@ -658,7 +565,12 @@ fn replay_index_entry_matches_metadata(
 }
 
 fn replay_index_entry_matches(entry: &ReplayIndexEntry, candidate: &ReplayCandidate) -> bool {
-    replay_index_entry_matches_metadata(entry, candidate) && entry.parsed.is_some()
+    replay_index_entry_matches_metadata(entry, candidate)
+        && entry
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.summary.version.as_deref())
+            .is_some_and(|version| !version.trim().is_empty())
 }
 
 fn parsed_replay_from_index(
@@ -710,33 +622,6 @@ fn parse_replay_candidate(
     Ok((parsed, entry))
 }
 
-fn load_user_data_checkpoint_store(path: &Path) -> UserDataCheckpointStore {
-    let Some(value) = read_json_file(path) else {
-        return UserDataCheckpointStore {
-            version: 1,
-            initialized_at: now_unix_secs(),
-            checkpoints: Vec::new(),
-        };
-    };
-
-    let mut store = serde_json::from_value::<UserDataCheckpointStore>(value).unwrap_or_default();
-    if store.version == 0 {
-        store.version = 1;
-    }
-    if store.initialized_at == 0 {
-        store.initialized_at = now_unix_secs();
-    }
-    store
-}
-
-fn write_user_data_checkpoint_store(
-    path: &Path,
-    store: &UserDataCheckpointStore,
-) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
-    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
-}
-
 fn load_region_selection(path: &Path) -> Option<RegionSelection> {
     read_json_file(path).and_then(|value| serde_json::from_value(value).ok())
 }
@@ -744,478 +629,6 @@ fn load_region_selection(path: &Path) -> Option<RegionSelection> {
 fn write_region_selection(path: &Path, selection: &RegionSelection) -> Result<(), String> {
     let text = serde_json::to_string_pretty(selection).map_err(|error| error.to_string())?;
     fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
-}
-
-fn latest_checkpoint_score(store: &UserDataCheckpointStore) -> Option<i64> {
-    store
-        .checkpoints
-        .iter()
-        .rev()
-        .find_map(|checkpoint| checkpoint.fields.get("score").and_then(value_as_i64))
-}
-
-fn checkpoint_field_is_interesting(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    [
-        "score",
-        "elo",
-        "rating",
-        "rank",
-        "win",
-        "loss",
-        "game",
-        "match",
-        "played",
-        "dev",
-        "beat",
-        "beaten",
-        "achievement",
-        "badge",
-        "medal",
-        "streak",
-        "tournament",
-        "level",
-        "xp",
-    ]
-    .iter()
-    .any(|word| path.contains(word))
-}
-
-fn checkpoint_value(value: &Value) -> Option<Value> {
-    match value {
-        Value::Bool(_) | Value::Number(_) => Some(value.clone()),
-        Value::String(text) if text.len() <= 128 => Some(Value::String(text.clone())),
-        _ => None,
-    }
-}
-
-fn collect_checkpoint_fields(
-    value: &Value,
-    prefix: &str,
-    depth: usize,
-    fields: &mut BTreeMap<String, Value>,
-) {
-    if depth > 5 || fields.len() >= 80 {
-        return;
-    }
-
-    match value {
-        Value::Object(object) => {
-            for (key, child) in object {
-                if matches!(
-                    key.to_ascii_lowercase().as_str(),
-                    "password" | "token" | "session" | "cookie" | "auth"
-                ) {
-                    continue;
-                }
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                collect_checkpoint_fields(child, &path, depth + 1, fields);
-                if fields.len() >= 80 {
-                    break;
-                }
-            }
-        }
-        Value::Array(items) => {
-            for (index, child) in items.iter().take(20).enumerate() {
-                collect_checkpoint_fields(child, &format!("{prefix}.{index}"), depth + 1, fields);
-                if fields.len() >= 80 {
-                    break;
-                }
-            }
-        }
-        _ if checkpoint_field_is_interesting(prefix) => {
-            if let Some(value) = checkpoint_value(value) {
-                fields.insert(prefix.to_string(), value);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn user_data_checkpoint_fields(lookup: &UserScoreLookup) -> BTreeMap<String, Value> {
-    let mut fields = BTreeMap::new();
-    fields.insert("score".to_string(), json!(lookup.score));
-    collect_checkpoint_fields(&lookup.user_data, "", 0, &mut fields);
-    fields
-}
-
-fn append_user_data_checkpoint_if_changed(
-    store: &mut UserDataCheckpointStore,
-    lookup: &UserScoreLookup,
-    fetched_at: u64,
-) {
-    let fields = user_data_checkpoint_fields(lookup);
-    if fields.is_empty() {
-        return;
-    }
-    if store.checkpoints.last().is_some_and(|checkpoint| {
-        checkpoint.username == lookup.username && checkpoint.fields == fields
-    }) {
-        return;
-    }
-
-    store.checkpoints.push(UserDataCheckpoint {
-        fetched_at,
-        username: lookup.username.clone(),
-        source: lookup.source.clone(),
-        fields,
-    });
-
-    if store.checkpoints.len() > 200 {
-        let drain_count = store.checkpoints.len() - 200;
-        store.checkpoints.drain(0..drain_count);
-    }
-}
-
-fn checkpoint_json(checkpoint: &UserDataCheckpoint) -> Value {
-    json!({
-        "fetchedAt": checkpoint.fetched_at,
-        "username": checkpoint.username,
-        "source": checkpoint.source,
-        "fields": checkpoint.fields,
-        "score": checkpoint.fields.get("score").and_then(value_as_i64),
-    })
-}
-
-fn load_leaderboard_sync_state(path: &Path) -> LeaderboardSyncState {
-    read_json_file(path)
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_else(|| LeaderboardSyncState {
-            status: "not-submitted".to_string(),
-            ..LeaderboardSyncState::default()
-        })
-}
-
-fn write_leaderboard_sync_state(path: &Path, state: &LeaderboardSyncState) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
-    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
-}
-
-fn leaderboard_base_url() -> Option<String> {
-    env::var("WOD_LEADERBOARD_URL")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| Some(DEFAULT_LEADERBOARD_URL.to_string()))
-        .filter(|value| {
-            value.starts_with("https://")
-                || value.starts_with("http://127.0.0.1")
-                || value.starts_with("http://localhost")
-        })
-}
-
-fn normalize_leaderboard_username(username: &str) -> String {
-    username
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
-        .collect::<String>()
-}
-
-fn leaderboard_token(username: &str, password: &str) -> String {
-    let normalized = normalize_leaderboard_username(username);
-    let mut hasher = Sha256::new();
-    hasher.update(b"more-of-dots-leaderboard-v1\0");
-    hasher.update(normalized.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(password.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn leaderboard_field_i64(fields: &BTreeMap<String, Value>, needles: &[&str]) -> Option<i64> {
-    fields.iter().find_map(|(key, value)| {
-        let key = key.to_ascii_lowercase();
-        let compact_key: String = key
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric())
-            .collect();
-        let is_match = needles.iter().any(|needle| {
-            let needle = needle.to_ascii_lowercase();
-            let compact_needle: String = needle
-                .chars()
-                .filter(|ch| ch.is_ascii_alphanumeric())
-                .collect();
-            key.contains(&needle) || compact_key.contains(&compact_needle)
-        });
-        is_match.then(|| value_as_i64(value)).flatten()
-    })
-}
-
-fn leaderboard_public_stats_from_checkpoint(
-    checkpoint: &UserDataCheckpoint,
-    fallback_username: Option<&str>,
-    region: Option<String>,
-) -> Option<LeaderboardPublicStats> {
-    let username = checkpoint
-        .username
-        .as_deref()
-        .or(fallback_username)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let normalized_username = normalize_leaderboard_username(&username);
-    if normalized_username.is_empty() {
-        return None;
-    }
-    let score = checkpoint
-        .fields
-        .get("score")
-        .and_then(value_as_i64)
-        .or_else(|| leaderboard_field_i64(&checkpoint.fields, &["elo", "rating"]))?;
-    let wins = leaderboard_field_i64(
-        &checkpoint.fields,
-        &[
-            "number of wins",
-            "number_of_wins",
-            "wincount",
-            "win_count",
-            "wins",
-            "victories",
-        ],
-    );
-    let games = leaderboard_field_i64(
-        &checkpoint.fields,
-        &[
-            "number of games",
-            "number_of_games",
-            "games played",
-            "games_played",
-            "gamecount",
-            "game_count",
-            "matchcount",
-            "match_count",
-            "totalgames",
-            "total_games",
-            "games",
-            "matches",
-            "played",
-        ],
-    );
-    let losses = leaderboard_field_i64(
-        &checkpoint.fields,
-        &["losses", "loss_count", "losscount", "defeats"],
-    )
-    .or_else(|| games.zip(wins).map(|(games, wins)| (games - wins).max(0)));
-    let official_rank = leaderboard_field_i64(
-        &checkpoint.fields,
-        &[
-            "ratingrank",
-            "leaderboardrank",
-            "officialrank",
-            "rank",
-            "position",
-            "place",
-        ],
-    );
-
-    Some(LeaderboardPublicStats {
-        username,
-        normalized_username,
-        score,
-        official_rank,
-        games,
-        wins,
-        losses,
-        region,
-        source: checkpoint.source.clone(),
-        fetched_at: checkpoint.fetched_at,
-    })
-}
-
-fn latest_leaderboard_stats(
-    app: &AppHandle,
-) -> Result<(Option<LeaderboardPublicStats>, bool, Option<String>), String> {
-    let checkpoint_path = user_data_checkpoint_path(app)?;
-    let store = load_user_data_checkpoint_store(&checkpoint_path);
-    let login = game_login();
-    let region =
-        load_region_selection(&region_selection_path(app)?).map(|selection| selection.region);
-    let stats = store.checkpoints.last().and_then(|checkpoint| {
-        leaderboard_public_stats_from_checkpoint(checkpoint, login.username.as_deref(), region)
-    });
-    Ok((stats, login.password.is_some(), login.username))
-}
-
-fn leaderboard_status_value(app: &AppHandle) -> Result<Value, String> {
-    let (stats, has_password, login_username) = latest_leaderboard_stats(app)?;
-    let sync = load_leaderboard_sync_state(&leaderboard_sync_path(app)?);
-    let configured = leaderboard_base_url().is_some();
-    let submit_reason = match (&stats, has_password, configured) {
-        (None, _, _) => "No scored user-data checkpoint is available.",
-        (Some(_), false, _) => "War of Dots config login password is missing.",
-        (Some(_), true, false) => "WOD_LEADERBOARD_URL is not configured.",
-        (Some(_), true, true) => "Ready to sync.",
-    };
-
-    Ok(json!({
-        "configured": configured,
-        "canSubmit": stats.is_some() && has_password && configured,
-        "submitReason": submit_reason,
-        "hasPassword": has_password,
-        "loginUsername": login_username,
-        "local": stats,
-        "lastSync": sync,
-    }))
-}
-
-fn leaderboard_sync_state_from_error(
-    username: Option<String>,
-    error: String,
-) -> LeaderboardSyncState {
-    LeaderboardSyncState {
-        status: "sync-failed".to_string(),
-        synced_at: Some(now_unix_secs()),
-        username,
-        message: None,
-        error: Some(error),
-        ..LeaderboardSyncState::default()
-    }
-}
-
-async fn post_leaderboard_snapshot(app: &AppHandle) -> Result<Value, String> {
-    let sync_path = leaderboard_sync_path(app)?;
-    let base_url = leaderboard_base_url()
-        .ok_or_else(|| "WOD_LEADERBOARD_URL is not configured.".to_string())?;
-    let checkpoint_path = user_data_checkpoint_path(app)?;
-    let store = load_user_data_checkpoint_store(&checkpoint_path);
-    let Some(checkpoint) = store.checkpoints.last() else {
-        return Err("No scored user-data checkpoint is available.".to_string());
-    };
-    let login = game_login();
-    let username = checkpoint.username.as_deref().or(login.username.as_deref());
-    let Some(password) = login.password.as_deref() else {
-        return Err("War of Dots config login password is missing.".to_string());
-    };
-    let region =
-        load_region_selection(&region_selection_path(app)?).map(|selection| selection.region);
-    let stats = leaderboard_public_stats_from_checkpoint(checkpoint, username, region)
-        .ok_or_else(|| "No scored user-data checkpoint is available.".to_string())?;
-    let token = leaderboard_token(&stats.username, password);
-    let payload = json!({
-        "player": stats,
-        "claimToken": token,
-        "client": {
-            "app": "More of Dots",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-    });
-
-    let response = reqwest::Client::builder()
-        .timeout(LEADERBOARD_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?
-        .post(format!("{base_url}/snapshot"))
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    let status = response.status();
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        let message = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("Leaderboard sync failed.")
-            .to_string();
-        let state = leaderboard_sync_state_from_error(Some(stats.username), message.clone());
-        write_leaderboard_sync_state(&sync_path, &state)?;
-        return Err(message);
-    }
-
-    let public_rank = value.get("rank").and_then(value_as_i64).or_else(|| {
-        value
-            .get("player")
-            .and_then(|player| player.get("rank"))
-            .and_then(value_as_i64)
-    });
-    let public_score = value
-        .get("score")
-        .and_then(value_as_i64)
-        .or_else(|| {
-            value
-                .get("player")
-                .and_then(|player| player.get("score"))
-                .and_then(value_as_i64)
-        })
-        .or(Some(stats.score));
-    let state = LeaderboardSyncState {
-        status: "synced".to_string(),
-        synced_at: Some(now_unix_secs()),
-        username: Some(stats.username),
-        public_rank,
-        public_score,
-        message: value
-            .get("message")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        error: None,
-    };
-    write_leaderboard_sync_state(&sync_path, &state)?;
-    Ok(json!({
-        "configured": true,
-        "submitted": true,
-        "lastSync": state,
-        "response": value,
-    }))
-}
-
-async fn fetch_leaderboard_rows() -> Result<Value, String> {
-    let Some(base_url) = leaderboard_base_url() else {
-        return Ok(json!({
-            "configured": false,
-            "rows": [],
-            "message": "WOD_LEADERBOARD_URL is not configured.",
-        }));
-    };
-    let response = reqwest::Client::builder()
-        .timeout(LEADERBOARD_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?
-        .get(format!("{base_url}/leaderboard?limit=100"))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    let status = response.status();
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        return Err(value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("Could not load leaderboard.")
-            .to_string());
-    }
-    Ok(value)
-}
-
-fn env_flag(name: &str) -> bool {
-    env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-fn env_flag_disabled(name: &str) -> bool {
-    env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        )
-    })
 }
 
 fn run_hidden_powershell(script: &str) -> Result<std::process::Output, String> {
@@ -1348,7 +761,7 @@ fn find_file_by_name(root: &Path, file_name: &str, max_depth: usize) -> Option<P
     None
 }
 
-fn find_python_probe_dll(app: &AppHandle) -> Option<PathBuf> {
+fn find_python_probe_dll(_app: &AppHandle) -> Option<PathBuf> {
     if let Some(path) = env::var_os("WOD_PYTHON_PROBE_DLL").map(PathBuf::from) {
         if path.is_file() {
             return Some(path);
@@ -1356,32 +769,11 @@ fn find_python_probe_dll(app: &AppHandle) -> Option<PathBuf> {
     }
 
     let mut candidates = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("wod_python_probe.dll"));
-        }
-    }
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(resource_dir.join("wod_python_probe.dll"));
-        candidates.push(
-            resource_dir
-                .join("_up_")
-                .join("tools")
-                .join("python-probe-dll")
-                .join("target")
-                .join("release")
-                .join("wod_python_probe.dll"),
-        );
-        candidates.push(
-            resource_dir
-                .join("tools")
-                .join("python-probe-dll")
-                .join("target")
-                .join("release")
-                .join("wod_python_probe.dll"),
-        );
-        if let Some(path) = find_file_by_name(&resource_dir, "wod_python_probe.dll", 8) {
-            candidates.push(path);
+    if let Ok(recorder_path) = resolve_recorder_path() {
+        if let Some(recorder_dir) = recorder_path.parent() {
+            if let Some(path) = find_file_by_name(recorder_dir, "wod_python_probe.dll", 8) {
+                candidates.push(path);
+            }
         }
     }
     if let Some(root) = repo_root_from_cwd() {
@@ -1397,7 +789,7 @@ fn find_python_probe_dll(app: &AppHandle) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn find_python_probe_injector(app: &AppHandle) -> Option<PathBuf> {
+fn find_python_probe_injector(_app: &AppHandle) -> Option<PathBuf> {
     if let Some(path) = env::var_os("WOD_PYTHON_PROBE_INJECTOR").map(PathBuf::from) {
         if path.is_file() {
             return Some(path);
@@ -1405,17 +797,11 @@ fn find_python_probe_injector(app: &AppHandle) -> Option<PathBuf> {
     }
 
     let mut candidates = Vec::new();
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(
-            resource_dir
-                .join("_up_")
-                .join("scripts")
-                .join("invoke-python-probe.ps1"),
-        );
-        candidates.push(resource_dir.join("scripts").join("invoke-python-probe.ps1"));
-        candidates.push(resource_dir.join("invoke-python-probe.ps1"));
-        if let Some(path) = find_file_by_name(&resource_dir, "invoke-python-probe.ps1", 8) {
-            candidates.push(path);
+    if let Ok(recorder_path) = resolve_recorder_path() {
+        if let Some(recorder_dir) = recorder_path.parent() {
+            if let Some(path) = find_file_by_name(recorder_dir, "invoke-python-probe.ps1", 8) {
+                candidates.push(path);
+            }
         }
     }
     if let Some(root) = repo_root_from_cwd() {
@@ -1732,875 +1118,6 @@ except Exception as exc:
     .replace("__REGION__", &escaped_region)
 }
 
-fn user_data_export_payload(output_path: &Path) -> String {
-    let escaped_output = python_raw_string(&output_path.to_string_lossy());
-    format!(
-        r#"
-import gc
-import json
-import os
-import time
-import traceback
-
-OUTPUT_PATH = r'''{escaped_output}'''
-
-INTERESTING_KEYS = {{
-    'username', 'user_name', 'name', 'score', 'elo', 'rating', 'rank',
-    'wins', 'losses', 'games', 'stats', 'userstats', 'profile', 'account',
-    'authorized', 'access', 'steamid', 'steam_id'
-}}
-
-def jsonable(value, depth=4, seen=None):
-    if seen is None:
-        seen = set()
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    ident = id(value)
-    if ident in seen:
-        return '<cycle>'
-    seen.add(ident)
-    if depth <= 0:
-        return repr(value)[:160]
-    if isinstance(value, dict):
-        out = {{}}
-        for index, (key, child) in enumerate(value.items()):
-            if index >= 80:
-                out['...'] = 'truncated'
-                break
-            try:
-                out[str(key)] = jsonable(child, depth - 1, seen)
-            except Exception as exc:
-                out[str(key)] = '<failed: %r>' % exc
-        return out
-    if isinstance(value, (list, tuple, set)):
-        return [jsonable(child, depth - 1, seen) for child in list(value)[:80]]
-    attrs = getattr(value, '__dict__', None)
-    if isinstance(attrs, dict):
-        return jsonable(attrs, depth - 1, seen)
-    return repr(value)[:160]
-
-def value_as_int(value):
-    try:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(round(value))
-        if isinstance(value, str) and value.strip():
-            return int(float(value.strip()))
-    except Exception:
-        return None
-    return None
-
-def find_score(value, depth=4):
-    if depth <= 0:
-        return None
-    if isinstance(value, dict):
-        for key in ('score', 'elo', 'rating'):
-            if key in value:
-                parsed = value_as_int(value.get(key))
-                if parsed is not None:
-                    return parsed
-        for child in value.values():
-            found = find_score(child, depth - 1)
-            if found is not None:
-                return found
-    elif isinstance(value, (list, tuple)):
-        for child in value[:40]:
-            found = find_score(child, depth - 1)
-            if found is not None:
-                return found
-    return None
-
-def candidate_weight(value):
-    try:
-        data = value if isinstance(value, dict) else getattr(value, '__dict__', {{}})
-        if not isinstance(data, dict):
-            return 0
-        keys = {{str(key).lower() for key in data.keys()}}
-        weight = len(keys & INTERESTING_KEYS)
-        if any(key in keys for key in ('score', 'elo', 'rating')):
-            weight += 8
-        if any(key in keys for key in ('username', 'user_name', 'name')):
-            weight += 4
-        if any(key in keys for key in ('stats', 'userstats', 'profile', 'account')):
-            weight += 3
-        return weight
-    except Exception:
-        return 0
-
-def summarize_candidate(value):
-    data = value if isinstance(value, dict) else getattr(value, '__dict__', {{}})
-    if not isinstance(data, dict):
-        data = {{}}
-    payload = jsonable(data, depth=4)
-    username = None
-    if isinstance(payload, dict):
-        for key in ('username', 'user_name', 'name'):
-            item = payload.get(key)
-            if isinstance(item, str) and item.strip():
-                username = item.strip()
-                break
-    return {{
-        'class': getattr(type(value), '__name__', str(type(value))),
-        'score': find_score(payload),
-        'username': username,
-        'data': payload,
-    }}
-
-def main():
-    ranked = []
-    for value in gc.get_objects():
-        weight = candidate_weight(value)
-        if weight >= 8:
-            ranked.append((weight, id(value), value))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    candidates = [summarize_candidate(value) for weight, ident, value in ranked[:12]]
-    best = next((candidate for candidate in candidates if candidate.get('score') is not None), None)
-    result = {{
-        'source': 'game-json',
-        'exportedAt': int(time.time()),
-        'status': 'ok' if best else 'no_score_candidate',
-        'candidateCount': len(ranked),
-        'best': best,
-        'candidates': candidates,
-    }}
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    temp_path = OUTPUT_PATH + '.tmp'
-    with open(temp_path, 'w', encoding='utf-8') as handle:
-        json.dump(result, handle, indent=2, default=str)
-    os.replace(temp_path, OUTPUT_PATH)
-
-try:
-    main()
-except Exception as exc:
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH + '.error.txt', 'w', encoding='utf-8') as handle:
-        handle.write(repr(exc) + '\n' + traceback.format_exc())
-"#,
-        escaped_output = escaped_output
-    )
-}
-
-fn export_user_data_from_game_json(app: &AppHandle) -> Result<UserScoreLookup, String> {
-    let process = real_game_processes().into_iter().next().ok_or_else(|| {
-        "War of Dots is not running, so game-json export has no live cache to read.".to_string()
-    })?;
-    let process_id = process
-        .process_id
-        .ok_or_else(|| "War of Dots process id was unavailable.".to_string())?;
-
-    let source_dll = find_python_probe_dll(app).ok_or_else(|| {
-        "Python probe DLL is missing; build tools\\python-probe-dll first.".to_string()
-    })?;
-    let injector = find_python_probe_injector(app)
-        .ok_or_else(|| "Python probe injector script is missing.".to_string())?;
-
-    let probe_root = app_runtime_dir(app)?.join("probes").join("user-data-json");
-    fs::create_dir_all(&probe_root).map_err(|error| error.to_string())?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let probe_dll = probe_root.join(format!("wod_python_probe_{unique}.dll"));
-    let payload_path = probe_root.join("wod_python_probe_payload.py");
-    let output_path = probe_root.join("user-data.json");
-    let status_path = probe_root.join("wod_python_probe.status.json");
-    let _ = fs::remove_file(&output_path);
-    let _ = fs::remove_file(output_path.with_extension("json.error.txt"));
-    let _ = fs::remove_file(&status_path);
-    fs::copy(&source_dll, &probe_dll).map_err(|error| {
-        format!(
-            "Could not stage Python probe DLL {} to {}: {error}",
-            source_dll.display(),
-            probe_dll.display()
-        )
-    })?;
-    fs::write(&payload_path, user_data_export_payload(&output_path))
-        .map_err(|error| format!("Could not write {}: {error}", payload_path.display()))?;
-
-    let script = format!(
-        "& {} -ProcessId {} -ProbeDll {} -TimeoutSeconds 10",
-        quote_ps_arg(&injector),
-        process_id,
-        quote_ps_arg(&probe_dll)
-    );
-    let output = run_hidden_powershell(&script)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "Game JSON probe injection failed: {}",
-            if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            }
-        ));
-    }
-
-    let deadline = Instant::now() + USER_DATA_EXPORT_WAIT;
-    while Instant::now() < deadline {
-        if output_path.is_file() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    let value = read_json_file(&output_path).ok_or_else(|| {
-        let status = read_json_file(&status_path)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "no probe status".to_string());
-        format!("Game JSON export did not produce user-data.json ({status}).")
-    })?;
-    let score = find_user_score(&value).ok_or_else(|| {
-        "Game JSON export completed but no score/elo was found in the live cache.".to_string()
-    })?;
-    let username = value
-        .get("best")
-        .and_then(|best| best.get("username"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| game_login().username);
-    let user_data = value
-        .get("best")
-        .and_then(|best| best.get("data"))
-        .cloned()
-        .unwrap_or_else(|| value.clone());
-
-    Ok(UserScoreLookup {
-        score,
-        username,
-        user_data,
-        messages: vec![value],
-        source: "game-json".to_string(),
-    })
-}
-
-fn fetch_current_user_score_direct() -> Result<UserScoreLookup, String> {
-    if real_game_is_running() && !env_flag("WOD_USER_DATA_ALLOW_LIVE_DIRECT") {
-        return Err(
-            "Direct user-data lookup is disabled while War of Dots is running; using cached/game-json data protects the live client."
-                .to_string(),
-        );
-    }
-
-    fetch_current_user_score_from_socket()
-}
-
-fn lookup_current_user_score(
-    app: &AppHandle,
-    mode: UserDataLookupMode,
-) -> Result<UserScoreLookup, String> {
-    if mode == UserDataLookupMode::Automatic && env_flag_disabled("WOD_USER_DATA_AUTOMATIC_LOOKUP")
-    {
-        return Err("Automatic user-data lookup is disabled.".to_string());
-    }
-
-    let provider = env::var("WOD_USER_DATA_PROVIDER")
-        .unwrap_or_else(|_| "game-json".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    match provider.as_str() {
-        "cache" | "cached" | "off" | "disabled" => Err("User-data lookup is disabled.".to_string()),
-        "direct" | "direct-ws" | "ws" => fetch_current_user_score_direct(),
-        "game-json" | "game_json" | "auto" => match export_user_data_from_game_json(app) {
-            Ok(lookup) => Ok(lookup),
-            Err(game_json_error) => {
-                if real_game_is_running() {
-                    Err(game_json_error)
-                } else {
-                    fetch_current_user_score_direct().map_err(|direct_error| {
-                        format!("{game_json_error}; direct lookup also failed: {direct_error}")
-                    })
-                }
-            }
-        },
-        other => Err(format!(
-            "Unsupported WOD_USER_DATA_PROVIDER value: {other}."
-        )),
-    }
-}
-
-struct PseudoRandom {
-    state: u64,
-}
-
-impl PseudoRandom {
-    fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as u64)
-            .unwrap_or(0);
-        Self {
-            state: nanos ^ ((process::id() as u64) << 32) ^ 0x9e37_79b9_7f4a_7c15,
-        }
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        self.state ^= self.state << 7;
-        self.state ^= self.state >> 9;
-        self.state ^= self.state << 8;
-        self.state as u8
-    }
-
-    fn fill_bytes(&mut self, bytes: &mut [u8]) {
-        for byte in bytes {
-            *byte = self.next_u8();
-        }
-    }
-}
-
-fn load_game_config(path: &Path) -> Option<Value> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = GzDecoder::new(bytes.as_slice());
-        let mut decoded = Vec::new();
-        decoder.read_to_end(&mut decoded).ok()?;
-        serde_json::from_slice(&decoded).ok()
-    } else {
-        serde_json::from_slice(&bytes).ok()
-    }
-}
-
-fn game_login() -> GameLogin {
-    let mut candidates = Vec::new();
-    if let Some(path) = env::var_os("WOD_USER_CONFIG") {
-        candidates.push(PathBuf::from(path));
-    }
-    candidates.push(steam_game_dir().join("config.txt"));
-
-    for candidate in candidates {
-        let Some(config) = load_game_config(&candidate) else {
-            continue;
-        };
-        let login = config.get("login").unwrap_or(&Value::Null);
-        let username = login
-            .get("username")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let password = login
-            .get("password")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        if username.is_some() || password.is_some() {
-            return GameLogin { username, password };
-        }
-    }
-
-    GameLogin {
-        username: None,
-        password: None,
-    }
-}
-
-fn json_login_value(value: Option<&String>) -> Value {
-    value
-        .map(|value| Value::String(value.clone()))
-        .unwrap_or(Value::Null)
-}
-
-fn permissions_value() -> Value {
-    Value::Array(
-        USER_DATA_PERMISSIONS
-            .iter()
-            .map(|permission| Value::String((*permission).to_string()))
-            .collect(),
-    )
-}
-
-fn make_user_data_request(message_type: &str, content: Value) -> Value {
-    json!({ "type": message_type, "content": content })
-}
-
-fn make_user_data_access_request(message_type: &str, content: Value, access: Value) -> Value {
-    json!({ "type": message_type, "access": access, "content": content })
-}
-
-fn build_user_data_flows(login: &GameLogin, version: &str) -> Vec<Vec<Value>> {
-    let username = json_login_value(login.username.as_ref());
-    let password = json_login_value(login.password.as_ref());
-    let steam_id = 0u64;
-    let startup_auth = json!({
-        "username": username.clone(),
-        "password": password.clone(),
-        "steamid": steam_id.to_string(),
-    });
-    let auth = json!({
-        "username": username.clone(),
-        "password": password.clone(),
-        "version": version,
-        "steamid": steam_id,
-    });
-    let permissions = permissions_value();
-
-    let mut flows = vec![
-        vec![
-            make_user_data_request("access", json!({ "version": version })),
-            make_user_data_request("authorize", startup_auth),
-            make_user_data_request("get_userstats", json!({})),
-        ],
-        vec![make_user_data_access_request(
-            "get_userstats",
-            json!({}),
-            Value::String("authorize".to_string()),
-        )],
-        vec![make_user_data_access_request(
-            "get_userstats",
-            json!({}),
-            permissions.clone(),
-        )],
-        vec![
-            json!({ "access": permissions.clone() }),
-            make_user_data_access_request("get_userstats", json!({}), permissions.clone()),
-        ],
-    ];
-
-    if login.username.is_some() && login.password.is_some() {
-        flows.extend([
-            vec![
-                make_user_data_request("authorize", auth.clone()),
-                make_user_data_request("get_userstats", json!({})),
-            ],
-            vec![
-                make_user_data_access_request("authorize", auth.clone(), permissions.clone()),
-                make_user_data_access_request("get_userstats", json!({}), permissions.clone()),
-            ],
-            vec![
-                json!({ "access": permissions.clone() }),
-                make_user_data_request("authorize", auth.clone()),
-                make_user_data_request("get_userstats", json!({})),
-            ],
-            vec![
-                make_user_data_request("login_steamid", auth),
-                make_user_data_request("get_userstats", json!({})),
-            ],
-        ]);
-    }
-
-    flows
-}
-
-fn xor_repeating(data: &[u8], key: &[u8; 4]) -> Vec<u8> {
-    data.iter()
-        .enumerate()
-        .map(|(index, byte)| byte ^ key[index % 4])
-        .collect()
-}
-
-fn bake_cake(payload: &[u8], random: &mut PseudoRandom) -> Result<Vec<u8>, String> {
-    if payload.len() > 0x4000 {
-        return Err("User-data request payload is too large.".to_string());
-    }
-
-    let mut key = [0u8; 4];
-    let mut noise = [0u8; 2];
-    random.fill_bytes(&mut key);
-    random.fill_bytes(&mut noise);
-
-    let length = payload.len();
-    let (first_index, second_index) = if length < 4 {
-        (1usize, 2usize)
-    } else {
-        (
-            7usize.min(1usize.max(length.saturating_sub(3))),
-            13usize.min(
-                (7usize.min(1usize.max(length.saturating_sub(3))) + 1)
-                    .max(length.saturating_sub(1)),
-            ),
-        )
-    };
-    let mut body = xor_repeating(payload, &key);
-    body.insert(first_index, noise[0]);
-    body.insert(second_index, noise[1]);
-    body.insert(
-        0,
-        payload
-            .iter()
-            .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
-    );
-
-    let mut wrapped = Vec::with_capacity(16 + body.len());
-    wrapped.extend(key);
-    wrapped.extend((first_index as u32).to_be_bytes());
-    wrapped.extend((second_index as u32).to_be_bytes());
-    wrapped.extend((length as u32).to_be_bytes());
-    wrapped.extend(body);
-    Ok(wrapped)
-}
-
-fn decode_cake_candidate(
-    body: &[u8],
-    key: &[u8; 4],
-    length: usize,
-    remove_indexes: &[usize],
-) -> Option<Value> {
-    if remove_indexes.len() != 3 || remove_indexes.iter().any(|index| *index >= body.len()) || {
-        let mut sorted = remove_indexes.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        sorted.len() != 3
-    } {
-        return None;
-    }
-
-    let stripped = body
-        .iter()
-        .enumerate()
-        .filter_map(|(index, byte)| (!remove_indexes.contains(&index)).then_some(*byte))
-        .collect::<Vec<_>>();
-    if stripped.len() != length {
-        return None;
-    }
-
-    let payload = xor_repeating(&stripped, key);
-    if body[0]
-        != payload
-            .iter()
-            .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
-    {
-        return None;
-    }
-    serde_json::from_slice(&payload).ok()
-}
-
-fn eat_cake(message: &[u8]) -> Option<Value> {
-    if message.len() < 19 {
-        return None;
-    }
-
-    let key = [message[0], message[1], message[2], message[3]];
-    let first_index = u32::from_be_bytes([message[4], message[5], message[6], message[7]]) as usize;
-    let second_index =
-        u32::from_be_bytes([message[8], message[9], message[10], message[11]]) as usize;
-    let length = u32::from_be_bytes([message[12], message[13], message[14], message[15]]) as usize;
-    let body = &message[16..];
-    if length + 3 != body.len() {
-        return None;
-    }
-
-    let low = first_index.min(second_index);
-    let high = first_index.max(second_index);
-    let candidates = [
-        vec![0, first_index + 1, second_index + 1],
-        vec![0, low + 1, high + 2],
-        vec![0, low + 1, high + 1],
-        vec![0, first_index, second_index],
-    ];
-    let mut seen = Vec::<Vec<usize>>::new();
-    for mut indexes in candidates {
-        indexes.sort_unstable();
-        if seen.contains(&indexes) {
-            continue;
-        }
-        seen.push(indexes.clone());
-        if let Some(decoded) = decode_cake_candidate(body, &key, length, &indexes) {
-            return Some(decoded);
-        }
-    }
-
-    for first in 1..body.len() {
-        for second in (first + 1)..body.len() {
-            if let Some(decoded) = decode_cake_candidate(body, &key, length, &[0, first, second]) {
-                return Some(decoded);
-            }
-        }
-    }
-    None
-}
-
-fn parse_user_data_message(payload: Vec<u8>, binary: bool) -> Value {
-    if binary {
-        if let Some(decoded) = eat_cake(&payload) {
-            return decoded;
-        }
-    }
-    match serde_json::from_slice::<Value>(&payload) {
-        Ok(value) => value,
-        Err(_) => Value::String(String::from_utf8_lossy(&payload).to_string()),
-    }
-}
-
-fn parse_ws_url(url: &str) -> Result<(String, u16, String), String> {
-    let rest = url
-        .strip_prefix("ws://")
-        .ok_or_else(|| "Only ws:// user-data URLs are supported.".to_string())?;
-    let (host_port, path) = rest
-        .split_once('/')
-        .map(|(host_port, path)| (host_port, format!("/{path}")))
-        .unwrap_or((rest, "/".to_string()));
-    let (host, port) = host_port
-        .rsplit_once(':')
-        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
-        .unwrap_or((host_port, 80));
-    if host.is_empty() {
-        return Err("User-data WebSocket URL is missing a host.".to_string());
-    }
-    Ok((host.to_string(), port, path))
-}
-
-fn connect_user_data_socket(url: &str, random: &mut PseudoRandom) -> Result<TcpStream, String> {
-    let (host, port, path) = parse_ws_url(url)?;
-    let address = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|error| format!("Could not resolve {host}:{port}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("Could not resolve {host}:{port}."))?;
-    let mut stream = TcpStream::connect_timeout(&address, USER_DATA_CONNECT_TIMEOUT)
-        .map_err(|error| format!("Could not connect to {host}:{port}: {error}"))?;
-    stream
-        .set_read_timeout(Some(USER_DATA_CONNECT_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(USER_DATA_CONNECT_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-
-    let mut key_bytes = [0u8; 16];
-    random.fill_bytes(&mut key_bytes);
-    let key = BASE64.encode(key_bytes);
-    let request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         Sec-WebSocket-Key: {key}\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("Could not send WebSocket handshake: {error}"))?;
-
-    let mut response = Vec::new();
-    let mut byte = [0u8; 1];
-    while response.len() < 8192 && !response.ends_with(b"\r\n\r\n") {
-        stream
-            .read_exact(&mut byte)
-            .map_err(|error| format!("Could not read WebSocket handshake: {error}"))?;
-        response.push(byte[0]);
-    }
-    let response_text = String::from_utf8_lossy(&response);
-    if !response_text.starts_with("HTTP/1.1 101") && !response_text.starts_with("HTTP/1.0 101") {
-        return Err(format!(
-            "User-data WebSocket handshake failed: {}",
-            response_text.lines().next().unwrap_or("empty response")
-        ));
-    }
-
-    Ok(stream)
-}
-
-fn send_ws_frame(
-    stream: &mut TcpStream,
-    opcode: u8,
-    payload: &[u8],
-    random: &mut PseudoRandom,
-) -> Result<(), String> {
-    let mut frame = Vec::with_capacity(payload.len() + 16);
-    frame.push(0x80 | (opcode & 0x0f));
-    if payload.len() <= 125 {
-        frame.push(0x80 | payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        frame.push(0x80 | 126);
-        frame.extend((payload.len() as u16).to_be_bytes());
-    } else {
-        frame.push(0x80 | 127);
-        frame.extend((payload.len() as u64).to_be_bytes());
-    }
-
-    let mut mask = [0u8; 4];
-    random.fill_bytes(&mut mask);
-    frame.extend(mask);
-    frame.extend(
-        payload
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| byte ^ mask[index % 4]),
-    );
-    stream
-        .write_all(&frame)
-        .map_err(|error| format!("Could not send WebSocket frame: {error}"))
-}
-
-fn read_ws_payload(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, String> {
-    let mut header = [0u8; 2];
-    match stream.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(format!("Could not read WebSocket frame header: {error}")),
-    }
-
-    let opcode = header[0] & 0x0f;
-    let masked = (header[1] & 0x80) != 0;
-    let mut length = u64::from(header[1] & 0x7f);
-    if length == 126 {
-        let mut extended = [0u8; 2];
-        stream
-            .read_exact(&mut extended)
-            .map_err(|error| format!("Could not read WebSocket frame length: {error}"))?;
-        length = u64::from(u16::from_be_bytes(extended));
-    } else if length == 127 {
-        let mut extended = [0u8; 8];
-        stream
-            .read_exact(&mut extended)
-            .map_err(|error| format!("Could not read WebSocket frame length: {error}"))?;
-        length = u64::from_be_bytes(extended);
-    }
-    if length > 2 * 1024 * 1024 {
-        return Err("User-data WebSocket frame is too large.".to_string());
-    }
-
-    let mut mask = [0u8; 4];
-    if masked {
-        stream
-            .read_exact(&mut mask)
-            .map_err(|error| format!("Could not read WebSocket frame mask: {error}"))?;
-    }
-
-    let mut payload = vec![0u8; length as usize];
-    stream
-        .read_exact(&mut payload)
-        .map_err(|error| format!("Could not read WebSocket frame payload: {error}"))?;
-    if masked {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
-    }
-    Ok(Some((opcode, payload)))
-}
-
-fn receive_user_data_messages(
-    stream: &mut TcpStream,
-    wait: Duration,
-    random: &mut PseudoRandom,
-) -> Result<Vec<Value>, String> {
-    let deadline = Instant::now() + wait;
-    let mut messages = Vec::new();
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        stream
-            .set_read_timeout(Some(remaining.max(Duration::from_millis(25))))
-            .map_err(|error| error.to_string())?;
-        let Some((opcode, payload)) = read_ws_payload(stream)? else {
-            break;
-        };
-        match opcode {
-            0x1 => messages.push(parse_user_data_message(payload, false)),
-            0x2 => messages.push(parse_user_data_message(payload, true)),
-            0x8 => break,
-            0x9 => {
-                let _ = send_ws_frame(stream, 0xA, &payload, random);
-            }
-            _ => {}
-        }
-    }
-    Ok(messages)
-}
-
-fn run_user_data_flow(
-    url: &str,
-    frames: &[Value],
-    frame_format: UserDataFrameFormat,
-    random: &mut PseudoRandom,
-) -> Result<Option<(i64, Value, Vec<Value>)>, String> {
-    let mut stream = connect_user_data_socket(url, random)?;
-    let mut received_messages = Vec::new();
-
-    for frame in frames {
-        send_user_data_value(&mut stream, frame, frame_format, random)?;
-
-        for message in receive_user_data_messages(&mut stream, USER_DATA_WAIT, random)? {
-            if let Some(score) = find_user_score(&message) {
-                received_messages.push(message.clone());
-                let user_data = find_user_data_value(&message).unwrap_or(message);
-                return Ok(Some((score, user_data, received_messages)));
-            }
-            received_messages.push(message);
-        }
-    }
-
-    Ok(None)
-}
-
-fn send_user_data_value(
-    stream: &mut TcpStream,
-    value: &Value,
-    frame_format: UserDataFrameFormat,
-    random: &mut PseudoRandom,
-) -> Result<(), String> {
-    let json = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    match frame_format {
-        UserDataFrameFormat::Wrapped => {
-            let payload = bake_cake(&json, random)?;
-            send_ws_frame(stream, 0x2, &payload, random)
-        }
-        UserDataFrameFormat::Binary => send_ws_frame(stream, 0x2, &json, random),
-        UserDataFrameFormat::Text => send_ws_frame(stream, 0x1, &json, random),
-    }
-}
-
-fn value_as_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
-        .or_else(|| value.as_f64().map(|number| number.round() as i64))
-        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
-}
-
-fn find_user_score(value: &Value) -> Option<i64> {
-    match value {
-        Value::Object(object) => {
-            for key in ["score", "elo"] {
-                if let Some(score) = object.get(key).and_then(value_as_i64) {
-                    return Some(score);
-                }
-            }
-
-            for key in [
-                "content", "data", "user", "stats", "response", "result", "payload",
-            ] {
-                if let Some(score) = object.get(key).and_then(find_user_score) {
-                    return Some(score);
-                }
-            }
-
-            object.values().find_map(find_user_score)
-        }
-        Value::Array(items) => items.iter().find_map(find_user_score),
-        _ => None,
-    }
-}
-
-fn find_user_data_value(value: &Value) -> Option<Value> {
-    match value {
-        Value::Object(object) => {
-            if object.get("score").and_then(value_as_i64).is_some()
-                || object.get("elo").and_then(value_as_i64).is_some()
-            {
-                return Some(value.clone());
-            }
-
-            for key in [
-                "content", "data", "user", "stats", "response", "result", "payload",
-            ] {
-                if let Some(found) = object.get(key).and_then(find_user_data_value) {
-                    return Some(found);
-                }
-            }
-
-            object.values().find_map(find_user_data_value)
-        }
-        Value::Array(items) => items.iter().find_map(find_user_data_value),
-        _ => None,
-    }
-}
-
 fn region_index(region: &str) -> Option<usize> {
     REGION_NAMES
         .iter()
@@ -2611,60 +1128,6 @@ fn normalize_region(region: &str) -> Result<&'static str, String> {
     region_index(region)
         .map(|index| REGION_NAMES[index])
         .ok_or_else(|| "Region must be NA, EU, or ASIA.".to_string())
-}
-
-fn fetch_current_user_score_from_socket() -> Result<UserScoreLookup, String> {
-    let login = game_login();
-    if login.username.is_none() || login.password.is_none() {
-        return Err("War of Dots config login is missing.".to_string());
-    }
-
-    let url = env::var("WOD_USER_DATA_URL").unwrap_or_else(|_| DEFAULT_USER_DATA_URL.to_string());
-    let version =
-        env::var("WOD_USER_DATA_VERSION").unwrap_or_else(|_| DEFAULT_USER_DATA_VERSION.to_string());
-    let flows = build_user_data_flows(&login, &version);
-    let exhaustive = env::var("WOD_USER_DATA_EXHAUSTIVE")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
-    let formats = if exhaustive {
-        vec![
-            UserDataFrameFormat::Wrapped,
-            UserDataFrameFormat::Binary,
-            UserDataFrameFormat::Text,
-        ]
-    } else {
-        vec![UserDataFrameFormat::Wrapped]
-    };
-    let mut random = PseudoRandom::new();
-    let mut last_error = None;
-
-    for format in formats {
-        for frames in &flows {
-            match run_user_data_flow(&url, frames, format, &mut random) {
-                Ok(Some((score, user_data, messages))) => {
-                    return Ok(UserScoreLookup {
-                        score,
-                        username: login.username.clone(),
-                        user_data,
-                        messages,
-                        source: "direct-ws".to_string(),
-                    });
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if error.starts_with("Could not connect")
-                        || error.starts_with("Could not resolve")
-                        || error.starts_with("User-data WebSocket handshake failed")
-                    {
-                        return Err(error);
-                    }
-                    last_error = Some(error);
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| "User-data lookup returned no score.".to_string()))
 }
 
 fn inject_region_selection_into_game(app: &AppHandle, region: &str) -> Result<Value, String> {
@@ -3447,6 +1910,7 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
         summary: ReplaySummary {
             file_name,
             file_path: path.to_string_lossy().to_string(),
+            version: raw.get("version").and_then(Value::as_str).map(str::to_string),
             players,
             draw: result.as_ref().is_some_and(replay_result_is_draw),
             length: format_duration_seconds(duration_seconds),
@@ -3815,6 +2279,7 @@ async fn run_backend_with_owner(
     extra_args: Vec<String>,
     owner_pid: u32,
 ) -> Result<Value, String> {
+    let recorder_path = resolve_recorder_path()?;
     let runtime_dir = app_runtime_dir(app)?;
     let mut args = vec![
         "--desktop-command".to_string(),
@@ -3826,14 +2291,20 @@ async fn run_backend_with_owner(
     ];
     args.extend(extra_args);
 
-    let output = app
-        .shell()
-        .sidecar("wod-replay-server")
-        .map_err(|error| error.to_string())?
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| error.to_string())?;
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        let mut command = Command::new(&recorder_path);
+        command.args(args);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        command.output().map_err(|error| {
+            format!(
+                "Could not start More of Dots Recorder at {}: {error}",
+                recorder_path.display()
+            )
+        })
+    })
+    .await
+    .map_err(|error| format!("Recorder launch task failed: {error}"))??;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3859,14 +2330,83 @@ async fn run_backend_with_owner(
     })
 }
 
-#[tauri::command]
-async fn backend_status(app: AppHandle) -> Result<Value, String> {
-    run_backend(&app, "health", Vec::new()).await
+fn resolve_recorder_path() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = env::var_os("WOD_RECORDER_PATH") {
+        candidates.push(PathBuf::from(configured));
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let local_app_data = PathBuf::from(local_app_data);
+        candidates.push(
+            local_app_data
+                .join("Programs")
+                .join("More of Dots Recorder")
+                .join("more-of-dots-recorder.exe"),
+        );
+        candidates.push(
+            local_app_data
+                .join("More of Dots Recorder")
+                .join("more-of-dots-recorder.exe"),
+        );
+    }
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join("more-of-dots-recorder.exe"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .ok_or_else(|| {
+            "More of Dots Recorder is not installed. Install the separate recorder package or set WOD_RECORDER_PATH. The main app remains usable without it.".to_string()
+        })
 }
 
 #[tauri::command]
-async fn stage_game(app: AppHandle) -> Result<Value, String> {
-    run_backend(&app, "stage-game", Vec::new()).await
+async fn recorder_status(app: AppHandle) -> Result<Value, String> {
+    let recorder_path = resolve_recorder_path()?;
+    let mut value = run_backend(&app, "recorder-capabilities", Vec::new()).await?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("installed".to_string(), Value::Bool(true));
+        object.insert("executable".to_string(), json!(recorder_path));
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+async fn list_recorder_versions(app: AppHandle) -> Result<Value, String> {
+    run_backend(&app, "list-game-versions", Vec::new()).await
+}
+
+#[tauri::command]
+fn recording_default_directory(app: AppHandle) -> Result<PathBuf, String> {
+    let videos_dir = app
+        .path()
+        .video_dir()
+        .map_err(|error| format!("Windows Videos folder is unavailable: {error}"))?;
+    fs::create_dir_all(&videos_dir)
+        .map_err(|error| format!("Could not prepare {}: {error}", videos_dir.display()))?;
+    Ok(videos_dir)
+}
+
+#[tauri::command]
+fn open_recording_output_directory(output_path: String) -> Result<bool, String> {
+    let output_path = PathBuf::from(output_path);
+    if !output_path.is_file() {
+        return Err(format!("Recorded video was not found: {}", output_path.display()));
+    }
+    let directory = output_path
+        .parent()
+        .ok_or_else(|| "Recorded video has no output folder.".to_string())?;
+    let mut command = Command::new("explorer.exe");
+    command.arg(directory);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .map_err(|error| format!("Could not open {}: {error}", directory.display()))?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -4057,41 +2597,6 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     }
     let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
-}
-
-fn resolve_ffmpeg_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let mut candidates = Vec::new();
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(resource_dir.join("ffmpeg.exe"));
-        candidates.push(resource_dir.join("bin").join("ffmpeg.exe"));
-    }
-    if let Ok(executable) = env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            candidates.push(parent.join("ffmpeg.exe"));
-            candidates.push(parent.join("bin").join("ffmpeg.exe"));
-        }
-    }
-    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
-        return Ok(path);
-    }
-
-    let output = Command::new("where.exe")
-        .arg("ffmpeg.exe")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("Could not look for FFmpeg: {error}"))?;
-    if output.status.success() {
-        if let Some(path) = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .find(|path| path.is_file())
-        {
-            return Ok(path);
-        }
-    }
-    Err("FFmpeg is required to record replay videos. Install FFmpeg or place ffmpeg.exe beside the app.".to_string())
 }
 
 fn safe_recording_file_name(requested_name: &str) -> String {
@@ -4545,7 +3050,6 @@ struct CompletedReplayRecording {
 async fn record_one_replay(
     app: AppHandle,
     work: ReplayRecordingWork,
-    ffmpeg_path: PathBuf,
     options: ReplayRecordingOptions,
     total: usize,
     concurrency: usize,
@@ -4583,6 +3087,8 @@ async fn record_one_replay(
             "concurrency": concurrency,
             "queueIndex": work.queue_index,
             "fileName": work.display_name,
+            "sourcePath": work.source_path.to_string_lossy(),
+            "step": "preparing",
             "playbackSpeed": options.playback_speed,
             "bitrateKbps": options.bitrate_kbps,
             "resolutionHeight": options.resolution_height,
@@ -4595,6 +3101,7 @@ async fn record_one_replay(
         let polling_app = app.clone();
         let polling_status_path = work.status_path.clone();
         let polling_name = work.display_name.clone();
+        let polling_source_path = work.source_path.to_string_lossy().to_string();
         let polling_active = Arc::clone(&active_count);
         let polling_completed = Arc::clone(&completed_count);
         let polling_failed = Arc::clone(&failed_count);
@@ -4609,6 +3116,15 @@ async fn record_one_replay(
                         if let Ok(encoder) = serde_json::from_str::<Value>(&contents) {
                             let processed = polling_processed.load(Ordering::Relaxed);
                             let active = polling_active.load(Ordering::Relaxed);
+                            let recorder_step = encoder
+                                .get("step")
+                                .and_then(Value::as_str)
+                                .unwrap_or("preparing");
+                            let display_step = if recorder_step == "completed" {
+                                "exporting"
+                            } else {
+                                recorder_step
+                            };
                             let _ = polling_app.emit(
                                 "replay-recording-progress",
                                 json!({
@@ -4624,6 +3140,8 @@ async fn record_one_replay(
                                     "concurrency": concurrency,
                                     "queueIndex": queue_index,
                                     "fileName": polling_name,
+                                    "sourcePath": polling_source_path,
+                                    "step": display_step,
                                     "encoder": encoder,
                                 }),
                             );
@@ -4656,6 +3174,8 @@ async fn record_one_replay(
                     "concurrency": concurrency,
                     "queueIndex": work.queue_index,
                     "fileName": work.display_name,
+                    "sourcePath": work.source_path.to_string_lossy(),
+                    "step": if attempt == 1 { "preparing" } else { "retrying" },
                     "attempt": attempt,
                     "maxAttempts": MAX_ATTEMPTS,
                 }),
@@ -4672,8 +3192,6 @@ async fn record_one_replay(
                     work.replay.file_name.clone(),
                     "--output".to_string(),
                     work.partial_path.to_string_lossy().to_string(),
-                    "--ffmpeg".to_string(),
-                    ffmpeg_path.to_string_lossy().to_string(),
                     "--cancel-path".to_string(),
                     work.cancel_path.to_string_lossy().to_string(),
                     "--status-path".to_string(),
@@ -4739,6 +3257,24 @@ async fn record_one_replay(
             return Err(format!("{last_error} Failed after {MAX_ATTEMPTS} attempts."));
         }
 
+        let _ = app.emit(
+            "replay-recording-progress",
+            json!({
+                "stage": "exporting",
+                "step": "exporting",
+                "current": processed_count.load(Ordering::Relaxed),
+                "processed": processed_count.load(Ordering::Relaxed),
+                "succeeded": completed_count.load(Ordering::Relaxed),
+                "failed": failed_count.load(Ordering::Relaxed),
+                "total": total,
+                "active": active_count.load(Ordering::Relaxed),
+                "queued": total.saturating_sub(processed_count.load(Ordering::Relaxed).saturating_add(active_count.load(Ordering::Relaxed))),
+                "concurrency": concurrency,
+                "queueIndex": work.queue_index,
+                "fileName": work.display_name,
+                "sourcePath": work.source_path.to_string_lossy(),
+            }),
+        );
         fs::rename(&work.partial_path, &work.final_path)
             .map_err(|error| format!("Could not publish {}: {error}", work.final_path.display()))?;
         let encoder_status = fs::read_to_string(&work.status_path)
@@ -4768,6 +3304,8 @@ async fn record_one_replay(
                 "concurrency": concurrency,
                 "queueIndex": work.queue_index,
                 "fileName": work.display_name,
+                "sourcePath": work.source_path.to_string_lossy(),
+                "step": "completed",
                 "outputPath": work.final_path,
             }),
         );
@@ -4805,6 +3343,8 @@ async fn record_one_replay(
                 "concurrency": concurrency,
                 "queueIndex": work.queue_index,
                 "fileName": work.display_name,
+                "sourcePath": work.source_path.to_string_lossy(),
+                "step": "failed",
                 "message": error,
             }),
         );
@@ -4842,7 +3382,6 @@ async fn record_replays_inner(
     if !destination_dir.is_dir() {
         return Err(format!("Replay video destination is not a folder: {}", destination_dir.display()));
     }
-    let ffmpeg_path = resolve_ffmpeg_path(app)?;
     let _ = app.emit(
         "replay-recording-progress",
         json!({
@@ -4862,8 +3401,6 @@ async fn record_replays_inner(
             "message": format!("Preparing up to {concurrency} isolated game runtimes"),
         }),
     );
-    run_backend(app, "stage-game", Vec::new()).await?;
-
     let recording_root = app_runtime_dir(app)?.join("replay-recordings");
     fs::create_dir_all(&recording_root).map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
@@ -4901,6 +3438,28 @@ async fn record_replays_inner(
         })
         .collect::<Vec<_>>();
 
+    for work in &work_items {
+        let _ = app.emit(
+            "replay-recording-progress",
+            json!({
+                "stage": "queued-file",
+                "step": "waiting-in-queue",
+                "current": 0,
+                "processed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "total": total,
+                "active": 0,
+                "queued": total,
+                "percent": 0,
+                "concurrency": concurrency,
+                "queueIndex": work.queue_index,
+                "fileName": work.display_name,
+                "sourcePath": work.source_path.to_string_lossy(),
+            }),
+        );
+    }
+
     let active_count = Arc::new(AtomicUsize::new(0));
     let completed_count = Arc::new(AtomicUsize::new(0));
     let failed_count = Arc::new(AtomicUsize::new(0));
@@ -4909,7 +3468,6 @@ async fn record_replays_inner(
         record_one_replay(
             app.clone(),
             work,
-            ffmpeg_path.clone(),
             options.clone(),
             total,
             concurrency,
@@ -5155,89 +3713,6 @@ fn delete_maps(file_names: Vec<String>) -> Result<Vec<String>, String> {
     Ok(deleted)
 }
 
-fn fetch_user_data_impl(app: &AppHandle) -> Result<Value, String> {
-    let checkpoint_path = user_data_checkpoint_path(&app)?;
-    let mut store = load_user_data_checkpoint_store(&checkpoint_path);
-    let fetched_at = now_unix_secs();
-    let lookup = lookup_current_user_score(&app, UserDataLookupMode::Manual);
-    let (username, score, user_data, messages, source, lookup_error) = match lookup {
-        Ok(lookup) => {
-            append_user_data_checkpoint_if_changed(&mut store, &lookup, fetched_at);
-            write_user_data_checkpoint_store(&checkpoint_path, &store)?;
-            (
-                lookup.username,
-                Some(lookup.score),
-                lookup.user_data,
-                lookup.messages,
-                lookup.source,
-                Value::Null,
-            )
-        }
-        Err(error) => {
-            let latest_fields = store
-                .checkpoints
-                .last()
-                .map(|checkpoint| checkpoint.fields.clone())
-                .unwrap_or_default();
-            let user_data = json!({
-                "source": "cached",
-                "status": "lookup-failed",
-                "error": error.clone(),
-                "fields": latest_fields,
-            });
-            (
-                None,
-                latest_checkpoint_score(&store),
-                user_data,
-                Vec::new(),
-                "cached".to_string(),
-                json!(error),
-            )
-        }
-    };
-    let checkpoints = store
-        .checkpoints
-        .iter()
-        .map(checkpoint_json)
-        .collect::<Vec<_>>();
-
-    Ok(json!({
-        "fetchedAt": fetched_at,
-        "username": username,
-        "score": score,
-        "source": source,
-        "lookupError": lookup_error,
-        "userData": user_data,
-        "messages": messages,
-        "checkpoints": checkpoints,
-        "checkpointFile": checkpoint_path.to_string_lossy(),
-    }))
-}
-
-#[tauri::command]
-async fn fetch_user_data(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_user_data_impl(&app))
-        .await
-        .map_err(|error| format!("User data task failed: {error}"))?
-}
-
-#[tauri::command]
-async fn leaderboard_status(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || leaderboard_status_value(&app))
-        .await
-        .map_err(|error| format!("Leaderboard status task failed: {error}"))?
-}
-
-#[tauri::command]
-async fn leaderboard_submit(app: AppHandle) -> Result<Value, String> {
-    post_leaderboard_snapshot(&app).await
-}
-
-#[tauri::command]
-async fn leaderboard_list() -> Result<Value, String> {
-    fetch_leaderboard_rows().await
-}
-
 #[tauri::command]
 fn region_status(app: AppHandle) -> Result<Value, String> {
     region_status_value(&app)
@@ -5267,11 +3742,6 @@ fn select_region(app: AppHandle, region: String) -> Result<Value, String> {
         "message": message,
         "applyResult": apply_result,
     }))
-}
-
-#[tauri::command]
-async fn get_job(app: AppHandle, job_id: String) -> Result<Value, String> {
-    run_backend(&app, "job", vec!["--job-id".to_string(), job_id]).await
 }
 
 #[tauri::command]
@@ -5719,7 +4189,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(WindowOwnerProcesses::default())
         .manage(ReplayRecordingControl::default())
@@ -5746,8 +4215,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            backend_status,
-            stage_game,
+            recorder_status,
+            list_recorder_versions,
+            recording_default_directory,
+            open_recording_output_directory,
             list_jobs,
             list_replays,
             upload_replay,
@@ -5761,13 +4232,8 @@ pub fn run() {
             save_map,
             create_map,
             delete_maps,
-            fetch_user_data,
-            leaderboard_status,
-            leaderboard_submit,
-            leaderboard_list,
             region_status,
             select_region,
-            get_job,
             capture_replay,
             capture_replay_path,
             release_job_artifacts,
@@ -5890,56 +4356,6 @@ mod tests {
     }
 
     #[test]
-    fn leaderboard_token_does_not_expose_raw_password() {
-        let token = leaderboard_token("Savvy", "hunter2");
-
-        assert_eq!(token.len(), 64);
-        assert!(!token.contains("hunter2"));
-        assert_eq!(token, leaderboard_token("savvy", "hunter2"));
-        assert_ne!(token, leaderboard_token("savvy", "different-password"));
-    }
-
-    #[test]
-    fn leaderboard_public_stats_are_minimal_and_sanitized() {
-        let mut fields = BTreeMap::new();
-        fields.insert("score".to_string(), json!(1510));
-        fields.insert("profile.game_count".to_string(), json!(12));
-        fields.insert("number_of_wins".to_string(), json!(7));
-        fields.insert("password".to_string(), json!("secret"));
-        fields.insert("session.token".to_string(), json!("token-value"));
-        let checkpoint = UserDataCheckpoint {
-            fetched_at: 123,
-            username: Some("Savvy".to_string()),
-            source: "game-json".to_string(),
-            fields,
-        };
-
-        let stats =
-            leaderboard_public_stats_from_checkpoint(&checkpoint, None, Some("NA".to_string()))
-                .unwrap();
-        let serialized = serde_json::to_string(&stats).unwrap();
-
-        assert_eq!(stats.normalized_username, "savvy");
-        assert_eq!(stats.score, 1510);
-        assert_eq!(stats.games, Some(12));
-        assert_eq!(stats.wins, Some(7));
-        assert_eq!(stats.losses, Some(5));
-        assert!(!serialized.contains("secret"));
-        assert!(!serialized.contains("token-value"));
-        assert!(!serialized.contains("password"));
-        assert!(!serialized.contains("session"));
-    }
-
-    #[test]
-    fn leaderboard_status_reports_missing_password_as_view_only() {
-        let source = include_str!("lib.rs");
-
-        assert!(source.contains("War of Dots config login password is missing."));
-        assert!(source.contains("\"hasPassword\""));
-        assert!(source.contains("\"canSubmit\""));
-    }
-
-    #[test]
     fn map_filename_validation_stays_inside_map_editor() {
         assert_eq!(
             safe_map_file_name("generated_map1.txt").unwrap(),
@@ -6009,6 +4425,7 @@ mod tests {
             summary: ReplaySummary {
                 file_name: "match.rep".to_string(),
                 file_path: path.to_string_lossy().to_string(),
+                version: Some("1.2.18.3".to_string()),
                 players: Vec::new(),
                 draw: false,
                 length: "0:00".to_string(),
@@ -6035,6 +4452,15 @@ mod tests {
 
         assert!(replay_index_entry_matches(&entry, &candidate));
 
+        let mut missing_version = entry.clone();
+        missing_version
+            .parsed
+            .as_mut()
+            .unwrap()
+            .summary
+            .version = None;
+        assert!(!replay_index_entry_matches(&missing_version, &candidate));
+
         let mut changed = candidate.clone();
         changed.size += 1;
         assert!(!replay_index_entry_matches(&entry, &changed));
@@ -6046,6 +4472,34 @@ mod tests {
         let mut changed = candidate;
         changed.original_path = PathBuf::from(r"C:\replays\other.rep");
         assert!(!replay_index_entry_matches(&entry, &changed));
+    }
+
+    #[test]
+    fn replay_index_invalidates_entries_from_an_older_schema() {
+        let root = env::temp_dir().join(format!(
+            "more-of-dots-replay-index-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("replay-index.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version": REPLAY_INDEX_VERSION - 1,
+                "entries": {"stale": {"fileName": "stale.rep"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = load_replay_index(&path);
+
+        assert_eq!(store.version, REPLAY_INDEX_VERSION);
+        assert!(store.entries.is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

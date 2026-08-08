@@ -31,15 +31,14 @@ def test_sidecar_health_command_runs_without_http_server(tmp_path: Path) -> None
     assert "runner" in payload
 
 
-def test_stage_game_command_uses_cross_process_mutex() -> None:
+def test_desktop_commands_do_not_stage_the_users_live_game() -> None:
     source = Path(__file__).resolve().parents[1] / "wod_replay_server" / "desktop_cli.py"
     content = source.read_text(encoding="utf-8")
 
-    assert 'STAGE_GAME_MUTEX_NAME = "Global\\\\MoreOfDotsStageGame"' in content
-    assert "def _stage_game_mutex" in content
-    assert "kernel32.WaitForSingleObject" in content
-    assert "with _stage_game_mutex():" in content
-    assert "stage_game(ctx.settings.steam_game_dir, ctx.settings.staged_game_dir)" in content
+    assert "def command_stage_game" not in content
+    assert 'args.desktop_command == "stage-game"' not in content
+    assert "metadata.get(\"target_game_version\") or metadata.get(\"version\")" in content
+    assert "document.recording_bytes" in content
 
 
 def test_health_skips_runtime_cleanup(monkeypatch, tmp_path: Path) -> None:
@@ -67,3 +66,20 @@ def test_list_jobs_skips_runtime_cleanup(monkeypatch, tmp_path: Path) -> None:
     payload = desktop_cli.command_list_jobs(tmp_path, 20)
 
     assert [job["job_id"] for job in payload["jobs"]] == [paths.job_id]
+
+
+def test_recording_status_finishes_with_protocol_step(tmp_path: Path) -> None:
+    status_path = tmp_path / "recording.status.json"
+    status_path.write_text(
+        json.dumps({"status": "recording", "step": "recording", "current_seconds": 50, "total_seconds": 180}),
+        encoding="utf-8",
+    )
+
+    desktop_cli._finish_recording_status(status_path, step="completed", status="succeeded")
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["protocol_version"] == 1
+    assert payload["status"] == "succeeded"
+    assert payload["step"] == "completed"
+    assert payload["current_seconds"] == 50
+    assert payload["total_seconds"] == 180

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "app_id": 3902430,
+  "windows_depot_id": 3902431,
+  "versions": {
+    "1.3.4": {
+      "release_version": "1.3.4",
+      "build_id": "24510123",
+      "manifest_id": "3415773471114708203",
+      "game_exe_sha256": "3848360b7e5e56d96d20170ae8ea3f008c102ebf49d57cba81cfa8aa096b648e"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+More of Dots Recorder - Third-Party Notices
+============================================
+
+FFmpeg
+Copyright the FFmpeg developers and participating library authors.
+The exact configuration and upstream/source links for the bundled build are
+installed in FFMPEG-README.txt. The applicable license is installed in
+FFMPEG-LICENSE.txt.

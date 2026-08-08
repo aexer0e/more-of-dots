@@ -104,8 +104,8 @@ def load_matching_profile(profile_dir: Path, game_exe: Path) -> AddressProfile:
 
     message = (
         f"No validated address profile matches staged game hash {game_hash}. "
-        "Run scripts\\calibrate-memory.ps1 in the logged-in Windows session, then add a completed "
-        "profile under runtime\\address-profiles."
+        "Run scripts\\local-runner.ps1 -Calibrate in the logged-in Windows session, then add a "
+        "completed profile under runtime\\address-profiles."
     )
     if errors:
         message += f" Ignored profile errors: {'; '.join(errors)}"

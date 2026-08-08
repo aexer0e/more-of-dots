@@ -38,6 +38,8 @@ def test_runner_command_contains_local_capture_arguments(tmp_path: Path) -> None
     assert "automation-desktop" in command
     assert "-OwnerProcessId" in command
     assert "4321" in command
+    assert "-GameSourceDir" in command
+    assert str(staged_game_dir) in command
     assert "abc123" in command
     assert str(runtime_dir) in command
 
@@ -256,15 +258,36 @@ def test_main_thread_replay_start_advances_one_scene_per_update(monkeypatch) -> 
 def test_recording_progress_counts_all_terminal_replays() -> None:
     root = Path(__file__).resolve().parents[1]
     frontend = (root / "src" / "main.ts").read_text(encoding="utf-8")
+    styles = (root / "src" / "styles.css").read_text(encoding="utf-8")
     desktop = (root / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
 
     assert "progress.processed ?? progress.current" in frontend
-    assert "Math.floor((replayRecordingProcessed(progress) * 100) / total)" in frontend
     assert "function mergeReplayRecordingProgress" in frontend
     assert "Math.max(replayRecordingProcessed(previous), replayRecordingProcessed(next))" in frontend
+    assert "function updateRecordingQueueRow" in frontend
+    assert 'data-recording-action="clear"' in frontend
+    assert 'data-recording-action="open"' in frontend
     assert 'role="progressbar"' in frontend
-    assert 'aria-valuetext="${processed} of ${total} replays processed"' in frontend
+    assert 'setAttribute(track, "aria-valuenow", String(Math.round(percent)))' in frontend
+    # The queue is patched in place; rebuilding it made the panel flash.
+    assert "root.innerHTML = renderReplayRecordingQueue()" not in frontend
+    assert ".recording-queue-list.is-scrollable" in styles
+    assert "max-height: 310px" in styles
     assert "let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;" in desktop
     assert "let failed = failed_count.fetch_add(1, Ordering::Relaxed) + 1;" in desktop
     assert '"percent": processed.saturating_mul(100) / total.max(1)' in desktop
     assert "const MAX_ATTEMPTS: usize = 3;" in desktop
+
+
+def test_recording_supports_high_resolution_exports() -> None:
+    root = Path(__file__).resolve().parents[1]
+    frontend = (root / "src" / "main.ts").read_text(encoding="utf-8")
+    desktop = (root / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
+    recorder = (root / "wod_replay_server" / "desktop_cli.py").read_text(encoding="utf-8")
+    runner = (root / "scripts" / "local-runner.ps1").read_text(encoding="utf-8")
+
+    assert "[480, 720, 1080]" in frontend
+    assert "RECORDING_DEFAULT_RESOLUTION_INDEX = 2" in frontend
+    assert "[480, 720, 1080]" in desktop
+    assert "{480, 720, 1080}" in recorder
+    assert "480 { 854 } 1080 { 1920 } default { 1280 }" in runner

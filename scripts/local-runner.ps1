@@ -25,6 +25,7 @@ param(
     [int]$VideoHeight = 720,
     [int]$VideoMaxFrames = 90,
     [string]$ShareRoot = '',
+    [string]$GameSourceDir = '',
     [string]$GameWindowTitle = 'War of Dots',
     [ValidateSet('automation-desktop', 'current-desktop')]
     [string]$DesktopStrategy = 'automation-desktop',
@@ -39,6 +40,9 @@ if (-not $ShareRoot) {
     $ShareRoot = Join-Path (Resolve-Path (Join-Path $scriptRoot '..')).Path 'runtime'
 }
 $ShareRoot = (Resolve-Path -LiteralPath $ShareRoot).Path
+if ($GameSourceDir) {
+    $GameSourceDir = (Resolve-Path -LiteralPath $GameSourceDir).Path
+}
 
 Add-Type -Namespace Win32 -Name Native -MemberDefinition @'
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -244,7 +248,9 @@ function Wait-ReplayStartupLock(
 ) {
     if ($RunnerStatusPath) {
         Write-JsonFile -Path $RunnerStatusPath -Data ([ordered]@{
+            protocol_version = 1
             status = 'waiting-for-startup-slot'
+            step = 'waiting-for-game-slot'
             frame_count = 0
         })
     }
@@ -270,6 +276,9 @@ function Wait-ReplayStartupLock(
 }
 
 function Get-SharedGameDir {
+    if ($GameSourceDir) {
+        return $GameSourceDir
+    }
     Join-Path $ShareRoot 'staged-game'
 }
 
@@ -1722,8 +1731,8 @@ try:
 except Exception:
     VIDEO_FPS = 30
 try:
-    VIDEO_WIDTH = max(320, min(3840, int(os.environ.get('WOD_VIDEO_WIDTH', '1280'))))
-    VIDEO_HEIGHT = max(180, min(2160, int(os.environ.get('WOD_VIDEO_HEIGHT', '720'))))
+    VIDEO_WIDTH = max(320, min(1920, int(os.environ.get('WOD_VIDEO_WIDTH', '1280'))))
+    VIDEO_HEIGHT = max(180, min(1080, int(os.environ.get('WOD_VIDEO_HEIGHT', '720'))))
 except Exception:
     VIDEO_WIDTH, VIDEO_HEIGHT = 1280, 720
 try:
@@ -2139,6 +2148,20 @@ def write_video_status(payload):
     if not VIDEO_STATUS_PATH:
         return False
     value = dict(payload or {})
+    value.setdefault('protocol_version', 1)
+    if not value.get('step'):
+        value['step'] = {
+            'waiting-for-startup-slot': 'waiting-for-game-slot',
+            'launching-game': 'opening-game',
+            'waiting-for-replay-start': 'starting-replay',
+            'starting-replay': 'starting-replay',
+            'replay-started': 'starting-replay',
+            'recording': 'recording',
+            'finishing': 'exporting',
+            'completed': 'exporting',
+            'cancelled': 'cancelled',
+            'failed': 'failed',
+        }.get(str(value.get('status', '')).lower(), 'preparing')
     value.setdefault('path', VIDEO_OUTPUT_PATH)
     value['updated_at_ms'] = int(time.time() * 1000)
     return write_json_atomic(VIDEO_STATUS_PATH, value)
@@ -4835,6 +4858,7 @@ def install_main_thread_replay_start_hook(candidates, replay, artifact):
     }
     write_video_status({
         'status': 'waiting-for-replay-start',
+        'step': 'starting-replay',
         'phase': 'waiting-for-main-thread',
         'frame_count': 0,
     })
@@ -4862,6 +4886,7 @@ def install_main_thread_replay_start_hook(candidates, replay, artifact):
         persist_start_state()
         write_video_status({
             'status': 'failed',
+            'step': 'failed',
             'phase': phase,
             'frame_count': 0,
             'error': repr(exc),
@@ -4883,6 +4908,7 @@ def install_main_thread_replay_start_hook(candidates, replay, artifact):
                 persist_start_state()
                 write_video_status({
                     'status': 'starting-replay',
+                    'step': 'starting-replay',
                     'phase': 'home-to-play',
                     'frame_count': 0,
                 })
@@ -4906,6 +4932,7 @@ def install_main_thread_replay_start_hook(candidates, replay, artifact):
                 persist_start_state()
                 write_video_status({
                     'status': 'starting-replay',
+                    'step': 'starting-replay',
                     'phase': 'play-to-game',
                     'frame_count': 0,
                 })
@@ -4917,6 +4944,7 @@ def install_main_thread_replay_start_hook(candidates, replay, artifact):
             persist_start_state()
             write_video_status({
                 'status': 'replay-started',
+                'step': 'starting-replay',
                 'phase': 'waiting-for-first-frame',
                 'frame_count': 0,
             })
@@ -5648,6 +5676,7 @@ def install_main_thread_frame_hook():
                     raise RuntimeError('ffmpeg exited with code %s while cancelling: %s' % (return_code, error_text))
                 write_frame_status({
                     'status': 'cancelled',
+                    'step': 'cancelled',
                     'path': capture_path,
                     'frame_count': state['frame_count'],
                     'speed_after': state.get('speed_after'),
@@ -5687,6 +5716,7 @@ def install_main_thread_frame_hook():
                     state['complete'] = True
                     write_frame_status({
                         'status': 'completed',
+                        'step': 'exporting',
                         'path': capture_path,
                         'bytes': os.path.getsize(capture_path),
                         'source_size': [width, height],
@@ -5695,6 +5725,9 @@ def install_main_thread_frame_hook():
                         'bitrate_kbps': VIDEO_BITRATE_KBPS,
                         'tick': tick,
                         'end_tick': requested_end_tick,
+                        'current_seconds': round(max(0.0, float(tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
+                        'total_seconds': round(max(0.0, float(requested_end_tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
+                        'progress_percent': 100.0,
                         'frame_count': state['frame_count'],
                         'speed_before': state.get('speed_before'),
                         'speed_after': state.get('speed_after'),
@@ -5706,12 +5739,16 @@ def install_main_thread_frame_hook():
                 elif state['frame_count'] == 1 or state['frame_count'] % VIDEO_FPS == 0:
                     write_frame_status({
                         'status': 'finishing' if state['replay_end_reached'] else 'recording',
+                        'step': 'exporting' if state['replay_end_reached'] else 'recording',
                         'path': capture_path,
                         'output_size': [VIDEO_WIDTH, VIDEO_HEIGHT],
                         'fps': VIDEO_FPS,
                         'bitrate_kbps': VIDEO_BITRATE_KBPS,
                         'tick': tick,
                         'end_tick': requested_end_tick,
+                        'current_seconds': round(max(0.0, float(tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
+                        'total_seconds': round(max(0.0, float(requested_end_tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
+                        'progress_percent': round(max(0.0, min(100.0, (float(tick or 0) / max(1.0, float(requested_end_tick or 0))) * 100.0)), 2),
                         'frame_count': state['frame_count'],
                         'speed_after': state.get('speed_after'),
                         'speed_method': state.get('speed_method'),
@@ -5743,6 +5780,7 @@ def install_main_thread_frame_hook():
             state['complete'] = True
             write_frame_status({
                 'status': 'failed',
+                'step': 'failed',
                 'path': capture_path,
                 'frame_count': state['frame_count'],
                 'speed_before': state.get('speed_before'),
@@ -7211,7 +7249,9 @@ function Invoke-VideoCapturePoc([string]$Id) {
         $startupLockOwned = Wait-ReplayStartupLock -Mutex $startupMutex -CancelMarker $CancelPath -RunnerStatusPath $videoStatusPath -TimeoutSeconds ([Math]::Max(60, $MaxSeconds))
         if (-not $startupLockOwned) {
             Write-JsonFile -Path $videoStatusPath -Data ([ordered]@{
+                protocol_version = 1
                 status = 'cancelled'
+                step = 'cancelled'
                 frame_count = 0
                 phase = 'waiting-for-startup-slot'
             })
@@ -7224,7 +7264,9 @@ function Invoke-VideoCapturePoc([string]$Id) {
             return
         }
         Write-JsonFile -Path $videoStatusPath -Data ([ordered]@{
+            protocol_version = 1
             status = 'launching-game'
+            step = 'opening-game'
             frame_count = 0
             phase = 'startup'
         })
@@ -7255,7 +7297,7 @@ function Invoke-VideoCapturePoc([string]$Id) {
         $videoStatus = $null
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($CancelPath -and (Test-Path -LiteralPath $CancelPath)) {
-                $videoStatus = [pscustomobject]@{ status = 'cancelled'; frame_count = 0; phase = 'runner-watchdog' }
+                $videoStatus = [pscustomobject]@{ protocol_version = 1; status = 'cancelled'; step = 'cancelled'; frame_count = 0; phase = 'runner-watchdog' }
                 Write-JsonFile -Path $videoStatusPath -Data $videoStatus
                 break
             }
@@ -7282,7 +7324,9 @@ function Invoke-VideoCapturePoc([string]$Id) {
             }
             if (-not $firstFrameSeen -and [DateTime]::UtcNow -ge $startupDeadline) {
                 $videoStatus = [pscustomobject]@{
+                    protocol_version = 1
                     status = 'failed'
+                    step = 'failed'
                     frame_count = 0
                     phase = 'startup-watchdog'
                     error = 'Replay startup produced no first video frame within 30 seconds.'
@@ -7292,7 +7336,9 @@ function Invoke-VideoCapturePoc([string]$Id) {
             }
             if ($firstFrameSeen -and ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge 45) {
                 $videoStatus = [pscustomobject]@{
+                    protocol_version = 1
                     status = 'failed'
+                    step = 'failed'
                     frame_count = if ($videoStatus -and $null -ne $videoStatus.frame_count) { [int]$videoStatus.frame_count } else { 0 }
                     phase = 'progress-watchdog'
                     error = 'Replay recording made no frame or status progress for 45 seconds.'

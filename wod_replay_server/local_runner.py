@@ -121,13 +121,19 @@ def _stats_summary_from_path(path: Path) -> dict[str, Any] | None:
 
 
 class LocalSessionRunner:
-    def __init__(self, settings: AppSettings, owner_pid: int | None = None):
+    def __init__(
+        self,
+        settings: AppSettings,
+        owner_pid: int | None = None,
+        game_source_dir: Path | None = None,
+    ):
         self.settings = settings
         self.owner_pid = owner_pid if owner_pid and owner_pid > 0 else None
+        self.game_source_dir = game_source_dir.expanduser().resolve() if game_source_dir else settings.staged_game_dir
 
     @property
     def game_exe(self) -> Path:
-        return self.settings.staged_game_dir / "game.exe"
+        return self.game_source_dir / "game.exe"
 
     def cleanup_game_processes(self, job_id: str | None) -> dict[str, Any]:
         if not job_id:
@@ -189,6 +195,8 @@ class LocalSessionRunner:
             str(script),
             "-ShareRoot",
             str(self.settings.runtime_dir),
+            "-GameSourceDir",
+            str(self.game_source_dir),
             "-GameWindowTitle",
             self.settings.game_window_title,
             "-DesktopStrategy",
@@ -419,12 +427,6 @@ class LocalSessionRunner:
             "runner_result": parsed,
             "process_cleanup": cleanup_events,
         }
-
-    def probe_runtime(self, job_id: str | None = None, *, timeout_seconds: int = 90) -> dict[str, Any]:
-        runner_args = ["-PythonProbe"]
-        if job_id:
-            runner_args.extend(["-JobId", job_id])
-        return self._run_probe_command(runner_args, timeout_seconds=timeout_seconds)
 
     def probe_replay_state(self, job_id: str, *, timeout_seconds: int = 120) -> dict[str, Any]:
         return self._run_probe_command(["-ProbeReplayState", "-JobId", job_id], timeout_seconds=timeout_seconds)

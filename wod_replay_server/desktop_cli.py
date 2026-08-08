@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-import ctypes
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 from threading import Lock
@@ -16,51 +15,51 @@ from .address_profiles import AddressProfile, MissingAddressProfile, load_matchi
 from .config import get_settings
 from .local_runner import LocalSessionRunner
 from .replay import ReplayValidationError, validate_replay
-from .stage_game import stage_game
 from .storage import JobPaths, JobStore
 from .synthesis import MAX_INLINE_STATS_BYTES, synthesize_replay
+from .version_vault import VersionVault, VersionVaultError
 
 
 AUTHORITATIVE_CAPTURE_SOURCES = {"game-live-python", "memory", "local-session-memory-capture"}
 ORPHAN_UPLOAD_MAX_AGE_SECONDS = 60 * 60
-STAGE_GAME_MUTEX_NAME = "Global\\MoreOfDotsStageGame"
-
-
-@contextmanager
-def _stage_game_mutex(timeout_seconds: int = 120):
-    if os.name != "nt":
-        yield
-        return
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
-    kernel32.ReleaseMutex.restype = ctypes.c_bool
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_bool
-
-    handle = kernel32.CreateMutexW(None, False, STAGE_GAME_MUTEX_NAME)
-    if not handle:
-        raise OSError(ctypes.get_last_error(), "CreateMutexW failed for staged game lock")
-
-    acquired = False
-    try:
-        wait = kernel32.WaitForSingleObject(handle, max(1, timeout_seconds) * 1000)
-        if wait not in (0, 0x80):
-            raise TimeoutError(f"Timed out waiting for staged game lock after {timeout_seconds}s.")
-        acquired = True
-        yield
-    finally:
-        if acquired:
-            kernel32.ReleaseMutex(handle)
-        kernel32.CloseHandle(handle)
 
 
 def _json_default(value: Any) -> str:
     return str(value)
+
+
+def _finish_recording_status(path: Path, *, step: str, status: str, error: str | None = None) -> None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    value.update(
+        {
+            "protocol_version": 1,
+            "status": status,
+            "step": step,
+            "updated_at_ms": int(time.time() * 1000),
+        }
+    )
+    if error:
+        value["error"] = error
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, default=_json_default), encoding="utf-8")
+        for attempt in range(8):
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    return
+                time.sleep(0.025 * (attempt + 1))
+    except OSError:
+        return
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _load_backend(runtime_dir: Path | None, owner_pid: int | None = None):
@@ -74,9 +73,21 @@ def _load_backend(runtime_dir: Path | None, owner_pid: int | None = None):
         settings=settings,
         store=JobStore(settings.jobs_dir),
         replay_runner=LocalSessionRunner(settings, owner_pid=owner_pid),
+        owner_pid=owner_pid,
+        version_vault=VersionVault(),
         capture_lock=Lock(),
-        stage_lock=Lock(),
     )
+
+
+def _use_replay_game_version(ctx, metadata: dict[str, Any]) -> dict[str, Any]:
+    selected = ctx.version_vault.resolve(metadata.get("target_game_version") or metadata.get("version"))
+    game_dir = Path(selected["path"])
+    ctx.replay_runner = LocalSessionRunner(
+        ctx.settings,
+        owner_pid=ctx.owner_pid,
+        game_source_dir=game_dir,
+    )
+    return selected
 
 
 def _job_response(job: dict[str, Any]) -> dict[str, Any]:
@@ -89,33 +100,6 @@ def _job_response(job: dict[str, Any]) -> dict[str, Any]:
         "address_profile": job.get("address_profile"),
         "error": job.get("error"),
     }
-
-
-def _debug_tool_inventory(settings) -> dict[str, Any]:
-    candidates = {
-        "cheat_engine": [
-            r"C:\Program Files\Cheat Engine 7.5\Cheat Engine.exe",
-            r"C:\Program Files (x86)\Cheat Engine 7.5\Cheat Engine.exe",
-        ],
-        "ghidra": [
-            r"C:\ProgramData\chocolatey\lib\ghidra\tools\ghidra_12.1_PUBLIC\ghidraRun.bat",
-        ],
-        "x64dbg": [
-            str(settings.project_root / "runtime" / "debug-tools" / "x64dbg" / "release" / "x64" / "x64dbg.exe"),
-            str(settings.runtime_dir / "debug-tools" / "x64dbg" / "release" / "x64" / "x64dbg.exe"),
-        ],
-        "windbg": [
-            r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\windbg.exe",
-        ],
-        "cdb": [
-            r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe",
-        ],
-    }
-    tools: dict[str, Any] = {}
-    for name, paths in candidates.items():
-        found = next((path for path in paths if Path(path).exists()), None)
-        tools[name] = {"available": found is not None, "path": found}
-    return tools
 
 
 def _write_capture_request(ctx, paths: JobPaths, metadata: dict[str, Any], profile: AddressProfile | None) -> None:
@@ -469,16 +453,34 @@ def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> di
         "runtime_jobs_max_bytes": settings.runtime_jobs_max_bytes,
         "runtime_cleanup": _skipped_runtime_cleanup("startup-health"),
         "runner": runner,
-        "debug_tools": _debug_tool_inventory(settings),
+        "recorder": {
+            "protocol_version": 1,
+            "home": str(ctx.version_vault.home),
+            "versions": ctx.version_vault.list_versions(),
+            "supported_versions": ctx.version_vault.catalog.public_summary(),
+        },
     }
 
 
-def command_stage_game(runtime_dir: Path | None, owner_pid: int | None = None) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir, owner_pid)
-    with ctx.stage_lock:
-        with _stage_game_mutex():
-            result = stage_game(ctx.settings.steam_game_dir, ctx.settings.staged_game_dir)
-    return {"status": "staged", **result}
+def command_recorder_capabilities() -> dict[str, Any]:
+    vault = VersionVault()
+    return {
+        "name": "More of Dots Recorder",
+        "protocol_versions": [1],
+        "commands": [
+            "record-replay",
+            "capture-file",
+            "list-game-versions",
+        ],
+        "app_id": 3902430,
+        "home": str(vault.home),
+        "supported_versions": vault.catalog.public_summary(),
+    }
+
+
+def command_list_game_versions() -> dict[str, Any]:
+    vault = VersionVault()
+    return {"home": str(vault.home), "versions": vault.list_versions()}
 
 
 def command_list_jobs(runtime_dir: Path | None, limit: int, owner_pid: int | None = None) -> dict[str, Any]:
@@ -518,9 +520,14 @@ def command_capture_file(
         job = ctx.store.update_job(paths, status="failed", error=str(exc))
         return _job_response(job)
 
-    paths.input_replay_path.write_bytes(raw)
-    ctx.store.append_log(paths, "Replay gzip and JSON structure validated.")
-    ctx.store.update_job(paths, metadata=document.metadata)
+    paths.input_replay_path.write_bytes(document.recording_bytes)
+    ctx.store.append_log(
+        paths,
+        f"Replay schema validated and normalized for game {document.metadata['target_game_version']}.",
+    )
+    selected_version = _use_replay_game_version(ctx, document.metadata)
+    ctx.store.append_log(paths, f"Using immutable game version {selected_version['game_version']} from the recorder vault.")
+    ctx.store.update_job(paths, metadata=document.metadata, game_version=selected_version)
 
     _run_capture_job(ctx, paths.job_id)
     _cleanup_runtime(ctx, preserve_job_ids={paths.job_id})
@@ -550,20 +557,20 @@ def _create_capture_job(ctx, input_path: Path, filename: str | None):
         return paths, None
 
     document = validate_replay(raw, max_json_bytes=ctx.settings.max_replay_json_bytes)
-    paths.input_replay_path.write_bytes(raw)
-    ctx.store.append_log(paths, "Replay gzip and JSON structure validated for probe.")
-    ctx.store.update_job(paths, status="probe_queued", metadata=document.metadata)
+    selected_version = _use_replay_game_version(ctx, document.metadata)
+    paths.input_replay_path.write_bytes(document.recording_bytes)
+    ctx.store.append_log(
+        paths,
+        f"Replay schema validated and normalized; using immutable game version {selected_version['game_version']} from the recorder vault.",
+    )
+    ctx.store.update_job(
+        paths,
+        status="probe_queued",
+        metadata=document.metadata,
+        game_version=selected_version,
+    )
     _write_capture_request(ctx, paths, document.metadata, None)
     return paths, document
-
-
-def command_probe_runtime(
-    runtime_dir: Path | None,
-    job_id: str | None = None,
-    owner_pid: int | None = None,
-) -> dict[str, Any]:
-    ctx = _load_backend(runtime_dir, owner_pid)
-    return ctx.replay_runner.probe_runtime(job_id)
 
 
 def command_probe_file(
@@ -606,7 +613,7 @@ def command_record_replay(
     input_path: Path,
     filename: str | None,
     output_path: Path,
-    ffmpeg_path: Path,
+    ffmpeg_path: Path | None,
     cancel_path: Path,
     status_path: Path,
     playback_speed: int,
@@ -620,7 +627,7 @@ def command_record_replay(
         return _job_response(ctx.store.read_job(paths))
 
     output_path = output_path.expanduser().resolve()
-    ffmpeg_path = ffmpeg_path.expanduser().resolve()
+    ffmpeg_path = _resolve_ffmpeg_path(ffmpeg_path)
     cancel_path = cancel_path.expanduser().resolve()
     status_path = status_path.expanduser().resolve()
     if playback_speed not in {1, 2, 4, 6, 10}:
@@ -649,9 +656,33 @@ def command_record_replay(
     )
     ctx.store.append_log(paths, f"record-replay result: {result}")
     final_status = "cancelled" if result.get("status") == "cancelled" else result.get("status", "failed")
+    terminal_step = "completed" if final_status == "succeeded" else final_status
+    terminal_error = str(result.get("message") or result.get("stderr") or "").strip() or None
+    _finish_recording_status(status_path, step=terminal_step, status=final_status, error=terminal_error)
     ctx.store.update_job(paths, status=final_status, capture=result)
     _cleanup_runtime(ctx, preserve_job_ids={paths.job_id})
     return {"job_id": paths.job_id, "status": final_status, "result": result}
+
+
+def _resolve_ffmpeg_path(requested: Path | None) -> Path:
+    candidates: list[Path] = []
+    if requested:
+        candidates.append(requested.expanduser())
+    configured = os.environ.get("WOD_FFMPEG_PATH")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates.extend((executable_dir / "ffmpeg.exe", executable_dir / "bin" / "ffmpeg.exe"))
+    discovered = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
+    if discovered:
+        candidates.append(Path(discovered))
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        "FFmpeg was not found in the recorder package. Install or repair More of Dots Recorder."
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -677,10 +708,12 @@ def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        if args.desktop_command == "health":
+        if args.desktop_command == "recorder-capabilities":
+            payload = command_recorder_capabilities()
+        elif args.desktop_command == "list-game-versions":
+            payload = command_list_game_versions()
+        elif args.desktop_command == "health":
             payload = command_health(args.runtime_dir, args.owner_pid)
-        elif args.desktop_command == "stage-game":
-            payload = command_stage_game(args.runtime_dir, args.owner_pid)
         elif args.desktop_command == "list-jobs":
             payload = command_list_jobs(args.runtime_dir, args.limit, args.owner_pid)
         elif args.desktop_command == "job":
@@ -695,15 +728,13 @@ def run(argv: list[str] | None = None) -> int:
             if args.input is None:
                 raise ValueError("--input is required for capture-file.")
             payload = command_capture_file(args.runtime_dir, args.input, args.filename, args.owner_pid)
-        elif args.desktop_command == "probe-runtime":
-            payload = command_probe_runtime(args.runtime_dir, args.job_id, args.owner_pid)
         elif args.desktop_command in {"probe-replay-state", "sample-live-state", "capture-live-replay"}:
             if args.input is None:
                 raise ValueError(f"--input is required for {args.desktop_command}.")
             payload = command_probe_file(args.runtime_dir, args.input, args.filename, args.desktop_command, args.owner_pid)
         elif args.desktop_command == "record-replay":
-            if args.input is None or args.output is None or args.ffmpeg is None or args.cancel_path is None or args.status_path is None:
-                raise ValueError("--input, --output, --ffmpeg, --cancel-path, and --status-path are required for record-replay.")
+            if args.input is None or args.output is None or args.cancel_path is None or args.status_path is None:
+                raise ValueError("--input, --output, --cancel-path, and --status-path are required for record-replay.")
             payload = command_record_replay(
                 args.runtime_dir,
                 args.input,

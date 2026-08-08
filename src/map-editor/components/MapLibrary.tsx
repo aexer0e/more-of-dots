@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { CANVAS_HEIGHT, CANVAS_WIDTH, CAPITAL_SIZE, CITY_SIZE, SPRITE_SIZE, teamColorForIndex } from '../lib/constants';
-import { modeLabel, formatUpdatedAt, teamsForMap } from '../lib/mapCodec';
+import { modeLabel, formatUpdatedAt } from '../lib/mapCodec';
 import type { StoredMap } from '../lib/types';
 import { spriteAssets, uiAssets } from '../lib/assets';
 
@@ -43,7 +43,6 @@ function thumbnailIconSize(map: StoredMap, size: number) {
 
 function MapThumbnail({ map }: { map: StoredMap }) {
   const terrainSource = map.data.map_surface ? `data:image/png;base64,${map.data.map_surface}` : uiAssets.logo;
-  const teamCount = teamsForMap(map);
   const capitalIndexes = new Set(map.data.capitals);
 
   return (

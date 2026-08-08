@@ -18,6 +18,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["wod_replay_server*"]
 
+[tool.setuptools.package-data]
+wod_replay_server = ["supported_versions.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

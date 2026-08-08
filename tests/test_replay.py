@@ -35,6 +35,9 @@ def test_validate_valid_replay_extracts_metadata() -> None:
     assert replay.metadata["tick_count"] == 2
     assert replay.metadata["first_tick"] == 180
     assert replay.metadata["max_tick"] == 240
+    assert replay.metadata["source_version"] == "1.2.18.3"
+    assert replay.metadata["target_game_version"] == "1.3.4"
+    assert replay.metadata["move_order_count"] == 2
 
 
 def test_validate_custom_map_marks_custom_present() -> None:
@@ -102,9 +105,70 @@ def test_rejects_malformed_json() -> None:
 
 def test_rejects_missing_metadata() -> None:
     payload = valid_payload()
-    del payload["result"]
+    del payload["player_usernames"]
 
     with pytest.raises(ReplayValidationError, match="missing required keys"):
+        validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+
+
+def test_missing_or_unknown_version_uses_schema_fallback() -> None:
+    for source_version in (None, "9.9.9"):
+        payload = valid_payload()
+        payload["version"] = source_version
+
+        replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+        recording_payload = json.loads(gzip.decompress(replay.recording_bytes))
+
+        assert replay.metadata["source_version"] == source_version
+        assert replay.metadata["version_inference"] == "compatible-replay-schema"
+        assert replay.metadata["target_game_version"] == "1.3.4"
+        assert recording_payload["version"] == "1.3.4"
+
+
+def test_1_2_23_conversion_preserves_orders_and_modern_names() -> None:
+    payload = valid_payload()
+    payload["version"] = "1.2.23"
+    payload["player_usernames"] = [[{"username": "one", "title": "Friend"}], [{"username": "two", "title": None}]]
+    payload["180"] = {
+        "12": [[100, 200], [120, 220]],
+        "production0": {"color": 0, "rate": 0.7, "ratio": 1},
+        "message0": [7, [], -1],
+    }
+
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+    recording_payload = json.loads(gzip.decompress(replay.recording_bytes))
+
+    assert recording_payload["version"] == "1.3.4"
+    assert recording_payload["player_usernames"] == payload["player_usernames"]
+    assert recording_payload["180"] == payload["180"]
+    assert replay.metadata["move_order_count"] == 2
+    assert replay.metadata["waypoint_count"] == 3
+
+
+def test_legacy_player_labels_are_normalized_for_1_3_4() -> None:
+    payload = valid_payload()
+    payload["version"] = None
+    payload["player_usernames"] = [["one [Friend]"], ["two"]]
+
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+    recording_payload = json.loads(gzip.decompress(replay.recording_bytes))
+
+    assert recording_payload["player_usernames"] == [
+        [{"username": "one", "title": "Friend"}],
+        [{"username": "two", "title": None}],
+    ]
+    assert replay.metadata["player_schema"] == "legacy-labelled-players"
+
+
+def test_empty_move_order_set_is_derived_but_malformed_order_fails() -> None:
+    payload = valid_payload()
+    payload.pop("180")
+    payload.pop("240")
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+    assert replay.metadata["move_order_count"] == 0
+
+    payload["180"] = {"12": "not-a-path"}
+    with pytest.raises(ReplayValidationError, match="move order"):
         validate_replay(gzipped(payload), max_json_bytes=1_000_000)
 
 

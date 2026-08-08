@@ -7,9 +7,9 @@ import shutil
 from typing import Iterable
 
 
-EXCLUDED_DIR_NAMES = {"replays", "__pycache__"}
-EXCLUDED_FILE_NAMES = {"config.txt", "error_log.txt", "out.txt", "err.txt"}
-EXCLUDED_SUFFIXES = {".log", ".bak", ".rep", ".pyc", ".pyo"}
+EXCLUDED_DIR_NAMES = {"replays", "dlcs", "map_editor", "__pycache__", ".depotdownloader"}
+EXCLUDED_FILE_NAMES = {"config.txt", "error_log.txt", "out.txt", "err.txt", "strings.txt", "vanilla_maps.zip"}
+EXCLUDED_SUFFIXES = {".log", ".bak", ".cmd", ".rep", ".pyc", ".pyo"}
 
 
 def should_copy_path(path: Path, source_root: Path) -> bool:

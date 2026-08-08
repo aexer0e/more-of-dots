@@ -177,7 +177,7 @@ function fitImageCover(
   context.drawImage(image, (width - dw) / 2, (height - dh) / 2, dw, dh);
 }
 
-function teamAccent(index: number, teamCount: number) {
+function teamAccent(index: number) {
   return TEAM_ACCENTS[teamColorForIndex(index)];
 }
 
@@ -259,16 +259,6 @@ function formatTeamMapSummary(summary: TeamMapSummary) {
   return parts.join(', ');
 }
 
-function createDraftCounts(map: StoredMap) {
-  return {
-    infantry: map.data.infantry.reduce((c, t) => c + t.length, 0),
-    tanks: map.data.tanks.reduce((c, t) => c + t.length, 0),
-    cities: map.data.cities.length,
-    capitals: map.data.capitals.length,
-    bridges: map.data.bridges.length,
-  };
-}
-
 function clampZoom(value: number) {
   return Math.max(0.35, Math.min(5, Number(value.toFixed(2))));
 }
@@ -287,10 +277,6 @@ function scaledIconSize(size: number) {
 
 function scaledHitRadius() {
   return scaledIconSize(HIT_RADIUS);
-}
-
-function isBrushSizedTool(toolId: ToolId) {
-  return toolId === 'terrainBrush' || toolId === 'terrainLine' || toolId === 'tank' || toolId === 'capital';
 }
 
 function isEntityBrushTool(toolId: ToolId): toolId is 'infantry' | 'tank' | 'city' | 'capital' {
@@ -555,7 +541,6 @@ function hoverTargetKey(target: HoverTarget | null) {
 
 interface ToolIconProps {
   selectedTeam: number;
-  teamCount: number;
   toolId: ToolId;
 }
 
@@ -563,7 +548,7 @@ function ControlGlyph({ icon: Icon }: { icon: LucideIcon }) {
   return <Icon aria-hidden="true" className="help-row-icon" strokeWidth={2} />;
 }
 
-function ToolIcon({ selectedTeam, teamCount, toolId }: ToolIconProps) {
+function ToolIcon({ selectedTeam, toolId }: ToolIconProps) {
   const teamColor = teamColorForIndex(selectedTeam);
 
   if (toolId === 'infantry' || toolId === 'tank') {
@@ -776,7 +761,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   const leavePromptResolverRef = useRef<((result: LeaveResult) => void) | null>(null);
   const mountedRef = useRef(true);
 
-  const counts = useMemo(() => createDraftCounts(draft), [draft]);
   const teamCount = teamsForMap(draft);
   const selectionBounds = useMemo(() => selectionBoundsFromRects(selectionRects), [selectionRects]);
   const canvasStackStyle = useMemo(
@@ -1169,12 +1153,12 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     draftRef.current.data.infantry.forEach((team, ti) => {
       const teamColor = teamColorForIndex(ti);
       const img = getCachedImage(spriteAssets[teamColor].infantry);
-      for (const [x, y] of team) drawSprite(ctx, img, x, y, scaledIconSize(SPRITE_SIZE), teamAccent(ti, teamCount));
+      for (const [x, y] of team) drawSprite(ctx, img, x, y, scaledIconSize(SPRITE_SIZE), teamAccent(ti));
     });
     draftRef.current.data.tanks.forEach((team, ti) => {
       const teamColor = teamColorForIndex(ti);
       const img = getCachedImage(spriteAssets[teamColor].tank);
-      for (const [x, y] of team) drawSprite(ctx, img, x, y, scaledIconSize(SPRITE_SIZE + 4), teamAccent(ti, teamCount));
+      for (const [x, y] of team) drawSprite(ctx, img, x, y, scaledIconSize(SPRITE_SIZE + 4), teamAccent(ti));
     });
 
     ctx.restore();
@@ -1327,7 +1311,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
       const color = entity.kind === 'city'
         ? (capitalSet.has(entity.cityIndex) ? '#f7ca5d' : '#8ad8ff')
-        : teamAccent(entity.teamIndex, teamCount);
+        : teamAccent(entity.teamIndex);
 
       ctx.save();
       ctx.globalAlpha = 0.18;
@@ -1473,7 +1457,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
         const size = tool === 'tank'
           ? scaledHitRadius() * 2
           : Math.max(scaledHitRadius() * 2, Math.round(brushSizeRef.current));
-        const color = tool === 'tank' ? teamAccent(selectedTeamRef.current, teamCount) : '#f7ca5d';
+        const color = tool === 'tank' ? teamAccent(selectedTeamRef.current) : '#f7ca5d';
         drawCircleOutline(ctx, hover, size, color);
       } else if (tool !== 'bridge' && tool !== 'select') {
         ctx.strokeStyle = 'rgba(255,255,255,0.6)';
@@ -1854,17 +1838,6 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     overlayDirtyRef.current = true;
     requestDraw();
     pushHistory();
-  }
-
-  function nearestCityIndex(x: number, y: number) {
-    let best = -1;
-    const hitRadius = scaledHitRadius();
-    let bestD = hitRadius * hitRadius;
-    draftRef.current.data.cities.forEach(([cx, cy], i) => {
-      const d = (cx - x) ** 2 + (cy - y) ** 2;
-      if (d < bestD) { best = i; bestD = d; }
-    });
-    return best;
   }
 
   function conversionRadius() {
@@ -3087,7 +3060,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
                     onClick={() => activateTool(tool.id)}
                     title={tool.hint}
                   >
-                    <span className="glyph"><ToolIcon selectedTeam={selectedTeam} teamCount={teamCount} toolId={tool.id} /></span>
+                    <span className="glyph"><ToolIcon selectedTeam={selectedTeam} toolId={tool.id} /></span>
                     <span className="label">{tool.label}</span>
                   </button>
                 ))}
@@ -3138,7 +3111,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
                     onClick={() => activateTool(tool.id)}
                     title={tool.hint}
                   >
-                    <span className="glyph"><ToolIcon selectedTeam={selectedTeam} teamCount={teamCount} toolId={tool.id} /></span>
+                    <span className="glyph"><ToolIcon selectedTeam={selectedTeam} toolId={tool.id} /></span>
                     <span className="label">{tool.label}</span>
                   </button>
                 ))}
@@ -3168,7 +3141,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       <div className="editor-stage">
         <div className="stage-topbar">
           <div className="stage-tool-summary">
-            <span className="tool-chip-pill"><span className="tool-chip-icon"><ToolIcon selectedTeam={selectedTeam} teamCount={teamCount} toolId={selectedTool} /></span>{TOOL_LOOKUP[selectedTool].label}</span>
+            <span className="tool-chip-pill"><span className="tool-chip-icon"><ToolIcon selectedTeam={selectedTeam} toolId={selectedTool} /></span>{TOOL_LOOKUP[selectedTool].label}</span>
             <p className="stage-context">{stageContext}</p>
           </div>
           <div className="stage-topbar-actions">
@@ -3256,7 +3229,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
                   <p
                     key={`${teamColor}-${summary.teamIndex}`}
                     className="stage-map-live-summary-line"
-                    style={{ '--team-summary-accent': teamAccent(summary.teamIndex, teamCount) } as CSSProperties}
+                    style={{ '--team-summary-accent': teamAccent(summary.teamIndex) } as CSSProperties}
                     title={`${TEAM_LABELS[teamColor]}: ${line}`}
                   >
                     {line}

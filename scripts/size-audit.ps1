@@ -3,6 +3,7 @@ param()
 
 $ErrorActionPreference = 'Continue'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$Version = (Get-Content -LiteralPath (Join-Path $Root 'VERSION') -Raw).Trim()
 
 function New-SizeEntry([string]$Kind, [string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -26,10 +27,8 @@ function New-SizeEntry([string]$Kind, [string]$Path) {
 
 $entries = @()
 
-Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri\binaries') -Filter 'wod-replay-server-*.exe' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTimeUtc -Descending |
-    Select-Object -First 1 |
-    ForEach-Object { $entries += New-SizeEntry 'sidecar' $_.FullName }
+$entries += New-SizeEntry 'separate-recorder' (Join-Path $Root 'recorder-dist\more-of-dots-recorder\more-of-dots-recorder.exe')
+$entries += New-SizeEntry 'recorder-nsis-installer' (Join-Path $Root "recorder-dist\More.of.Dots.Recorder_${Version}_x64-setup.exe")
 
 $entries += New-SizeEntry 'tauri-exe' (Join-Path $Root 'src-tauri\target\release\more-of-dots.exe')
 

@@ -5,7 +5,7 @@
   "identifier": "local.more-of-dots",
   "build": {
     "beforeDevCommand": "npm run dev:web",
-    "beforeBuildCommand": "npm run build:web && npm run build:sidecar",
+    "beforeBuildCommand": "npm run build:web",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
@@ -51,11 +51,6 @@
     "active": true,
     "targets": ["nsis", "msi"],
     "icon": ["icons/icon.ico", "icons/more-of-dots-icon.png"],
-    "resources": [
-      "../scripts/invoke-python-probe.ps1",
-      "../tools/python-probe-dll/target/release/wod_python_probe.dll"
-    ],
-    "externalBin": ["binaries/wod-replay-server"],
     "windows": {
       "nsis": {
         "installMode": "currentUser",

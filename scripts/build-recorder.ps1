@@ -7,7 +7,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
-$Version = (Get-Content -LiteralPath (Join-Path $Root 'VERSION') -Raw).Trim()
+# The recorder carries its own version. It ships far less often than the app, and
+# its installer bundles a large game vault, so following the app's VERSION would
+# force a full re-download for every app patch that left the payload untouched.
+$VersionFile = Join-Path $Root 'wod_replay_server\RECORDER_VERSION'
+$Version = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
+if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+    throw "wod_replay_server\RECORDER_VERSION must contain a MAJOR.MINOR.PATCH version, found '$Version'."
+}
 
 function Invoke-RecorderSigning([string]$Path) {
     $Thumbprint = $env:WOD_SIGNING_CERTIFICATE_SHA1
@@ -43,7 +50,8 @@ $AddData = @(
     "$(Join-Path $Root 'scripts\local-runner.ps1');scripts",
     "$(Join-Path $Root 'scripts\invoke-python-probe.ps1');scripts",
     "$ProbeDll;tools\python-probe-dll\target\release",
-    "$(Join-Path $Root 'wod_replay_server\supported_versions.json');wod_replay_server"
+    "$(Join-Path $Root 'wod_replay_server\supported_versions.json');wod_replay_server",
+    "$VersionFile;wod_replay_server"
 )
 $Arguments = @(
     '--clean',
@@ -132,6 +140,35 @@ if (-not (Test-Path -LiteralPath $BundledVersions -PathType Container)) {
     throw 'Bundled game-version export did not produce a versions folder.'
 }
 $NsisArguments += "/DBUNDLED_VERSIONS_DIR=$BundledVersions"
+
+# The installer skips re-extracting an unchanged vault, which is most of the
+# install time. That decision hangs on this identifier, so hash file contents
+# rather than names and sizes; a silently stale vault would break recording in a
+# way the user could not diagnose.
+$VaultFiles = Get-ChildItem -LiteralPath $BundledVersions -File -Recurse | Sort-Object FullName
+if (-not $VaultFiles) { throw 'Bundled game-version export produced no files.' }
+$VaultDigest = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $VaultLines = foreach ($File in $VaultFiles) {
+        $Relative = $File.FullName.Substring($BundledVersions.Length).TrimStart('\')
+        "$Relative`:$((Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+    }
+    $VaultBytes = [System.Text.Encoding]::UTF8.GetBytes(($VaultLines -join "`n"))
+    $BundledVersionsId = [System.BitConverter]::ToString($VaultDigest.ComputeHash($VaultBytes)).Replace('-', '').ToLowerInvariant()
+} finally {
+    $VaultDigest.Dispose()
+}
+$NsisArguments += "/DBUNDLED_VERSIONS_ID=$BundledVersionsId"
+
+# The installer also confirms this build is really on disk before trusting the
+# marker, so a hand-deleted vault is repaired instead of skipped.
+$BundledProbe = Get-ChildItem -LiteralPath $BundledVersions -Directory |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'game\game.exe') -PathType Leaf } |
+    Sort-Object Name |
+    Select-Object -First 1
+if (-not $BundledProbe) { throw 'Bundled game-version export contains no version with game\game.exe.' }
+$NsisArguments += "/DBUNDLED_VERSIONS_PROBE=$($BundledProbe.Name)"
+
 $NsisArguments += (Join-Path $Root 'scripts\recorder-installer.nsi')
 & $MakeNsis @NsisArguments
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {

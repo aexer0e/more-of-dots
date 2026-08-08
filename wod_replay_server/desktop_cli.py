@@ -14,6 +14,7 @@ from typing import Any
 from .address_profiles import AddressProfile, MissingAddressProfile, load_matching_profile
 from .config import get_settings
 from .local_runner import LocalSessionRunner
+from .recorder_version import recorder_version
 from .replay import ReplayValidationError, validate_replay
 from .storage import JobPaths, JobStore
 from .synthesis import MAX_INLINE_STATS_BYTES, synthesize_replay
@@ -454,6 +455,7 @@ def command_health(runtime_dir: Path | None, owner_pid: int | None = None) -> di
         "runtime_cleanup": _skipped_runtime_cleanup("startup-health"),
         "runner": runner,
         "recorder": {
+            "version": recorder_version(),
             "protocol_version": 1,
             "home": str(ctx.version_vault.home),
             "versions": ctx.version_vault.list_versions(),
@@ -466,6 +468,7 @@ def command_recorder_capabilities() -> dict[str, Any]:
     vault = VersionVault()
     return {
         "name": "More of Dots Recorder",
+        "version": recorder_version(),
         "protocol_versions": [1],
         "commands": [
             "record-replay",

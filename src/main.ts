@@ -311,8 +311,38 @@ type ReplayRecordingSetup = {
   bitrateIndex: number;
   resolutionIndex: number;
   replays: ReplayBrowserItem[];
-  readiness: "checking" | "ready" | "error";
+  readiness: "checking" | "ready" | "error" | "recorder";
   error: string;
+};
+
+type RecorderUpdateStatus = {
+  installed: boolean;
+  installed_version: string | null;
+  available_version: string;
+  game_versions: string[];
+  update_available: boolean;
+  update_required: boolean;
+  compatible: boolean;
+  size: number;
+};
+
+type RecorderInstallStep =
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "verifying"
+  | "installing"
+  | "verifying-install"
+  | "completed"
+  | "cancelled"
+  | "current"
+  | "error";
+
+type RecorderInstallProgressEvent = {
+  step: RecorderInstallStep;
+  downloaded?: number;
+  total?: number;
+  error?: string;
 };
 
 type BrowserSuggestion = {
@@ -528,6 +558,11 @@ let browserRecordingSetup: ReplayRecordingSetup | null = null;
 let browserRecordingReplays = new Map<string, ReplayBrowserItem>();
 let recordingQueueRoot: HTMLDivElement | null = null;
 const recordingQueueRows = new Map<string, HTMLElement>();
+let recorderUpdate: RecorderUpdateStatus | null = null;
+let recorderInstallStep: RecorderInstallStep = "idle";
+let recorderInstallDownloaded = 0;
+let recorderInstallTotal = 0;
+let recorderInstallError = "";
 let browserError = "";
 let browserSearch = "";
 let browserHideUnmatched = true;
@@ -1698,6 +1733,132 @@ function renderRecordingScale(values: readonly number[], formatter: (value: numb
     .join("")}</div>`;
 }
 
+function formatMegabytes(bytes: number): string {
+  if (!bytes) return "";
+  const megabytes = bytes / (1024 * 1024);
+  return megabytes >= 1024 ? `${(megabytes / 1024).toFixed(1)} GB` : `${Math.round(megabytes)} MB`;
+}
+
+function recorderInstallBusy(): boolean {
+  return ["checking", "downloading", "verifying", "installing", "verifying-install"].includes(recorderInstallStep);
+}
+
+function recorderNeedsAttention(): boolean {
+  if (!recorderUpdate) return false;
+  return !recorderUpdate.installed || recorderUpdate.update_required || recorderUpdate.update_available;
+}
+
+// Rendered once with the dialog and patched in place afterwards. Download
+// progress arrives several times a second, and rebuilding the dialog on each
+// event would restart its transitions and steal focus from the buttons.
+function renderRecorderInstallPanel(): string {
+  return `
+    <div id="recorderInstallPanel" class="recorder-install" role="status" hidden>
+      <span class="recorder-install-copy">
+        <strong id="recorderInstallTitle"></strong>
+        <small id="recorderInstallDetail"></small>
+      </span>
+      <div id="recorderInstallTrack" class="recorder-install-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden>
+        <span id="recorderInstallFill" class="recorder-install-fill"></span>
+      </div>
+      <span class="recorder-install-actions">
+        <button id="recorderInstallCancel" class="recorder-install-secondary" type="button" hidden>Cancel</button>
+        <button id="recorderInstallAction" class="recorder-install-primary" type="button"></button>
+      </span>
+    </div>
+  `;
+}
+
+function recorderInstallCopy(): { title: string; detail: string } {
+  const status = recorderUpdate;
+  const version = status?.available_version ?? "";
+  switch (recorderInstallStep) {
+    case "checking":
+      return { title: "Checking for the recorder", detail: "Contacting the update service." };
+    case "downloading": {
+      const size = recorderInstallTotal ? ` of ${formatMegabytes(recorderInstallTotal)}` : "";
+      return {
+        title: `Downloading recorder ${version}`.trim(),
+        detail: `${formatMegabytes(recorderInstallDownloaded)}${size} downloaded.`,
+      };
+    }
+    case "verifying":
+      return { title: "Verifying the download", detail: "Checking the signature before running it." };
+    case "installing":
+      return { title: "Installing the recorder", detail: "This takes a minute and does not report progress." };
+    case "verifying-install":
+      return { title: "Finishing up", detail: "Confirming the recorder responds." };
+    case "completed":
+    case "current":
+      return { title: `Recorder ${status?.installed_version ?? version} is ready`, detail: "You can start recording." };
+    case "cancelled":
+      return { title: "Install cancelled", detail: "The partial download is kept, so retrying resumes it." };
+    case "error":
+      return { title: "Recorder install failed", detail: recorderInstallError };
+    default:
+      break;
+  }
+  if (!status) return { title: "", detail: "" };
+  if (!status.installed) {
+    return {
+      title: "Replay export needs the recorder",
+      detail: `More of Dots Recorder ${status.available_version} is a ${formatMegabytes(status.size)} download.`,
+    };
+  }
+  if (status.update_required) {
+    return {
+      title: "Recorder update required",
+      detail: `Recorder ${status.installed_version} cannot talk to this version of More of Dots.`,
+    };
+  }
+  return {
+    title: `Recorder ${status.available_version} is available`,
+    detail: `You have ${status.installed_version}. Updating downloads ${formatMegabytes(status.size)}.`,
+  };
+}
+
+function updateRecorderInstallUi() {
+  const panel = document.querySelector<HTMLElement>("#recorderInstallPanel");
+  if (!panel) return;
+  const visible = recorderInstallBusy() || recorderNeedsAttention() || recorderInstallStep !== "idle";
+  panel.hidden = !visible;
+  if (!visible) return;
+
+  const { title, detail } = recorderInstallCopy();
+  setText(panel.querySelector("#recorderInstallTitle"), title);
+  setText(panel.querySelector("#recorderInstallDetail"), detail);
+  setAttribute(panel, "class", `recorder-install is-${recorderInstallStep}`);
+  setAttribute(panel, "role", recorderInstallStep === "error" ? "alert" : "status");
+
+  const track = panel.querySelector<HTMLElement>("#recorderInstallTrack");
+  const fill = panel.querySelector<HTMLElement>("#recorderInstallFill");
+  const showTrack = recorderInstallStep === "downloading" && recorderInstallTotal > 0;
+  if (track) track.hidden = !showTrack;
+  if (showTrack && track && fill) {
+    const percent = clamp((recorderInstallDownloaded / recorderInstallTotal) * 100, 0, 100);
+    fill.style.width = `${percent}%`;
+    setAttribute(track, "aria-valuenow", String(Math.round(percent)));
+  }
+
+  const action = panel.querySelector<HTMLButtonElement>("#recorderInstallAction");
+  const cancel = panel.querySelector<HTMLButtonElement>("#recorderInstallCancel");
+  if (cancel) cancel.hidden = recorderInstallStep !== "downloading";
+  if (action) {
+    const busy = recorderInstallBusy();
+    const done = recorderInstallStep === "completed" || recorderInstallStep === "current";
+    action.hidden = busy || done;
+    action.disabled = busy;
+    setText(
+      action,
+      recorderInstallStep === "error" || recorderInstallStep === "cancelled"
+        ? "Try again"
+        : recorderUpdate?.installed
+          ? "Update recorder"
+          : "Install recorder",
+    );
+  }
+}
+
 function renderReplayRecordingDialog(): string {
   const setup = browserRecordingSetup;
   if (!setup) return "";
@@ -1775,6 +1936,7 @@ function renderReplayRecordingDialog(): string {
 
         ${setup.readiness === "checking" ? `<div class="recording-setup-status" role="status">Checking recorder...</div>` : ""}
         ${setup.readiness === "error" ? `<div class="recording-setup-status is-error" role="alert">${escapeHtml(setup.error)}</div>` : ""}
+        ${renderRecorderInstallPanel()}
 
         <footer class="recording-setup-actions">
           <span class="recording-setup-summary"><strong>${playbackSpeed}× · ${resolution}p · ${bitrate} Mbps</strong><small>Videos include a 2-second result-screen hold.</small></span>
@@ -2536,6 +2698,11 @@ function bindBrowserEvents() {
   document.querySelector<HTMLButtonElement>("#startConfiguredRecording")?.addEventListener("click", () => {
     void startConfiguredRecording();
   });
+  document.querySelector<HTMLButtonElement>("#recorderInstallAction")?.addEventListener("click", () => {
+    void startRecorderInstall();
+  });
+  document.querySelector<HTMLButtonElement>("#recorderInstallCancel")?.addEventListener("click", cancelRecorderInstall);
+  updateRecorderInstallUi();
   document.querySelector<HTMLInputElement>("#recordingConcurrency")?.addEventListener("input", (event) => {
     if (!browserRecordingSetup) return;
     const input = event.currentTarget as HTMLInputElement;
@@ -2721,6 +2888,51 @@ function rememberRecordingDirectory(directory: string) {
   }
 }
 
+async function refreshRecorderUpdate(options: { force?: boolean } = {}): Promise<RecorderUpdateStatus | null> {
+  if (!options.force && recorderUpdate) return recorderUpdate;
+  try {
+    recorderUpdate = await invoke<RecorderUpdateStatus>("check_recorder_update");
+  } catch (error) {
+    // Being offline must not stop someone recording with the recorder they have.
+    console.warn("Recorder update check failed", error);
+  }
+  return recorderUpdate;
+}
+
+async function startRecorderInstall() {
+  if (recorderInstallBusy()) return;
+  recorderInstallStep = "checking";
+  recorderInstallError = "";
+  recorderInstallDownloaded = 0;
+  recorderInstallTotal = 0;
+  updateRecorderInstallUi();
+  const setup = browserRecordingSetup;
+  try {
+    recorderUpdate = await invoke<RecorderUpdateStatus>("install_recorder");
+    recorderInstallStep = "completed";
+    updateRecorderInstallUi();
+    // The dialog was disabled while the recorder was missing, so re-run the
+    // readiness check and let the user continue with the export they asked for.
+    if (setup && browserRecordingSetup === setup) await evaluateRecordingReadiness(setup);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === "cancelled") {
+      recorderInstallStep = "cancelled";
+    } else {
+      recorderInstallStep = "error";
+      recorderInstallError = message;
+    }
+    updateRecorderInstallUi();
+  }
+}
+
+function cancelRecorderInstall() {
+  if (recorderInstallStep !== "downloading") return;
+  void invoke("cancel_recorder_install").catch((error) => {
+    console.warn("Could not cancel the recorder install", error);
+  });
+}
+
 async function recordSelectedReplays() {
   const replays = selectedBrowserReplays();
   if (
@@ -2744,6 +2956,12 @@ async function recordSelectedReplays() {
   renderReplayBrowser();
   refreshRecordingQueueUi();
   window.requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#recordingConcurrency")?.focus());
+  await evaluateRecordingReadiness(setup);
+}
+
+async function evaluateRecordingReadiness(setup: ReplayRecordingSetup) {
+  setup.readiness = "checking";
+  setup.error = "";
   try {
     const [recorder, vault, defaultDirectory] = await Promise.all([
       invoke<{
@@ -2769,12 +2987,28 @@ async function recordSelectedReplays() {
     setup.destinationDir = defaultDirectory;
     setup.readiness = "ready";
     rememberRecordingDirectory(defaultDirectory);
+    // A working recorder must not block on the network, so look for a newer one
+    // after the dialog is already usable and fold the answer in when it lands.
+    void refreshRecorderUpdate().then(() => updateRecorderInstallUi());
   } catch (error) {
     if (browserRecordingSetup !== setup) return;
-    setup.readiness = "error";
-    setup.error = error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    // A recorder that is absent or too old is an offer to install, not a dead
+    // end, so only fall back to a plain error when an install cannot fix it.
+    const status = await refreshRecorderUpdate({ force: true });
+    if (browserRecordingSetup !== setup) return;
+    if (status && (!status.installed || status.update_required || status.update_available)) {
+      setup.readiness = "recorder";
+      setup.error = "";
+    } else {
+      setup.readiness = "error";
+      setup.error = message;
+    }
   } finally {
-    if (browserRecordingSetup === setup) renderReplayBrowser();
+    if (browserRecordingSetup === setup) {
+      renderReplayBrowser();
+      updateRecorderInstallUi();
+    }
   }
 }
 
@@ -5774,6 +6008,17 @@ if (appMode === "browser") {
     refreshRecordingQueueUi();
   }).catch((error) => {
     console.error("Replay recording progress listener failed", error);
+  });
+  void listen<RecorderInstallProgressEvent>("recorder-install-progress", (event) => {
+    recorderInstallStep = event.payload.step;
+    if (event.payload.step === "downloading") {
+      recorderInstallDownloaded = event.payload.downloaded ?? 0;
+      recorderInstallTotal = event.payload.total ?? 0;
+    }
+    if (event.payload.error) recorderInstallError = event.payload.error;
+    updateRecorderInstallUi();
+  }).catch((error) => {
+    console.error("Recorder install progress listener failed", error);
   });
   renderReplayBrowser();
   refreshRecordingQueueUi();

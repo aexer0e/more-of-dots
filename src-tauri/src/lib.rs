@@ -25,6 +25,10 @@ use tauri::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+mod recorder_update;
+
+use recorder_update::RecorderInstallControl;
+
 const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
 const FPS: f64 = 30.0;
 const GAME_DIR_NAME: &str = "War of Dots";
@@ -2374,6 +2378,47 @@ async fn recorder_status(app: AppHandle) -> Result<Value, String> {
     Ok(value)
 }
 
+/// Asks the installed recorder to identify itself, or `None` when there is not a
+/// working one on disk. Update decisions need to tell "absent" apart from
+/// "present but broken", and both answer the same way here: reinstall.
+async fn installed_recorder(app: &AppHandle) -> Option<Value> {
+    resolve_recorder_path().ok()?;
+    run_backend(app, "recorder-capabilities", Vec::new()).await.ok()
+}
+
+#[tauri::command]
+async fn check_recorder_update(app: AppHandle) -> Result<Value, String> {
+    recorder_update::check(&app).await
+}
+
+#[tauri::command]
+async fn install_recorder(app: AppHandle) -> Result<Value, String> {
+    // NSIS cannot replace the recorder while a job holds its image open, and it
+    // reports that as a bare exit code. Refusing here produces an explanation the
+    // user can act on instead.
+    {
+        let control = app.state::<ReplayRecordingControl>();
+        let state = control
+            .state
+            .lock()
+            .map_err(|_| "Recording state is unavailable.".to_string())?;
+        if state.active {
+            return Err(
+                "Recording is in progress. Let the queue finish before updating the recorder."
+                    .to_string(),
+            );
+        }
+    }
+    let control = app.state::<RecorderInstallControl>();
+    recorder_update::install(&app, &control).await
+}
+
+#[tauri::command]
+fn cancel_recorder_install(app: AppHandle) -> Result<bool, String> {
+    app.state::<RecorderInstallControl>().cancel();
+    Ok(true)
+}
+
 #[tauri::command]
 async fn list_recorder_versions(app: AppHandle) -> Result<Value, String> {
     run_backend(&app, "list-game-versions", Vec::new()).await
@@ -4192,6 +4237,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(WindowOwnerProcesses::default())
         .manage(ReplayRecordingControl::default())
+        .manage(RecorderInstallControl::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
@@ -4216,6 +4262,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             recorder_status,
+            check_recorder_update,
+            install_recorder,
+            cancel_recorder_install,
             list_recorder_versions,
             recording_default_directory,
             open_recording_output_directory,

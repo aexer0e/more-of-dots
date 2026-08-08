@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 1.0.1 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.0.1/More.of.Dots_1.0.1_x64-setup.exe)
+[Download More of Dots 1.2.0 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.2.0/More.of.Dots_1.2.0_x64-setup.exe)
 
 - Browse, search, and download War of Dots replays
 - Back up discovered replays automatically
@@ -13,6 +13,14 @@ Replay video export is provided by the optional **More of Dots Recorder** packag
 
 The recorder bundles only the immutable War of Dots `1.3.4` build in `%LOCALAPPDATA%\More of Dots Recorder\versions` and copies it into a disposable job runtime. Replay `1.2.23` uses the same movement/production/message schema and is normalized to `1.3.4` before launch. Missing or unknown version labels use the same structural fallback when player names and tick orders can be derived. Recordings never launch the user's live Steam `game.exe`.
 
+### Installing and updating from the app
+
+The export dialog installs the recorder itself when one is missing or out of date. The app reads `recorder.json` from the latest release, downloads the installer with resumable HTTP ranges, checks it against the published SHA-256 and a minisign signature made with the keypair in `tauri.conf.json`, then runs it with `/S`. Nothing is executed before both checks pass, a manifest offering an older recorder than the installed one is ignored, and installs are refused while a recording holds the recorder open.
+
+The recorder carries its own `wod_replay_server/RECORDER_VERSION`, independent of the app's `VERSION`. Bump it only when the recorder payload changes; otherwise every app patch would push the full installer again. `command_recorder_capabilities` reports it, and the manifest is generated from what the built recorder says rather than from what the build script assumes.
+
+Releases attach `recorder.json` and `recorder.json.sig` even when the recorder was not rebuilt, carrying the previous pair forward unchanged. The manifest's download URL is pinned to the tag that produced the installer, never to `latest`.
+
 Build the two release artifacts separately:
 
 ```powershell
@@ -21,6 +29,8 @@ npm run build:recorder
 ```
 
 `npm run build:recorder` produces `recorder-dist/More.of.Dots.Recorder_<version>_x64-setup.exe`. The per-user NSIS installer registers an uninstaller and Start Menu shortcut while keeping the bundled game build outside the program directory so upgrades and recorder quarantines do not erase the vault.
+
+On upgrade the installer clears `payload` before extracting, because PyInstaller renames files between builds and orphans would otherwise accumulate. It skips re-extracting the game vault when a content hash marker and the build on disk both match, which is most of the install time. Silent installs report `3` when the recorder is running and `4` when files could not be written.
 
 The build requires version `1.3.4` in a populated recorder home. It uses `%LOCALAPPDATA%\More of Dots Recorder` by default; set `WOD_BUNDLED_VERSION_VAULT` to use another source. Packaging verifies `game.exe` against `wod_replay_server/supported_versions.json` and embeds that single build in the NSIS installer.
 

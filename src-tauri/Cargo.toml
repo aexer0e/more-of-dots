@@ -17,7 +17,14 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 flate2 = "1"
 futures = "0.3"
+# Already in the tree via tauri-plugin-updater, so promoting these to direct
+# dependencies costs no extra crates.
+minisign-verify = "0.2"
 png = "0.17"
+# Feature set matched to tauri-plugin-updater's so the shared build of reqwest
+# does not gain a second TLS backend.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

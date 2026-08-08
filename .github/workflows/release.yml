@@ -91,6 +91,27 @@ jobs:
           $env:WOD_FFMPEG_PATH = (Get-Command ffmpeg.exe -ErrorAction Stop).Source
           npm run build:recorder
 
+      - name: Sign recorder installer and write manifest
+        if: vars.WOD_RECORDER_VAULT_URL != '' && vars.WOD_RECORDER_VAULT_SHA256 != ''
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $appVersion = (Get-Content VERSION -Raw).Trim()
+          $recorderVersion = (Get-Content wod_replay_server/RECORDER_VERSION -Raw).Trim()
+          $installer = "recorder-dist/More.of.Dots.Recorder_${recorderVersion}_x64-setup.exe"
+          # Signed with the same minisign keypair as the app bundles, so the client
+          # verifies against the pubkey already embedded in tauri.conf.json.
+          npx --yes tauri signer sign --private-key="$env:TAURI_SIGNING_PRIVATE_KEY" --password="$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" $installer
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the recorder installer failed.' }
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$appVersion/More.of.Dots.Recorder_${recorderVersion}_x64-setup.exe"
+          ./scripts/recorder-manifest.ps1 -InstallerPath $installer -Url $url
+          # The manifest is signed as well, so the client accepts nothing off the
+          # network that is not covered by the release keypair.
+          npx --yes tauri signer sign --private-key="$env:TAURI_SIGNING_PRIVATE_KEY" --password="$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" recorder-dist/recorder.json
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the recorder manifest failed.' }
+
       - name: Attach recorder installer to draft release
         if: vars.WOD_RECORDER_VAULT_URL != '' && vars.WOD_RECORDER_VAULT_SHA256 != ''
         shell: pwsh
@@ -98,4 +119,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = (Get-Content VERSION -Raw).Trim()
-          gh release upload "v$version" "recorder-dist/More.of.Dots.Recorder_${version}_x64-setup.exe#More of Dots Recorder (Windows x64)" --clobber
+          $recorderVersion = (Get-Content wod_replay_server/RECORDER_VERSION -Raw).Trim()
+          gh release upload "v$version" "recorder-dist/More.of.Dots.Recorder_${recorderVersion}_x64-setup.exe#More of Dots Recorder (Windows x64)" --clobber
+
+      - name: Carry forward the previous recorder manifest
+        if: vars.WOD_RECORDER_VAULT_URL == '' || vars.WOD_RECORDER_VAULT_SHA256 == ''
+        shell: pwsh
+        run: |
+          # The client polls recorder.json on the latest release, so every release
+          # needs one even when the recorder was not rebuilt. Reuse the published
+          # manifest unchanged; its URL is pinned to the tag that produced it.
+          New-Item -ItemType Directory -Force -Path recorder-dist | Out-Null
+          $latest = 'https://github.com/${{ github.repository }}/releases/latest/download'
+          try {
+            # The signature has to travel with it. A manifest published without
+            # one is rejected by every client, which reads as "no recorder".
+            Invoke-WebRequest -UseBasicParsing -Uri "$latest/recorder.json" -OutFile recorder-dist/recorder.json
+            Invoke-WebRequest -UseBasicParsing -Uri "$latest/recorder.json.sig" -OutFile recorder-dist/recorder.json.sig
+          } catch {
+            Remove-Item recorder-dist/recorder.json,recorder-dist/recorder.json.sig -ErrorAction SilentlyContinue
+            Write-Host 'No published recorder manifest yet; this release will not advertise a recorder.'
+          }
+
+      - name: Attach recorder manifest to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not ((Test-Path recorder-dist/recorder.json) -and (Test-Path recorder-dist/recorder.json.sig))) {
+            Write-Host 'No signed recorder manifest to attach.'
+            exit 0
+          }
+          $version = (Get-Content VERSION -Raw).Trim()
+          gh release upload "v$version" "recorder-dist/recorder.json#Recorder update manifest" "recorder-dist/recorder.json.sig#Recorder update manifest signature" --clobber

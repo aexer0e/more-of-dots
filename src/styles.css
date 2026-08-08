@@ -2339,6 +2339,104 @@ p {
   color: var(--danger);
 }
 
+/* Patched in place while a download runs, so the layout must hold still as the
+   copy changes length. The progress track spans both columns rather than
+   sitting between them, which keeps the buttons from shifting when it appears. */
+.recorder-install {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  display: grid;
+  gap: var(--s-2) var(--s-3);
+  grid-template-columns: 1fr auto;
+  margin: -4px 26px 18px;
+  padding: var(--s-3);
+}
+
+.recorder-install-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.recorder-install-copy strong {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+}
+
+.recorder-install-copy small {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.recorder-install-track {
+  background: var(--line);
+  border-radius: var(--r-pill);
+  grid-column: 1 / -1;
+  height: 3px;
+  overflow: hidden;
+}
+
+.recorder-install-fill {
+  background: var(--accent);
+  display: block;
+  height: 100%;
+  transition: width 120ms linear;
+}
+
+.recorder-install-actions {
+  align-items: center;
+  display: flex;
+  gap: var(--s-2);
+}
+
+.recorder-install-primary,
+.recorder-install-secondary {
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  height: var(--control-h);
+  padding: 0 var(--s-3);
+  white-space: nowrap;
+}
+
+.recorder-install-primary {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--accent-ink);
+}
+
+.recorder-install-primary:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.recorder-install-secondary {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+}
+
+.recorder-install-secondary:hover {
+  color: var(--text);
+}
+
+.recorder-install.is-error {
+  border-color: var(--danger-soft);
+}
+
+.recorder-install.is-error .recorder-install-copy small {
+  color: var(--danger);
+}
+
+.recorder-install.is-completed .recorder-install-copy strong,
+.recorder-install.is-current .recorder-install-copy strong {
+  color: var(--success);
+}
+
 #recordingQueueRoot {
   bottom: 74px;
   left: 18px;

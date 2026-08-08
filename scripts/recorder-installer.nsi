@@ -13,6 +13,17 @@ Unicode true
 !ifndef BUNDLED_VERSIONS_DIR
   !error "BUNDLED_VERSIONS_DIR is required"
 !endif
+!ifndef BUNDLED_VERSIONS_ID
+  !error "BUNDLED_VERSIONS_ID is required"
+!endif
+!ifndef BUNDLED_VERSIONS_PROBE
+  !error "BUNDLED_VERSIONS_PROBE is required"
+!endif
+
+; Silent-install exit codes. The app reports these back to the user, so they must
+; stay distinguishable from NSIS's own failures.
+!define ERR_RECORDER_RUNNING 3
+!define ERR_INSTALL_INCOMPLETE 4
 
 Name "More of Dots Recorder"
 OutFile "${OUTPUT_PATH}"
@@ -51,6 +62,22 @@ FunctionEnd
 
 Section "Recorder" SEC_RECORDER
   SetShellVarContext current
+
+  ; A recording in flight holds an open image handle on the recorder executable,
+  ; and NSIS cannot overwrite it. Probe for the lock first so a silent upgrade
+  ; fails with a code the app can explain instead of a half-written install.
+  IfFileExists "$INSTDIR\more-of-dots-recorder.exe" 0 recorder_not_running
+    ClearErrors
+    FileOpen $R0 "$INSTDIR\more-of-dots-recorder.exe" a
+    IfErrors 0 recorder_unlocked
+      ; Quit rather than Abort: Abort forces error level 2 and would erase the
+      ; specific code the app needs to explain what went wrong.
+      SetErrorLevel ${ERR_RECORDER_RUNNING}
+      Quit
+    recorder_unlocked:
+      FileClose $R0
+  recorder_not_running:
+
   SetOutPath "$INSTDIR"
   ; Remove the two files shipped by recorder 1.1.0's retired downloader.
   ; These are explicit deletes so upgrade cleanup never recursively follows a
@@ -60,7 +87,24 @@ Section "Recorder" SEC_RECORDER
   RMDir "$INSTDIR\tools\depot-downloader"
   RMDir "$INSTDIR\tools"
   Delete "$INSTDIR\install-recorder.ps1"
+
+  ; PyInstaller renames payload files between builds, so overwriting in place
+  ; leaves orphaned modules behind that later builds may still import. Clearing
+  ; the payload directory is safe because it only ever holds installer-owned
+  ; files; the bundled game vault lives outside $INSTDIR.
+  RMDir /r "$INSTDIR\payload"
+
   File /r "${RECORDER_DIR}\*"
+
+  ; Silent installs skip the file-error dialog, so confirm the payload landed
+  ; rather than trusting NSIS's default exit code.
+  IfFileExists "$INSTDIR\more-of-dots-recorder.exe" 0 recorder_incomplete
+  IfFileExists "$INSTDIR\payload\*.*" recorder_complete
+  recorder_incomplete:
+    SetErrorLevel ${ERR_INSTALL_INCOMPLETE}
+    Quit
+  recorder_complete:
+
   WriteUninstaller "$INSTDIR\Uninstall More of Dots Recorder.exe"
 
   CreateDirectory "$SMPROGRAMS\More of Dots Recorder"
@@ -79,8 +123,31 @@ Section "Recorder" SEC_RECORDER
 SectionEnd
 
 Section "Bundled replay game versions" SEC_BUNDLED_VERSIONS
-  SetOutPath "$LOCALAPPDATA\More of Dots Recorder\versions"
-  File /r "${BUNDLED_VERSIONS_DIR}\*"
+  SetShellVarContext current
+  ; The vault is roughly half a gigabyte and is by far the slowest part of the
+  ; install, yet it only changes when a new game build is bundled. The marker
+  ; records the content hash already on disk so payload-only upgrades skip it.
+  StrCpy $R1 "$LOCALAPPDATA\More of Dots Recorder\versions\.bundled-id"
+  ; The marker alone is not enough. A user who deleted the vault by hand would
+  ; otherwise keep a stale marker and never get the game data back.
+  IfFileExists "$LOCALAPPDATA\More of Dots Recorder\versions\${BUNDLED_VERSIONS_PROBE}\game\game.exe" 0 extract_versions
+  ClearErrors
+  FileOpen $R2 "$R1" r
+  IfErrors extract_versions
+  FileRead $R2 $R3
+  FileClose $R2
+  StrCmp $R3 "${BUNDLED_VERSIONS_ID}" versions_current extract_versions
+
+  extract_versions:
+    SetOutPath "$LOCALAPPDATA\More of Dots Recorder\versions"
+    Delete "$R1"
+    File /r "${BUNDLED_VERSIONS_DIR}\*"
+    ClearErrors
+    FileOpen $R2 "$R1" w
+    IfErrors versions_current
+    FileWrite $R2 "${BUNDLED_VERSIONS_ID}"
+    FileClose $R2
+  versions_current:
 SectionEnd
 
 Section "Uninstall"

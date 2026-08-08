@@ -19,7 +19,7 @@ dev = [
 include = ["wod_replay_server*"]
 
 [tool.setuptools.package-data]
-wod_replay_server = ["supported_versions.json"]
+wod_replay_server = ["supported_versions.json", "RECORDER_VERSION"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

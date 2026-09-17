@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>More of Dots</title>
-  <meta name="description" content="A free Windows app for War of Dots. Browse and back up replays, switch game regions, and create custom maps.">
+  <meta name="description" content="A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.">
   <link rel="icon" type="image/png" href="icon.png">
   <meta property="og:title" content="More of Dots">
-  <meta property="og:description" content="A free Windows app for War of Dots. Browse and back up replays, switch game regions, and create custom maps.">
+  <meta property="og:description" content="A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.">
   <meta property="og:image" content="screenshots/replays.png">
   <style>
     :root {
@@ -295,16 +295,16 @@
       <path d="M3 8 C 20 2, 36 10, 52 6 S 84 2, 100 7 S 132 10, 148 5 S 178 3, 187 7"
             fill="none" stroke="#5c8a3c" stroke-width="4" stroke-linecap="round"/>
     </svg>
-    <p class="tagline">A free Windows app for War of Dots. Browse and back up replays, switch game regions, and create custom maps.</p>
+    <p class="tagline">A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.</p>
     <div class="buttons">
-      <a class="btn primary" id="download-btn" href="https://github.com/aexer0e/more-of-dots/releases/download/v1.0.3/More.of.Dots_1.0.3_x64-setup.exe">Download for Windows</a>
+      <a class="btn primary" id="download-btn" href="https://github.com/aexer0e/more-of-dots/releases/download/v1.3.0/More.of.Dots_1.3.0_x64-setup.exe">Download for Windows</a>
       <a class="btn" href="https://github.com/aexer0e/more-of-dots">Source on GitHub</a>
     </div>
-    <p class="fine-print" id="fine-print">Free · Open source · Windows installer</p>
+    <p class="fine-print" id="fine-print">Free · Open source · Windows installer · v1.3.0</p>
 
     <figure class="shot-hero tilt-l">
       <div class="shot">
-        <img src="screenshots/replays.png" alt="The replay browser showing a grid of War of Dots replays with map thumbnails, player names and winners" width="1532" height="975">
+        <img src="screenshots/replays.png" alt="The replay browser showing a grid of War of Dots replays with map thumbnails, player names and winners" width="1280" height="720">
       </div>
       <figcaption><span class="cap-dot blue"></span>Replay browser</figcaption>
     </figure>
@@ -328,28 +328,28 @@
           <span class="dot" aria-hidden="true"></span>
           <div>
             <strong>Replay browser</strong>
-            <p>Search replays by player and download them directly into the game.</p>
+            <p>Search by player, filter matches, and preview the latest maps. Replays are backed up automatically.</p>
           </div>
         </li>
         <li>
           <span class="dot" aria-hidden="true"></span>
           <div>
-            <strong>Automatic backups</strong>
-            <p>Discovered replays are backed up automatically.</p>
+            <strong>Replay recording</strong>
+            <p>Export replays as videos, including older compatible replays. Install or update the recorder from the export dialog.</p>
           </div>
         </li>
         <li>
           <span class="dot" aria-hidden="true"></span>
           <div>
-            <strong>Region switching</strong>
-            <p>Change your game region from within the app. No VPN required.</p>
+            <strong>Leaderboards</strong>
+            <p>Track your rank and compare your progress with up to 10 other players.</p>
           </div>
         </li>
         <li>
           <span class="dot" aria-hidden="true"></span>
           <div>
             <strong>Map editor</strong>
-            <p>Create and edit custom maps and save them to the game.</p>
+            <p>Paint terrain, place units, and save custom maps to the game.</p>
           </div>
         </li>
       </ul>
@@ -358,15 +358,15 @@
     <div class="shot-pair">
       <figure class="tilt-r">
         <div class="shot">
-          <img src="screenshots/map-editor.png" alt="The map editor with terrain painting tools and red and blue units placed on a custom map" width="1532" height="975" loading="lazy">
+          <img src="screenshots/map-editor.png" alt="The map editor with terrain painting tools and red and blue units placed on a custom map" width="1280" height="720" loading="lazy">
         </div>
         <figcaption><span class="cap-dot red"></span>Map editor</figcaption>
       </figure>
       <figure class="tilt-l">
         <div class="shot">
-          <img src="screenshots/region.png" alt="The region picker with North America, Europe and Asia cards, Europe currently selected" width="1532" height="975" loading="lazy">
+          <img src="screenshots/leaderboard.png" alt="Global rankings with your player highlighted and a chart comparing player progress" width="1280" height="720" loading="lazy">
         </div>
-        <figcaption><span class="cap-dot blue"></span>Region switching</figcaption>
+        <figcaption><span class="cap-dot blue"></span>Leaderboards</figcaption>
       </figure>
     </div>
 
@@ -382,11 +382,11 @@
 
   <script>
     // Point the download button at the newest installer; the hardcoded
-    // v1.0.1 link stays as the fallback if this fails or JS is off.
+    // v1.3.0 app link stays as the fallback if this fails or JS is off.
     fetch("https://api.github.com/repos/aexer0e/more-of-dots/releases/latest")
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((release) => {
-        const exe = (release.assets || []).find((a) => a.name.endsWith(".exe"));
+        const exe = (release.assets || []).find((a) => /^More\.of\.Dots_\d+\.\d+\.\d+_x64-setup\.exe$/.test(a.name));
         if (!exe) return;
         document.getElementById("download-btn").href = exe.browser_download_url;
         if (release.tag_name) {

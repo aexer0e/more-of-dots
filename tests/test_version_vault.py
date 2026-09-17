@@ -111,26 +111,28 @@ def test_unsupported_version_is_rejected(tmp_path: Path) -> None:
         vault.resolve("1.3.4")
 
 
-def test_builtin_catalog_bundles_only_the_1_3_4_game_build() -> None:
+def test_builtin_catalog_bundles_only_the_1_4_1_game_build() -> None:
     catalog = SupportedVersionCatalog()
 
-    assert catalog.versions == ("1.3.4",)
+    assert catalog.versions == ("1.4.1",)
+    assert catalog.lookup("1.3.4") is None
     assert catalog.lookup("1.2.23") is None
-    assert catalog.lookup("1.3.4").game_exe_sha256 == "3848360b7e5e56d96d20170ae8ea3f008c102ebf49d57cba81cfa8aa096b648e"
+    assert catalog.lookup("1.4.1").game_exe_sha256 == "ea9225cf73a84ccdcb2f197cfd3f7b4765e5f00c3c1bb54b4fa5bd0b30befce1"
     assert catalog.lookup("1.3.1") is None
     assert catalog.public_summary()["mode"] == "single-build-schema-normalization"
-    assert catalog.public_summary()["target_game_version"] == "1.3.4"
-    assert catalog.public_summary()["compatible_replay_versions"] == ["1.2.23", "1.3.4"]
+    assert catalog.public_summary()["target_game_version"] == "1.4.1"
+    assert catalog.public_summary()["compatible_replay_versions"] == ["1.2.23", "1.3.4", "1.4.1"]
 
 
-def test_retired_bundled_1_2_23_is_removed_but_user_import_is_preserved(tmp_path: Path) -> None:
+@pytest.mark.parametrize("retired_version", ["1.2.23", "1.3.4"])
+def test_retired_bundled_build_is_removed_but_user_import_is_preserved(tmp_path: Path, retired_version: str) -> None:
     vault = VersionVault(tmp_path / "recorder", write_catalog(tmp_path / "catalog.json"))
-    retired = vault.versions_dir / "1.2.23"
+    retired = vault.versions_dir / retired_version
     retired.mkdir(parents=True)
     (retired / "game").mkdir()
     (retired / "game" / "game.exe").write_bytes(b"old")
     (retired / "version.json").write_text(
-        json.dumps({"game_version": "1.2.23", "source": "bundled"}),
+        json.dumps({"game_version": retired_version, "source": "bundled"}),
         encoding="utf-8",
     )
 
@@ -140,7 +142,7 @@ def test_retired_bundled_1_2_23_is_removed_but_user_import_is_preserved(tmp_path
 
     retired.mkdir(parents=True)
     (retired / "version.json").write_text(
-        json.dumps({"game_version": "1.2.23", "source": "user-import"}),
+        json.dumps({"game_version": retired_version, "source": "user-import"}),
         encoding="utf-8",
     )
     vault.ensure_dirs()

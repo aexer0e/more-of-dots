@@ -1568,12 +1568,6 @@ p {
   font-weight: var(--fw-medium);
 }
 
-.event-label {
-  background: linear-gradient(90deg, rgba(126, 35, 43, 0.82) 0 48%, rgba(31, 75, 145, 0.82) 52% 100%);
-  border-color: rgba(224, 231, 244, 0.42);
-  font-weight: var(--fw-medium);
-}
-
 .replay-event-label {
   left: 50%;
   max-width: 38%;
@@ -3597,7 +3591,9 @@ mark {
 
   .region-current {
     text-align: left;
-  }}
+  }
+
+}
 
 @media (max-width: 460px) {
   .region-actions {
@@ -3606,4 +3602,10 @@ mark {
 
   .region-help {
     display: grid;
-  }}
+  }
+
+}
+
+.example-banner { display:flex; gap:12px; align-items:center; padding:5px 18px; font-size:10px; color:#afc7df; background:#5a92c412; border-bottom:1px solid var(--line); flex-shrink:0; }
+.example-banner span { color:var(--muted); }
+.custom-map-toggle { width:auto; padding:0 8px; gap:5px; font-size:11px; }

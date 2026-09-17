@@ -10,7 +10,7 @@ from typing import Any
 
 
 GZIP_MAGIC = b"\x1f\x8b"
-TARGET_GAME_VERSION = "1.3.4"
+from .version_vault import TARGET_GAME_VERSION
 REQUIRED_KEYS = {"map", "player_usernames"}
 _LEGACY_PLAYER_LABEL = re.compile(r"^(.*?)\s+\[([^\[\]]+)]$")
 
@@ -172,6 +172,14 @@ def validate_replay(raw: bytes, *, max_json_bytes: int) -> ReplayDocument:
     payload.setdefault("result", False)
     if payload.get("map") == "custom" and isinstance(payload.get("custom_map"), dict):
         payload["map"] = copy.deepcopy(payload["custom_map"])
+
+    # 1.4 adds an explicit simulation mode. Old replays use the classic rules;
+    # changing them to experiment would change unit behaviour and the outcome.
+    if not isinstance(payload.get("mode"), str) or not payload["mode"].strip():
+        map_mode = payload["map"].get("mode") if isinstance(payload["map"], dict) else None
+        payload["mode"] = map_mode or {3: "v3", 4: "v4"}.get(len(normalized_players), "1v1")
+    if isinstance(payload["map"], dict):
+        payload["map"].setdefault("motorised", [[] for _ in normalized_players])
 
     source_version = payload.get("version")
     source_version = source_version.strip() if isinstance(source_version, str) and source_version.strip() else None

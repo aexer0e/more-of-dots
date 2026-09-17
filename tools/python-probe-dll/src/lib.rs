@@ -87,7 +87,7 @@ unsafe extern "system" fn worker(parameter: *mut c_void) -> DWord {
         }
     };
 
-    let python_name = CString::new("python312.dll").expect("static string has no nul");
+    let python_name = CString::new("python314.dll").expect("static string has no nul");
     let python = (0..80).find_map(|_| {
         let handle = GetModuleHandleA(python_name.as_ptr());
         if handle.is_null() {
@@ -101,7 +101,7 @@ unsafe extern "system" fn worker(parameter: *mut c_void) -> DWord {
         write_status(
             module,
             "failed",
-            "python312.dll is not loaded in the target process.",
+            "python314.dll is not loaded in the target process.",
         );
         return 1;
     };

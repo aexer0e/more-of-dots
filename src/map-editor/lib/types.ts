@@ -9,6 +9,7 @@ export interface MapData {
   mode: Mode;
   infantry: Point[][];
   tanks: Point[][];
+  motorised: Point[][];
   cities: Point[];
   capitals: number[];
   bridges: Bridge[];
@@ -42,6 +43,7 @@ export type ToolId =
   | 'select'
   | 'infantry'
   | 'tank'
+  | 'motorised'
   | 'city'
   | 'capital'
   | 'bridge'

@@ -1,3 +1,4 @@
+import { exampleMode } from '../../platform';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Brackets, Info, Keyboard, Mouse, MousePointer2, MouseRight, Redo2, Undo2, ZoomIn, type LucideIcon } from 'lucide-react';
 import { flagAssets, getCachedImage, preloadImages, spriteAssets, uiAssets } from '../lib/assets';
@@ -70,7 +71,7 @@ interface EntityBrushSession {
   dirty: boolean;
   last: { x: number; y: number } | null;
   pointerId: number | null;
-  tool: 'infantry' | 'tank' | 'city' | 'capital' | null;
+  tool: 'infantry' | 'tank' | 'motorised' | 'city' | 'capital' | null;
   working: StoredMap | null;
 }
 
@@ -102,7 +103,7 @@ interface SelectionRect {
 }
 
 type SelectedEntityRef =
-  | { kind: 'infantry' | 'tank'; entityIndex: number; teamIndex: number }
+  | { kind: 'infantry' | 'tank' | 'motorised'; entityIndex: number; teamIndex: number }
   | { kind: 'city'; cityIndex: number };
 
 interface SelectionSession {
@@ -130,13 +131,14 @@ interface TeamMapSummary {
   fundDelta: number;
   heavyUnits: number;
   lightUnits: number;
+  motorisedUnits: number;
   teamIndex: number;
 }
 
 type HoverTarget =
   | { type: 'terrain'; label: string; terrainHex: string }
   | { type: 'bridge'; label: string; removeLabel: string; bridge: [Point, Point]; color: string }
-  | { type: 'infantry' | 'tank'; label: string; removeLabel: string; point: Point; color: string; entityIndex: number; teamIndex: number }
+  | { type: 'infantry' | 'tank' | 'motorised'; label: string; removeLabel: string; point: Point; color: string; entityIndex: number; teamIndex: number }
   | { type: 'city' | 'capital'; label: string; removeLabel: string; point: Point; color: string; cityIndex: number };
 
 const BRIDGE_COLOR = '#643C0A';
@@ -191,6 +193,7 @@ function createTeamMapSummaries(map: StoredMap, teamCount: number): TeamMapSumma
       fundDelta: 0,
       heavyUnits,
       lightUnits,
+      motorisedUnits: map.data.motorised[teamIndex]?.length ?? 0,
       teamIndex,
     };
   });
@@ -198,6 +201,7 @@ function createTeamMapSummaries(map: StoredMap, teamCount: number): TeamMapSumma
   const unitPoints = summaries.map((summary) => [
     ...(map.data.infantry[summary.teamIndex] ?? []),
     ...(map.data.tanks[summary.teamIndex] ?? []),
+    ...(map.data.motorised[summary.teamIndex] ?? []),
   ]);
 
   map.data.cities.forEach(([cityX, cityY]) => {
@@ -221,7 +225,7 @@ function createTeamMapSummaries(map: StoredMap, teamCount: number): TeamMapSumma
 
   return summaries.map((summary) => ({
     ...summary,
-    fundDelta: summary.cities * 5 - (summary.lightUnits + summary.heavyUnits),
+    fundDelta: summary.cities * 5 - (summary.lightUnits + summary.heavyUnits + summary.motorisedUnits),
   }));
 }
 
@@ -239,6 +243,8 @@ function formatTeamMapSummary(summary: TeamMapSummary) {
   if (summary.lightUnits > 0) {
     parts.push(formatUnitLabel(summary.lightUnits, 'Light Unit', 'Light Units'));
   }
+
+  if (summary.motorisedUnits > 0) parts.push(formatUnitLabel(summary.motorisedUnits, 'Shock Unit', 'Shock Units'));
 
   if (summary.heavyUnits > 0) {
     parts.push(formatUnitLabel(summary.heavyUnits, 'Heavy Unit', 'Heavy Units'));
@@ -279,12 +285,12 @@ function scaledHitRadius() {
   return scaledIconSize(HIT_RADIUS);
 }
 
-function isEntityBrushTool(toolId: ToolId): toolId is 'infantry' | 'tank' | 'city' | 'capital' {
-  return toolId === 'infantry' || toolId === 'tank' || toolId === 'city' || toolId === 'capital';
+function isEntityBrushTool(toolId: ToolId): toolId is 'infantry' | 'tank' | 'motorised' | 'city' | 'capital' {
+  return toolId === 'infantry' || toolId === 'tank' || toolId === 'motorised' || toolId === 'city' || toolId === 'capital';
 }
 
 function isMoveEntityTool(toolId: ToolId) {
-  return toolId === 'infantry' || toolId === 'tank' || toolId === 'city' || toolId === 'capital';
+  return toolId === 'infantry' || toolId === 'tank' || toolId === 'motorised' || toolId === 'city' || toolId === 'capital';
 }
 
 function toolControlSignature(toolId: ToolId) {
@@ -530,7 +536,7 @@ function hoverTargetKey(target: HoverTarget | null) {
     const [[x1, y1], [x2, y2]] = target.bridge;
     return `bridge:${x1}:${y1}:${x2}:${y2}`;
   }
-  if (target.type === 'infantry' || target.type === 'tank') {
+  if (target.type === 'infantry' || target.type === 'tank' || target.type === 'motorised') {
     return `${target.type}:${target.teamIndex}:${target.entityIndex}`;
   }
   if (target.type === 'city' || target.type === 'capital') {
@@ -551,13 +557,13 @@ function ControlGlyph({ icon: Icon }: { icon: LucideIcon }) {
 function ToolIcon({ selectedTeam, toolId }: ToolIconProps) {
   const teamColor = teamColorForIndex(selectedTeam);
 
-  if (toolId === 'infantry' || toolId === 'tank') {
+  if (toolId === 'infantry' || toolId === 'tank' || toolId === 'motorised') {
     return (
       <img
         alt=""
         className="tool-icon-image"
         draggable={false}
-        src={spriteAssets[teamColor][toolId === 'infantry' ? 'infantry' : 'tank']}
+        src={spriteAssets[teamColor][toolId]}
       />
     );
   }
@@ -861,7 +867,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
     const preloadList: string[] = [uiAssets.city, uiAssets.capital];
     for (const color of TEAM_COLORS) {
-      preloadList.push(spriteAssets[color].infantry, spriteAssets[color].tank);
+      preloadList.push(spriteAssets[color].infantry, spriteAssets[color].tank, spriteAssets[color].motorised);
       preloadList.push(flagAssets[color]);
     }
     void preloadImages(preloadList).then(() => {
@@ -1016,7 +1022,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       const k = event.key.toLowerCase();
       const map: Record<string, ToolId> = {
         b: 'terrainBrush', l: 'terrainLine', r: 'terrainRect', f: 'terrainFill', s: 'terrainShape',
-        q: 'select', i: 'infantry', t: 'tank', c: 'city', k: 'capital', g: 'bridge', e: 'erase',
+        q: 'select', i: 'infantry', t: 'tank', m: 'motorised', c: 'city', k: 'capital', g: 'bridge', e: 'erase',
       };
       if (map[k]) { activateTool(map[k]); return; }
       if (k === '[') setBrushSize((s) => Math.max(1, s - 2));
@@ -1160,6 +1166,11 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       const img = getCachedImage(spriteAssets[teamColor].tank);
       for (const [x, y] of team) drawSprite(ctx, img, x, y, scaledIconSize(SPRITE_SIZE + 4), teamAccent(ti));
     });
+    draftRef.current.data.motorised.forEach((team, ti) => {
+      const teamColor = teamColorForIndex(ti);
+      const img = getCachedImage(spriteAssets[teamColor].motorised);
+      for (const [x, y] of team) drawSprite(ctx, img, x, y, scaledIconSize(SPRITE_SIZE), teamAccent(ti));
+    });
 
     ctx.restore();
   }
@@ -1190,7 +1201,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       return map.data.infantry[entity.teamIndex]?.[entity.entityIndex] ?? null;
     }
 
-    return map.data.tanks[entity.teamIndex]?.[entity.entityIndex] ?? null;
+    return map.data[entity.kind === 'motorised' ? 'motorised' : 'tanks'][entity.teamIndex]?.[entity.entityIndex] ?? null;
   }
 
   function setSelectionEntityPoint(map: StoredMap, entity: SelectedEntityRef, point: Point) {
@@ -1208,9 +1219,8 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       return;
     }
 
-    if (map.data.tanks[entity.teamIndex]?.[entity.entityIndex]) {
-      map.data.tanks[entity.teamIndex][entity.entityIndex] = point;
-    }
+    const units = map.data[entity.kind === 'motorised' ? 'motorised' : 'tanks'];
+    if (units[entity.teamIndex]?.[entity.entityIndex]) units[entity.teamIndex][entity.entityIndex] = point;
   }
 
   function selectionRectFromEntities(map: StoredMap, entities: SelectedEntityRef[]) {
@@ -1252,7 +1262,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       return { kind: 'city', cityIndex: target.cityIndex };
     }
 
-    if (target.type === 'infantry' || target.type === 'tank') {
+    if (target.type === 'infantry' || target.type === 'tank' || target.type === 'motorised') {
       return { kind: target.type, entityIndex: target.entityIndex, teamIndex: target.teamIndex };
     }
 
@@ -1271,6 +1281,11 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     map.data.tanks.forEach((team, teamIndex) => team.forEach((point, entityIndex) => {
       if (selectionRectContainsPoint(rect, point[0], point[1])) {
         next.push({ kind: 'tank', entityIndex, teamIndex });
+      }
+    }));
+    map.data.motorised.forEach((team, teamIndex) => team.forEach((point, entityIndex) => {
+      if (selectionRectContainsPoint(rect, point[0], point[1])) {
+        next.push({ kind: 'motorised', entityIndex, teamIndex });
       }
     }));
 
@@ -1716,6 +1731,25 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
         });
       }
     }));
+    draftRef.current.data.motorised.forEach((team, teamIndex) => team.forEach((point, entityIndex) => {
+      const distance = (point[0] - x) ** 2 + (point[1] - y) ** 2;
+      if (distance <= unitRadiusSquared) {
+        const teamColor = teamColorForIndex(teamIndex);
+        const teamName = TEAM_LABELS[teamColor];
+        hits.push({
+          distance,
+          target: {
+            type: 'motorised',
+            entityIndex,
+            label: `${teamName} Shock`,
+            removeLabel: `${teamName.toLowerCase()} Shock`,
+            point,
+            color: TEAM_ACCENTS[teamColor],
+            teamIndex,
+          },
+        });
+      }
+    }));
 
     const capitalSet = new Set(draftRef.current.data.capitals);
     draftRef.current.data.cities.forEach((point, index) => {
@@ -1793,6 +1827,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     next.teamCount = n;
     next.data.infantry = Array.from({ length: n }, (_, i) => next.data.infantry[i] ?? []);
     next.data.tanks = Array.from({ length: n }, (_, i) => next.data.tanks[i] ?? []);
+    next.data.motorised = Array.from({ length: n }, (_, i) => next.data.motorised[i] ?? []);
     commitDraft(next);
   }
 
@@ -1844,60 +1879,21 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     return Math.max(scaledHitRadius(), Math.round(brushSizeRef.current / 2));
   }
 
-  function applyTankBrush(map: StoredMap, x: number, y: number) {
-    const teamIndex = selectedTeamRef.current;
-    const radiusSquared = conversionRadius() * conversionRadius();
-    const nextInfantry: Point[] = [];
-    let changed = false;
-
-    for (const point of map.data.infantry[teamIndex]) {
-      const distance = (point[0] - x) * (point[0] - x) + (point[1] - y) * (point[1] - y);
-      if (distance <= radiusSquared) {
-        map.data.tanks[teamIndex].push(point);
-        changed = true;
-      } else {
-        nextInfantry.push(point);
-      }
-    }
-
-    map.data.infantry[teamIndex] = nextInfantry;
-    return changed;
-  }
-
-  function applyInfantryBrush(map: StoredMap, x: number, y: number) {
-    const targetTeamIndex = selectedTeamRef.current;
-    const radiusSquared = conversionRadius() * conversionRadius();
+  function applyUnitBrush(map: StoredMap, destination: 'infantry' | 'tanks' | 'motorised', x: number, y: number) {
+    const targetTeam = selectedTeamRef.current;
+    const radiusSquared = conversionRadius() ** 2;
     const converted: Point[] = [];
-    let changed = false;
-
-    map.data.infantry = map.data.infantry.map((team, teamIndex) => team.filter((point) => {
-      const distance = (point[0] - x) * (point[0] - x) + (point[1] - y) * (point[1] - y);
-      if (distance > radiusSquared) {
-        return true;
-      }
-      if (teamIndex === targetTeamIndex) {
-        return true;
-      }
-      converted.push(point);
-      changed = true;
-      return false;
-    }));
-
-    map.data.tanks = map.data.tanks.map((team) => team.filter((point) => {
-      const distance = (point[0] - x) * (point[0] - x) + (point[1] - y) * (point[1] - y);
-      if (distance > radiusSquared) {
-        return true;
-      }
-      converted.push(point);
-      changed = true;
-      return false;
-    }));
-
-    if (converted.length > 0) {
-      map.data.infantry[targetTeamIndex].push(...converted);
+    for (const kind of ['infantry', 'tanks', 'motorised'] as const) {
+      map.data[kind] = map.data[kind].map((team, teamIndex) => team.filter((point) => {
+        if (kind === destination && teamIndex === targetTeam) return true;
+        if (destination !== 'infantry' && teamIndex !== targetTeam) return true;
+        if ((point[0] - x) ** 2 + (point[1] - y) ** 2 > radiusSquared) return true;
+        converted.push(point);
+        return false;
+      }));
     }
-
-    return changed;
+    map.data[destination][targetTeam].push(...converted);
+    return converted.length > 0;
   }
 
   function applyCapitalBrush(map: StoredMap, x: number, y: number) {
@@ -1940,16 +1936,17 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     return changed;
   }
 
-  function applyEntityBrushAtPoint(map: StoredMap, tool: 'infantry' | 'tank' | 'city' | 'capital', x: number, y: number) {
-    if (tool === 'infantry') return applyInfantryBrush(map, x, y);
-    if (tool === 'tank') return applyTankBrush(map, x, y);
+  function applyEntityBrushAtPoint(map: StoredMap, tool: 'infantry' | 'tank' | 'motorised' | 'city' | 'capital', x: number, y: number) {
+    if (tool === 'infantry') return applyUnitBrush(map, 'infantry', x, y);
+    if (tool === 'tank') return applyUnitBrush(map, 'tanks', x, y);
+    if (tool === 'motorised') return applyUnitBrush(map, 'motorised', x, y);
     if (tool === 'city') return applyCityBrush(map, x, y);
     return applyCapitalBrush(map, x, y);
   }
 
   function applyEntityBrushAlongSegment(
     map: StoredMap,
-    tool: 'infantry' | 'tank' | 'city' | 'capital',
+    tool: 'infantry' | 'tank' | 'motorised' | 'city' | 'capital',
     start: { x: number; y: number },
     end: { x: number; y: number },
   ) {
@@ -1990,6 +1987,12 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       const current = map.data.tanks[target.teamIndex][target.entityIndex];
       if (!current || (current[0] === x && current[1] === y)) return false;
       map.data.tanks[target.teamIndex][target.entityIndex] = nextPoint;
+      return true;
+    }
+    if (target.type === 'motorised') {
+      const current = map.data.motorised[target.teamIndex][target.entityIndex];
+      if (!current || (current[0] === x && current[1] === y)) return false;
+      map.data.motorised[target.teamIndex][target.entityIndex] = nextPoint;
       return true;
     }
 
@@ -2063,6 +2066,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     const next = cloneMapRecord(draftRef.current);
     const infantryByTeam = new Map<number, number[]>();
     const tanksByTeam = new Map<number, number[]>();
+    const motorisedByTeam = new Map<number, number[]>();
     const cityIndexes: number[] = [];
 
     for (const entity of selected) {
@@ -2071,7 +2075,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
         continue;
       }
 
-      const targetMap = entity.kind === 'infantry' ? infantryByTeam : tanksByTeam;
+      const targetMap = entity.kind === 'infantry' ? infantryByTeam : entity.kind === 'motorised' ? motorisedByTeam : tanksByTeam;
       const bucket = targetMap.get(entity.teamIndex) ?? [];
       bucket.push(entity.entityIndex);
       targetMap.set(entity.teamIndex, bucket);
@@ -2083,6 +2087,9 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
     tanksByTeam.forEach((indexes, teamIndex) => {
       indexes.sort((left, right) => right - left).forEach((index) => next.data.tanks[teamIndex]?.splice(index, 1));
+    });
+    motorisedByTeam.forEach((indexes, teamIndex) => {
+      indexes.sort((left, right) => right - left).forEach((index) => next.data.motorised[teamIndex]?.splice(index, 1));
     });
 
     cityIndexes.sort((left, right) => right - left).forEach((index) => {
@@ -2098,8 +2105,8 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   }
 
   function spaceSelectedUnitsEvenly() {
-    const selectedUnits = selectedEntitiesRef.current.filter((entity): entity is Extract<SelectedEntityRef, { kind: 'infantry' | 'tank' }> => (
-      entity.kind === 'infantry' || entity.kind === 'tank'
+    const selectedUnits = selectedEntitiesRef.current.filter((entity): entity is Extract<SelectedEntityRef, { kind: 'infantry' | 'tank' | 'motorised' }> => (
+      entity.kind === 'infantry' || entity.kind === 'tank' || entity.kind === 'motorised'
     ));
 
     if (selectedUnits.length < 2) {
@@ -2109,7 +2116,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     const next = cloneMapRecord(draftRef.current);
     const entries = selectedUnits
       .map((entity) => ({ entity, point: selectionEntityPoint(next, entity) }))
-      .filter((entry): entry is { entity: Extract<SelectedEntityRef, { kind: 'infantry' | 'tank' }>; point: Point } => entry.point !== null);
+      .filter((entry): entry is { entity: Extract<SelectedEntityRef, { kind: 'infantry' | 'tank' | 'motorised' }>; point: Point } => entry.point !== null);
 
     if (entries.length < 2) {
       return;
@@ -2196,7 +2203,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
   function eraseAt(x: number, y: number) {
     const next = cloneMapRecord(draftRef.current);
-    const hits: Array<{ kind: 'infantry' | 'tank' | 'city' | 'bridge'; teamIndex?: number; index: number; d: number }> = [];
+    const hits: Array<{ kind: 'infantry' | 'tank' | 'motorised' | 'city' | 'bridge'; teamIndex?: number; index: number; d: number }> = [];
     const hitRadius = scaledHitRadius();
     const r2 = hitRadius * hitRadius;
 
@@ -2207,6 +2214,10 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     next.data.tanks.forEach((team, ti) => team.forEach((p, i) => {
       const d = (p[0] - x) ** 2 + (p[1] - y) ** 2;
       if (d <= r2) hits.push({ kind: 'tank', teamIndex: ti, index: i, d });
+    }));
+    next.data.motorised.forEach((team, ti) => team.forEach((p, i) => {
+      const d = (p[0] - x) ** 2 + (p[1] - y) ** 2;
+      if (d <= r2) hits.push({ kind: 'motorised', teamIndex: ti, index: i, d });
     }));
     next.data.cities.forEach((p, i) => {
       const d = (p[0] - x) ** 2 + (p[1] - y) ** 2;
@@ -2223,6 +2234,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     const c = hits[0];
     if (c.kind === 'infantry' && c.teamIndex !== undefined) next.data.infantry[c.teamIndex].splice(c.index, 1);
     if (c.kind === 'tank' && c.teamIndex !== undefined) next.data.tanks[c.teamIndex].splice(c.index, 1);
+    if (c.kind === 'motorised' && c.teamIndex !== undefined) next.data.motorised[c.teamIndex].splice(c.index, 1);
     if (c.kind === 'bridge') next.data.bridges.splice(c.index, 1);
     if (c.kind === 'city') {
       next.data.cities.splice(c.index, 1);
@@ -2241,6 +2253,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
 
     if (tool === 'infantry') { next.data.infantry[team].push([x, y]); commitDraft(next); return; }
     if (tool === 'tank') { next.data.tanks[team].push([x, y]); commitDraft(next); return; }
+    if (tool === 'motorised') { next.data.motorised[team].push([x, y]); commitDraft(next); return; }
     if (tool === 'city') { next.data.cities.push([x, y]); commitDraft(next); return; }
     if (tool === 'capital') {
       next.data.cities.push([x, y]);
@@ -2770,7 +2783,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   const unitTools = TOOLS.filter((t) => t.group === 'units');
   const objectTools = TOOLS.filter((t) => t.group === 'objects');
   const orderedTeams = visibleTeamOrder(teamCount);
-  const selectedUnitCount = selectedEntities.filter((entity) => entity.kind === 'infantry' || entity.kind === 'tank').length;
+  const selectedUnitCount = selectedEntities.filter((entity) => entity.kind === 'infantry' || entity.kind === 'tank' || entity.kind === 'motorised').length;
   const liveTeamSummaries = useMemo(
     () => createTeamMapSummaries(draft, teamCount).filter((summary) => formatTeamMapSummary(summary).length > 0),
     [draft, teamCount],
@@ -2906,7 +2919,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       { id: 'redo', icon: Redo2, label: 'Redo', keys: ['Ctrl', 'Y'], action: 'Step forward one edit.' },
       { id: 'brush-brackets', icon: Brackets, label: '[ / ]', action: 'Shrink or grow the brush.' },
       { id: 'teams', icon: Keyboard, label: '1 - 4', action: 'Switch the active team color.' },
-      { id: 'tools', icon: Keyboard, label: 'Q B L R F S I T C K G E', action: 'Quick-select editor tools.' },
+      { id: 'tools', icon: Keyboard, label: 'Q B L R F S I M T C K G E', action: 'Quick-select editor tools.' },
       { id: 'hover', icon: MousePointer2, label: 'Hover', action: 'Preview the active tool at the cursor.' },
     ];
 
@@ -3029,7 +3042,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
                 </label>
                 <button className="secondary-button" type="button" onClick={resetTerrainToPlains}>Reset terrain</button>
                 <button className="primary-button" type="button" disabled={saveState === 'saving' || saveState === 'saved'} onClick={() => { void persistNow(); }}>
-                  {saveState === 'saving' ? 'Saving...' : 'Save to game'}
+                  {saveState === 'saving' ? 'Saving...' : exampleMode ? 'Save example' : 'Save to game'}
                 </button>
               </div>
               </div>

@@ -4,14 +4,14 @@
 
 - Browse, search, and download War of Dots replays
 - Back up discovered replays automatically
-- Switch game regions without the need for a VPN
-- Create and edit custom maps
+- Follow global leaderboards, track your progress, and compare players
+- Create and edit custom maps, including motorised infantry
 
 ## Replay video recorder
 
 Replay video export is provided by the optional **More of Dots Recorder** package. The main app no longer bundles the PowerShell runner, process-injection DLL, Python worker, or FFmpeg, so a recorder quarantine does not remove the replay browser.
 
-The recorder bundles only the immutable War of Dots `1.3.4` build in `%LOCALAPPDATA%\More of Dots Recorder\versions` and copies it into a disposable job runtime. Replay `1.2.23` uses the same movement/production/message schema and is normalized to `1.3.4` before launch. Missing or unknown version labels use the same structural fallback when player names and tick orders can be derived. Recordings never launch the user's live Steam `game.exe`.
+The recorder bundles only the immutable War of Dots `1.4.1` build in `%LOCALAPPDATA%\More of Dots Recorder\versions` and copies it into a disposable job runtime. Older replays are normalized to `1.4.1` before launch, including structured player names, an explicit classic game mode, and empty motorised unit lists for older custom maps. Experimental replays retain their mode, units, and orders. Missing or unknown version labels use the same structural fallback when player names and tick orders can be derived. Recordings never launch the user's live Steam `game.exe`.
 
 ### Installing and updating from the app
 
@@ -46,7 +46,7 @@ npm run build:recorder
 
 On upgrade the installer clears `payload` before extracting, because PyInstaller renames files between builds and orphans would otherwise accumulate. It skips re-extracting the game vault when a content hash marker and the build on disk both match, which is most of the install time. Silent installs report `3` when the recorder is running and `4` when files could not be written.
 
-The build requires version `1.3.4` in a populated recorder home. It uses `%LOCALAPPDATA%\More of Dots Recorder` by default; set `WOD_BUNDLED_VERSION_VAULT` to use another source. Packaging verifies `game.exe` against `wod_replay_server/supported_versions.json` and embeds that single build in the NSIS installer.
+The build requires version `1.4.1` in a populated recorder home. It uses `%LOCALAPPDATA%\More of Dots Recorder` by default; set `WOD_BUNDLED_VERSION_VAULT` to use another source. Packaging verifies `game.exe` against `wod_replay_server/supported_versions.json` and embeds that single build in the NSIS installer.
 
 Automated releases build the recorder only when the repository variables `WOD_RECORDER_VAULT_URL` and `WOD_RECORDER_VAULT_SHA256` identify an authorized ZIP whose root contains the `versions` folder. This keeps the game binaries outside source control without adding a downloader to the installed recorder.
 
@@ -95,3 +95,21 @@ During recording, the status includes replay-time progress independently of expo
 `waiting-in-queue` is an orchestration state exposed by More of Dots before a recorder process is assigned to that replay. The app emits `replay-recording-progress` events containing `sourcePath`, `queueIndex`, `step`, aggregate queue counts, and the raw recorder status under `encoder`. This lets every replay retain its own state when several recordings run concurrently.
 
 More of Dots remembers the last video destination and uses the Windows Videos folder on first use. Opening replay export never launches a folder picker; the destination can be changed from the export page. The default preset is 1080p, with 480p and 720p also available. Once submitted, selection is cleared and recording progress moves to a compact bottom-left queue so the replay browser remains interactive.
+
+## Leaderboard
+
+The Leaderboard tab replaces Region because servers are now mixed. It reads public Elo and World top-100 snapshots from `wod-nations-map.moreofdots.workers.dev`. The app reads only the username from the local game's compressed settings and highlights that player. If no saved login is available, enter an exact username once. The password is never returned to the UI or sent to the worker.
+
+Search runs locally. Compare up to ten players alongside your own rank and score over 7, 30, 90 days, or all available history. Each player keeps a distinct color. The worker samples six-hour intervals for the week view and daily intervals for longer views. Charts connect missing observations with straight lines; the recorded values table retains missing values. Axis ticks use uniform round intervals.
+
+The app persists the latest snapshot and up to 12 history queries. It combines concurrent requests, waits until the next expected snapshot before fetching again, and revalidates expired entries with ETags. Hidden tabs do not poll the network. Saved snapshots remain visible if a refresh fails. Only player histories requested by the current comparison are downloaded.
+
+## Development examples
+
+Run `npm run dev` to prepare local examples and start the web UI at `http://127.0.0.1:5173`. Startup copies the newest 100 replays at most, filling any remaining slots from the app's replay backups and skipping duplicate content. It also copies recent editor maps, and map layouts from recent replays into ignored `build/dev-data`. It also saves fresh public Elo and World rankings with all available sampled history. All three tabs are populated before Vite starts. Subsequent offline starts can reuse the last saved leaderboard snapshot.
+
+Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to `%APPDATA%\local.more-of-dots\replay-backups`; set `WOD_REPLAY_BACKUP_DIR` to use another backup folder. Only the username is read from game settings; credentials are never copied. Example edits and deletions last for the browser session and do not touch Steam files. Restarting creates fresh copies. Recorder and game-launch actions are unavailable in example mode.
+
+`npm run dev:web` runs the same example workspace. `npm run dev:desktop` opens the native development app with that example UI. Release builds use the real backend.
+
+Replay previews support embedded PNGs, old numeric map IDs, and the new relative PNG paths, including Eronion maps. Only non-vanilla maps receive the Custom badge. Shock units use the game's `motorised` storage key and infantry artwork with an upward chevron.

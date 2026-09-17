@@ -1,12 +1,84 @@
 from __future__ import annotations
 
 import sys
+import gzip
+import json
+import shutil
+import subprocess
 import threading
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from wod_replay_server.local_runner import LocalSessionRunner
+
+
+def test_replay_setup_overrides_new_game_offline_defaults() -> None:
+    content = (Path(__file__).resolve().parents[1] / "scripts/local-runner.ps1").read_text(encoding="utf-8")
+    source = "def prepare_play_scene_for_replay" + content.split(
+        "def prepare_play_scene_for_replay", 1
+    )[1].split("\ndef get_game_scene_objects", 1)[0]
+    namespace = {"attrs_of": vars, "summarize_obj": vars}
+    exec(source, namespace)
+    scene = SimpleNamespace(
+        game_type="offline", game_mode="solo", instant_start=True,
+        game_setup={"type": "offline", "mode": "solo", "campaign": False},
+    )
+    namespace["prepare_play_scene_for_replay"](scene, {"map": {"path": "assets/fahero_maps/map20.png"}})
+    assert scene.game_type == scene.game_setup["type"] == "replay"
+    assert scene.game_mode == scene.game_setup["mode"] == "replay"
+    assert scene.instant_start is False
+    assert scene.game_setup["replay_file"] == "replay1"
+    assert scene.game_setup["room"] is False
+
+
+@pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell required")
+def test_staged_config_acknowledges_target_game_not_old_replay(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    game = tmp_path / "game"
+    job = tmp_path / "job"
+    game.mkdir()
+    job.mkdir()
+    old_config = gzip.compress(b'{"welcome":true,"version":"1.3.4"}')
+    (game / "config.txt").write_bytes(old_config)
+    (job / "input.rep").write_bytes(b"test replay")
+    (job / "capture-request.json").write_text(json.dumps({
+        "replay_metadata": {"version": "1.3.4", "target_game_version": "1.4.1"},
+    }), encoding="utf-8")
+    script = tmp_path / "test-config.ps1"
+    script.write_text(r'''
+param($Runner, $Game, $Job)
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Runner, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+# Load only file/config helpers. Never execute the runner or launch the game.
+$allowed = @('New-AutomationGameConfig', 'Prepare-ReplaySlot', 'Write-GzipJsonFile', 'ConvertTo-JsonBytes', 'Read-JsonFile', 'Backup-FileIfExists', 'Restore-FileBackup', 'Restore-ReplaySlot')
+foreach ($statement in $ast.EndBlock.Statements) {
+    if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $statement.Name -in $allowed) {
+        Invoke-Expression $statement.Extent.Text
+    }
+}
+function Get-GameDir { return $Game }
+function Get-JobRoot($Id) { return $Job }
+$state = Prepare-ReplaySlot -Id 'test'
+Copy-Item -LiteralPath (Join-Path $Game 'config.txt') -Destination (Join-Path $Job 'prepared-config.gz')
+Restore-ReplaySlot $state
+''', encoding="utf-8")
+    subprocess.run([
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+        str(root / "scripts/local-runner.ps1"), str(game), str(job),
+    ], check=True, capture_output=True, text=True)
+    config = json.loads(gzip.decompress((job / "prepared-config.gz").read_bytes()))
+    assert config["version"] == "1.4.1"
+    assert config["welcome"] is False
+    assert config["login"] == {"username": None, "password": None}
+    assert config["replays"]["saved_replays"] == [1]
+    assert (game / "config.txt").read_bytes() == old_config
+    assert not (game / "replays/replay1.rep").exists()
 
 
 def test_runner_command_contains_local_capture_arguments(tmp_path: Path) -> None:

@@ -687,7 +687,7 @@ function Restore-FileBackup([string]$Path, [string]$BackupPath, [bool]$HadBackup
     }
 }
 
-function New-AutomationGameConfig($ReplaySlot, $ReplayVersion) {
+function New-AutomationGameConfig($ReplaySlot, $GameVersion) {
     return [ordered]@{
         replays = [ordered]@{ saved_replays = @($ReplaySlot) }
         login = [ordered]@{ username = $null; password = $null }
@@ -724,7 +724,7 @@ function New-AutomationGameConfig($ReplaySlot, $ReplayVersion) {
             players = 1
             chat = 0
         }
-        version = $ReplayVersion
+        version = $GameVersion
     }
 }
 
@@ -754,13 +754,18 @@ function Prepare-ReplaySlot([string]$Id) {
     $hadConfig = Backup-FileIfExists -Path $configPath -BackupPath $configBackup
     $hadSlot = Backup-FileIfExists -Path $slotPath -BackupPath $slotBackup
 
-    $version = '1.0.0'
-    if ($request -and $request.replay_metadata -and $request.replay_metadata.version) {
-        $version = [string]$request.replay_metadata.version
+    # The update acknowledgement belongs to the running game, not the source replay.
+    $version = $null
+    if ($request -and $request.replay_metadata) {
+        $version = $request.replay_metadata.target_game_version
+        if (-not $version) { $version = $request.replay_metadata.version }
+    }
+    if (-not $version) {
+        throw 'Capture request is missing the target game version.'
     }
 
     Copy-Item -LiteralPath $inputReplay -Destination $slotPath -Force
-    Write-GzipJsonFile -Path $configPath -Data (New-AutomationGameConfig -ReplaySlot 1 -ReplayVersion $version)
+    Write-GzipJsonFile -Path $configPath -Data (New-AutomationGameConfig -ReplaySlot 1 -GameVersion $version)
 
     return [ordered]@{
         input_replay = $inputReplay
@@ -4457,6 +4462,10 @@ def replay_record(replay):
     return {'name': 'replay1', 'content': replay}
 
 def prepare_play_scene_for_replay(play_scene, replay, replay_file_value=None):
+    # 1.4 separates the connection type from the game mode. Leaving the type
+    # offline starts a bot match even when the old mode field says replay.
+    setattr(play_scene, 'game_type', 'replay')
+    setattr(play_scene, 'instant_start', False)
     try:
         setattr(play_scene, 'game_mode', 'replay')
     except Exception:
@@ -4470,6 +4479,7 @@ def prepare_play_scene_for_replay(play_scene, replay, replay_file_value=None):
     attrs = attrs_of(play_scene)
     setup = attrs.get('game_setup')
     if isinstance(setup, dict):
+        setup['type'] = 'replay'
         setup['mode'] = 'replay'
         setup['room'] = False
         setup['room_info'] = {'code': None, 'public_map_room': False}

@@ -22,7 +22,8 @@ export function normalizeMode(mode: string | null | undefined): Mode {
 export function inferTeamCount(data: Partial<MapData> | null | undefined): number {
   const infantryCount = Array.isArray(data?.infantry) ? data.infantry.length : 0;
   const tankCount = Array.isArray(data?.tanks) ? data.tanks.length : 0;
-  return Math.max(2, Math.min(4, infantryCount, tankCount) || Math.max(infantryCount, tankCount, MODE_TEAMS[normalizeMode(data?.mode as string)]));
+  const motorisedCount = Array.isArray(data?.motorised) ? data.motorised.length : 0;
+  return Math.max(2, Math.min(4, Math.max(infantryCount, tankCount, motorisedCount, MODE_TEAMS[normalizeMode(data?.mode as string)])));
 }
 
 export function teamsForMap(map: Pick<StoredMap, 'teamCount' | 'data'> | null | undefined) {
@@ -91,6 +92,7 @@ export function emptyMapData(mode: Mode = '1v1', width = CANVAS_WIDTH, height = 
     mode,
     infantry: Array.from({ length: teamCount }, () => []),
     tanks: Array.from({ length: teamCount }, () => []),
+    motorised: Array.from({ length: teamCount }, () => []),
     cities: [],
     capitals: [],
     bridges: [],
@@ -128,6 +130,7 @@ export function normalizeMapData(data: unknown): MapData {
     mode,
     infantry: normalizeTeamBuckets(raw.infantry),
     tanks: normalizeTeamBuckets(raw.tanks),
+    motorised: normalizeTeamBuckets(raw.motorised),
     cities,
     capitals,
     bridges,
@@ -141,6 +144,7 @@ export function cloneMapData(mapData: MapData): MapData {
     mode: normalizeMode(mapData.mode),
     infantry: mapData.infantry.map((team) => team.map(([x, y]) => [x, y] as Point)),
     tanks: mapData.tanks.map((team) => team.map(([x, y]) => [x, y] as Point)),
+    motorised: mapData.motorised.map((team) => team.map(([x, y]) => [x, y] as Point)),
     cities: mapData.cities.map(([x, y]) => [x, y] as Point),
     capitals: [...mapData.capitals],
     bridges: mapData.bridges.map(([start, end]) => [[start[0], start[1]], [end[0], end[1]]] as Bridge),
@@ -160,6 +164,7 @@ export function scaleMapObjects(data: MapData, scaleX: number, scaleY: number): 
     ...data,
     infantry: data.infantry.map((team) => team.map((point) => scalePoint(point, scaleX, scaleY))),
     tanks: data.tanks.map((team) => team.map((point) => scalePoint(point, scaleX, scaleY))),
+    motorised: data.motorised.map((team) => team.map((point) => scalePoint(point, scaleX, scaleY))),
     cities: data.cities.map((point) => scalePoint(point, scaleX, scaleY)),
     bridges: data.bridges.map(([start, end]) => [
       scalePoint(start, scaleX, scaleY),

@@ -28,10 +28,10 @@ export const uiAssets = {
 };
 
 export const spriteAssets = {
-  blue: { infantry: blueInfantry, tank: blueTank },
-  orange: { infantry: orangeInfantry, tank: orangeTank },
-  red: { infantry: redInfantry, tank: redTank },
-  purple: { infantry: purpleInfantry, tank: purpleTank },
+  blue: { motorised: new URL('../assets/blue_shock.svg', import.meta.url).href, infantry: blueInfantry, tank: blueTank },
+  orange: { motorised: new URL('../assets/orange_shock.svg', import.meta.url).href, infantry: orangeInfantry, tank: orangeTank },
+  red: { motorised: new URL('../assets/red_shock.svg', import.meta.url).href, infantry: redInfantry, tank: redTank },
+  purple: { motorised: new URL('../assets/purple_shock.svg', import.meta.url).href, infantry: purpleInfantry, tank: purpleTank },
 } as const;
 
 export const flagAssets = {

@@ -404,7 +404,8 @@ fn describe(installed: Option<&Value>, manifest: &RecorderManifest) -> Value {
         .map(str::to_string);
     let compatible = manifest
         .protocol_versions
-        .contains(&SUPPORTED_PROTOCOL_VERSION);
+        .contains(&SUPPORTED_PROTOCOL_VERSION)
+        && manifest.game_versions.iter().any(|version| version == super::REQUIRED_RECORDER_GAME_VERSION);
     let installed_compatible = installed
         .and_then(|value| value.get("protocol_versions"))
         .and_then(Value::as_array)
@@ -414,7 +415,9 @@ fn describe(installed: Option<&Value>, manifest: &RecorderManifest) -> Value {
                 .filter_map(Value::as_u64)
                 .any(|version| version == SUPPORTED_PROTOCOL_VERSION)
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && installed.and_then(|value| value.pointer("/supported_versions/target_game_version"))
+            .and_then(Value::as_str) == Some(super::REQUIRED_RECORDER_GAME_VERSION);
 
     let update_available = match parse_version(&manifest.recorder_version) {
         None => false,
@@ -541,7 +544,7 @@ mod tests {
             schema_version: 1,
             recorder_version: version.to_string(),
             protocol_versions: protocols,
-            game_versions: vec!["1.3.4".to_string()],
+            game_versions: vec![super::super::REQUIRED_RECORDER_GAME_VERSION.to_string()],
             install: RecorderInstall {
                 url: "https://github.com/aexer0e/more-of-dots/releases/download/v1/setup.exe"
                     .to_string(),
@@ -553,7 +556,19 @@ mod tests {
     }
 
     fn installed(version: &str, protocols: Vec<u64>) -> Value {
-        json!({ "version": version, "protocol_versions": protocols })
+        json!({ "version": version, "protocol_versions": protocols,
+            "supported_versions": { "target_game_version": super::super::REQUIRED_RECORDER_GAME_VERSION } })
+    }
+
+    #[test]
+    fn retired_game_build_requires_a_recorder_update() {
+        let mut current = installed("1.2.0", vec![1]);
+        current["supported_versions"]["target_game_version"] = json!("1.3.4");
+        let status = describe(Some(&current), &manifest("1.3.0", vec![1]));
+        assert_eq!(status["update_required"], json!(true));
+        let mut old_manifest = manifest("1.2.0", vec![1]);
+        old_manifest.game_versions = vec!["1.3.4".to_string()];
+        assert_eq!(describe(None, &old_manifest)["compatible"], json!(false));
     }
 
     /// Verbatim output of `tauri signer generate` and `tauri signer sign`. Those

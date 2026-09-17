@@ -51,56 +51,14 @@ def test_owner_process_registry_is_drained_when_app_state_drops() -> None:
     assert "child.kill()" in source
 
 
-def test_job_local_game_processes_are_not_treated_as_real_user_game() -> None:
-    source = _desktop_source()
-    staged_check = source.split("fn is_staged_game_process", 1)[1].split("fn real_game_processes", 1)[0]
 
-    assert r"\staged-game\game.exe" in staged_check
-    assert "\\jobs\\" in staged_check
-    assert r"\game-runtime\game.exe" in staged_check
-
-
-def test_region_selection_uses_latency_steering_without_static_fallbacks() -> None:
-    source = _desktop_source()
-    region_payload = source.split("fn region_selection_payload", 1)[1].split("fn user_data_export_payload", 1)[0]
-    region_status = source.split("fn region_status_value", 1)[1].split("fn sample_delta_max_bytes", 1)[0]
-    select_region = source.split("fn select_region", 1)[1].split("#[tauri::command]\nasync fn get_job", 1)[0]
-
-    assert "fn fetch_game_servers_from_socket()" not in source
-    assert "fn run_game_server_lookup_flow" not in source
-    assert "GAME_SERVER_LOOKUP_WAIT" not in source
-    assert "def extract_gameservers" in source
-    assert "_codex_original_get_gameservers" in source
-    assert "collect_server_manager_classes" in source
-    assert "getattr(cls, 'get_gameservers', None)" in source
-    assert "return value" in region_payload
-    assert "def patch_create_connection" in source
-    assert "measure_ws_latency" in source
-    assert "Region steering made this latency probe unreachable." in source
-    assert "Region steering active. Queue normally." in source
-    assert "region_status" in source
-    assert "select_region" in source
-    assert "fetch_game_servers_from_socket" not in region_status
-    assert "fetch_game_servers_from_socket" not in select_region
-    assert "let selected = if game_running" in region_status
-    assert "None" in region_status
-    assert "inject_region_selection_into_game(&app, region)?" in select_region
-    assert "manualReconnectRequired" not in region_payload
-    assert "def patch_object" not in region_payload
-    assert "def maybe_reconnect" not in region_payload
-    assert "patch_module_lists" not in region_payload
-    assert "connect()" not in region_payload
-    assert "34.228.56.15" not in source
-    assert "3.64.57.116" not in source
-    assert "13.212.239.74" not in source
-
-
-def test_region_commands_are_registered_with_tauri() -> None:
+def test_retired_region_controls_cannot_be_invoked() -> None:
     source = _desktop_source()
     handler = source.split("tauri::generate_handler![", 1)[1].split("])", 1)[0]
-
-    assert "region_status" in handler
-    assert "select_region" in handler
+    assert "region_status" not in handler
+    assert "select_region" not in handler
+    assert "region_selection_payload" not in source
+    assert "leaderboard_identity" in handler
 
 
 def test_recorder_payload_is_not_bundled_with_main_app() -> None:
@@ -112,8 +70,6 @@ def test_recorder_payload_is_not_bundled_with_main_app() -> None:
     recorder_installer = (root / "scripts" / "recorder-installer.nsi").read_text(encoding="utf-8")
 
     assert "fn resolve_recorder_path()" in source
-    assert 'find_file_by_name(recorder_dir, "wod_python_probe.dll", 8)' in source
-    assert 'find_file_by_name(recorder_dir, "invoke-python-probe.ps1", 8)' in source
     assert "externalBin" not in tauri_config["bundle"]
     assert "resources" not in tauri_config["bundle"]
     assert tauri_config["build"]["beforeBuildCommand"] == "npm run build:web"
@@ -130,22 +86,3 @@ def test_recorder_payload_is_not_bundled_with_main_app() -> None:
     assert 'RMDir /r "$INSTDIR"' in recorder_installer
     assert 'StrCmp $INSTDIR "$LOCALAPPDATA\\Programs\\More of Dots Recorder"' in recorder_installer
     assert package["scripts"]["build"] == "node scripts/version.mjs tauri build && npm run size:audit"
-
-
-def test_frontend_has_region_browser_page() -> None:
-    frontend = (Path(__file__).resolve().parents[1] / "src" / "main.ts").read_text(encoding="utf-8")
-
-    assert 'type BrowserPage = "replays" | "region" | "mapEditor";' in frontend
-    assert "leaderboard" not in frontend.lower()
-    assert 'data-browser-page="region"' in frontend
-    assert 'invoke<RegionStatusPayload>("region_status")' in frontend
-    assert 'invoke<RegionStatusPayload>("select_region", { region })' in frontend
-    assert "const selectedRegion = gameRunning ? regionStatusPayload?.selectedRegion ?? null : null;" in frontend
-    assert "User data" not in frontend
-    assert "Waiting for live server list" not in frontend
-    assert "North America" in frontend
-    assert "Europe" in frontend
-    assert "Asia" in frontend
-    assert '"34.228.56.15"' not in frontend
-    assert '"3.64.57.116"' not in frontend
-    assert '"13.212.239.74"' not in frontend

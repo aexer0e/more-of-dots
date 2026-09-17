@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../../platform';
 import { cloneStoredMapRecord, mapDataForStorage } from './mapCodec';
 import type { Mode, StoredMap } from './types';
 

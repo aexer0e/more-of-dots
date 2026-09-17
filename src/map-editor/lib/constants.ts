@@ -89,6 +89,7 @@ export const TOOLS: ToolDefinition[] = [
   { id: 'bridge', label: 'Bridge', hint: 'Click two points to span a bridge.', group: 'terrain', kind: 'plain' },
   { id: 'select', label: 'Select', hint: 'Drag to select units and cities. Shift adds. Ctrl drags only the box.', group: 'units', kind: 'select' },
   { id: 'infantry', label: 'Infantry', hint: 'Place infantry for the selected team.', group: 'units', kind: 'team' },
+  { id: 'motorised', label: 'Shock', hint: 'Place Shock infantry. Shift-drag to convert units.', group: 'units', kind: 'team' },
   { id: 'tank', label: 'Tank', hint: 'Brush over infantry to convert them into tanks.', group: 'units', kind: 'team' },
   { id: 'city', label: 'City', hint: 'Place a neutral city.', group: 'objects', kind: 'plain' },
   { id: 'capital', label: 'Capital', hint: 'Brush over cities to turn them into capitals.', group: 'objects', kind: 'plain' },

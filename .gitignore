@@ -37,3 +37,4 @@ tools/python-probe-dll/target/
 *.log
 out.txt
 err.txt
+traces/

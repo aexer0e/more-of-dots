@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -32,6 +32,7 @@ use recorder_update::RecorderInstallControl;
 const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
 const FPS: f64 = 30.0;
 const GAME_DIR_NAME: &str = "War of Dots";
+const REQUIRED_RECORDER_GAME_VERSION: &str = "1.4.1";
 const DEFAULT_SAMPLE_DELTA_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SAMPLE_DELTA_RECORDS: usize = 600;
@@ -43,11 +44,10 @@ const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
 const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
-const REPLAY_INDEX_VERSION: u32 = 2;
-const RED_BLUE_EVENT_LABEL: &str = "World";
-const REGION_SELECTION_WAIT: Duration = Duration::from_secs(8);
-const REGION_NAMES: [&str; 3] = ["NA", "EU", "ASIA"];
+const REPLAY_INDEX_VERSION: u32 = 3;
+
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 
 #[derive(Default)]
 struct WindowOwnerProcesses {
@@ -64,6 +64,17 @@ struct ReplayRecordingControlState {
     active: bool,
     cancel_requested: bool,
     current_cancel_paths: HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+struct ReplayMediaCatalog {
+    thumbnails: Mutex<HashMap<String, ReplayThumbnailSource>>,
+}
+
+#[derive(Clone, Debug)]
+enum ReplayThumbnailSource {
+    Base64(String),
+    File(PathBuf),
 }
 
 fn spawn_owner_process(label: &str) -> Result<Child, String> {
@@ -161,7 +172,10 @@ struct ReplaySummary {
     draw: bool,
     length: String,
     duration_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     thumbnail_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail_key: Option<String>,
     modified: u64,
     score_delta: Option<i64>,
     #[serde(default)]
@@ -234,24 +248,17 @@ struct ReplayListPayload {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ReplayThumbnailPath {
+    thumbnail_key: String,
+    file_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ReplayUploadResult {
     file_name: String,
     replay_path: String,
     backup_path: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RegionSelection {
-    region: String,
-    selected_at: u64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct WindowsGameProcess {
-    process_id: Option<u32>,
-    executable_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -288,13 +295,6 @@ fn read_json_file(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = app_runtime_dir(app)?.join(REPLAY_BACKUP_DIR_NAME);
     fs::create_dir_all(&path).map_err(|error| error.to_string())?;
@@ -303,10 +303,6 @@ fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn replay_index_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_runtime_dir(app)?.join(REPLAY_INDEX_FILE_NAME))
-}
-
-fn region_selection_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_runtime_dir(app)?.join("region-selection.json"))
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -471,10 +467,12 @@ fn dedupe_replay_candidates_by_hash(
     (candidates, errors)
 }
 
-fn collect_replay_candidates(app: &AppHandle) -> Result<Vec<ReplayCandidate>, String> {
+fn collect_replay_candidates(
+    app: &AppHandle,
+    replay_index: &ReplayIndexStore,
+) -> Result<Vec<ReplayCandidate>, String> {
     let replay_dirs = discover_replay_dirs();
     let fallback_thumbnail_dir = replay_dirs.first().cloned();
-    let replay_index = load_replay_index(&replay_index_path(app)?);
     let mut candidates: BTreeMap<String, ReplayCandidate> = BTreeMap::new();
 
     for replay_dir in &replay_dirs {
@@ -626,630 +624,8 @@ fn parse_replay_candidate(
     Ok((parsed, entry))
 }
 
-fn load_region_selection(path: &Path) -> Option<RegionSelection> {
-    read_json_file(path).and_then(|value| serde_json::from_value(value).ok())
-}
-
-fn write_region_selection(path: &Path, selection: &RegionSelection) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(selection).map_err(|error| error.to_string())?;
-    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
-}
-
-fn run_hidden_powershell(script: &str) -> Result<std::process::Output, String> {
-    let mut command = Command::new("powershell.exe");
-    command
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .spawn()
-        .and_then(|child| child.wait_with_output())
-        .map_err(|error| format!("Could not run PowerShell helper: {error}"))
-}
-
-fn parse_game_processes_json(text: &str) -> Vec<WindowsGameProcess> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return Vec::new();
-    };
-    match value {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|item| serde_json::from_value(item).ok())
-            .collect(),
-        Value::Object(_) => serde_json::from_value(value).ok().into_iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn game_processes() -> Vec<WindowsGameProcess> {
-    if !cfg!(windows) {
-        return Vec::new();
-    }
-
-    let output = run_hidden_powershell(
-        "Get-CimInstance Win32_Process -Filter \"Name = 'game.exe'\" | \
-         Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Depth 4 -Compress",
-    );
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    parse_game_processes_json(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn is_staged_game_process(process: &WindowsGameProcess) -> bool {
-    process
-        .executable_path
-        .as_deref()
-        .map(path_key_from_str)
-        .is_some_and(|path| {
-            path.contains(r"\staged-game\game.exe")
-                || path.contains(r"\jobs\") && path.contains(r"\game-runtime\game.exe")
-        })
-}
-
-fn real_game_processes() -> Vec<WindowsGameProcess> {
-    game_processes()
-        .into_iter()
-        .filter(|process| process.process_id.unwrap_or(0) > 0)
-        .filter(|process| !is_staged_game_process(process))
-        .collect()
-}
-
-fn real_game_is_running() -> bool {
-    !real_game_processes().is_empty()
-}
-
 fn path_key_from_str(value: &str) -> String {
     value.replace('/', r"\").to_ascii_lowercase()
-}
-
-fn repo_root_from_cwd() -> Option<PathBuf> {
-    let mut path = env::current_dir().ok()?;
-    loop {
-        if path
-            .join("scripts")
-            .join("invoke-python-probe.ps1")
-            .is_file()
-            && path
-                .join("tools")
-                .join("python-probe-dll")
-                .join("target")
-                .join("release")
-                .join("wod_python_probe.dll")
-                .is_file()
-        {
-            return Some(path);
-        }
-        if !path.pop() {
-            return None;
-        }
-    }
-}
-
-fn find_file_by_name(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
-    if max_depth == 0 || !root.is_dir() {
-        return None;
-    }
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
-            && path.is_file()
-        {
-            return Some(path);
-        }
-        if path.is_dir() {
-            if let Some(found) = find_file_by_name(&path, file_name, max_depth - 1) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn find_python_probe_dll(_app: &AppHandle) -> Option<PathBuf> {
-    if let Some(path) = env::var_os("WOD_PYTHON_PROBE_DLL").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(recorder_path) = resolve_recorder_path() {
-        if let Some(recorder_dir) = recorder_path.parent() {
-            if let Some(path) = find_file_by_name(recorder_dir, "wod_python_probe.dll", 8) {
-                candidates.push(path);
-            }
-        }
-    }
-    if let Some(root) = repo_root_from_cwd() {
-        candidates.push(
-            root.join("tools")
-                .join("python-probe-dll")
-                .join("target")
-                .join("release")
-                .join("wod_python_probe.dll"),
-        );
-    }
-
-    candidates.into_iter().find(|path| path.is_file())
-}
-
-fn find_python_probe_injector(_app: &AppHandle) -> Option<PathBuf> {
-    if let Some(path) = env::var_os("WOD_PYTHON_PROBE_INJECTOR").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(recorder_path) = resolve_recorder_path() {
-        if let Some(recorder_dir) = recorder_path.parent() {
-            if let Some(path) = find_file_by_name(recorder_dir, "invoke-python-probe.ps1", 8) {
-                candidates.push(path);
-            }
-        }
-    }
-    if let Some(root) = repo_root_from_cwd() {
-        candidates.push(root.join("scripts").join("invoke-python-probe.ps1"));
-    }
-    candidates.into_iter().find(|path| path.is_file())
-}
-
-fn quote_ps_arg(value: &Path) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
-}
-
-fn python_raw_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
-fn region_selection_payload(output_path: &Path, region: &str) -> String {
-    let escaped_output = python_raw_string(&output_path.to_string_lossy());
-    let escaped_region = python_raw_string(region);
-    r#"
-import gc
-import inspect
-import json
-import os
-import sys
-import time
-import traceback
-
-OUTPUT_PATH = r'''__OUTPUT_PATH__'''
-REGION = r'''__REGION__'''
-REGION_NAMES = ['NA', 'EU', 'ASIA']
-STEERING_KEY = '_codex_region_steering'
-CREATE_CONNECTION_ORIGINAL = '_codex_original_create_connection'
-GET_GAMESERVERS_ORIGINAL = '_codex_original_get_gameservers'
-
-def jsonable(value, depth=3, seen=None):
-    if seen is None:
-        seen = set()
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    ident = id(value)
-    if ident in seen:
-        return '<cycle>'
-    seen.add(ident)
-    if depth <= 0:
-        return repr(value)[:160]
-    if isinstance(value, dict):
-        return {str(key): jsonable(child, depth - 1, seen) for key, child in list(value.items())[:24]}
-    if isinstance(value, (list, tuple, set)):
-        return [jsonable(item, depth - 1, seen) for item in list(value)[:12]]
-    attrs = getattr(value, '__dict__', None)
-    if isinstance(attrs, dict):
-        return jsonable(attrs, depth - 1, seen)
-    return repr(value)[:160]
-
-def steering_state(module):
-    state = getattr(module, STEERING_KEY, None)
-    if not isinstance(state, dict):
-        state = {}
-        setattr(module, STEERING_KEY, state)
-    state.update({
-        'region': REGION,
-        'selectedIndex': REGION_NAMES.index(REGION) if REGION in REGION_NAMES else None,
-        'updatedAt': int(time.time()),
-    })
-    state.setdefault('servers', [])
-    state.setdefault('selectedServerUrl', None)
-    state.setdefault('serversSource', None)
-    state.setdefault('blockedLatencyUrls', [])
-    return state
-
-def write_result(result):
-    result['region'] = REGION
-    selected = result.get('selectedServerUrl')
-    if selected:
-        result['selectedServerUrl'] = selected
-    result['writtenAt'] = int(time.time())
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    temp_path = OUTPUT_PATH + '.tmp'
-    with open(temp_path, 'w', encoding='utf-8') as handle:
-        json.dump(result, handle, indent=2, default=str)
-    os.replace(temp_path, OUTPUT_PATH)
-
-def normalize_servers(value):
-    if not isinstance(value, (list, tuple)):
-        return None
-    servers = []
-    for item in value:
-        if isinstance(item, str) and item.strip().startswith('ws://'):
-            servers.append(item.strip())
-    return servers or None
-
-def extract_gameservers(value, depth=5):
-    if depth <= 0:
-        return None
-    servers = normalize_servers(value)
-    if servers:
-        return servers
-    if isinstance(value, dict):
-        if 'gameservers' in value:
-            servers = extract_gameservers(value.get('gameservers'), depth - 1)
-            if servers:
-                return servers
-        for key in ('content', 'data', 'response', 'result', 'payload'):
-            if key in value:
-                servers = extract_gameservers(value.get(key), depth - 1)
-                if servers:
-                    return servers
-        for child in value.values():
-            servers = extract_gameservers(child, depth - 1)
-            if servers:
-                return servers
-    elif isinstance(value, (list, tuple)):
-        for child in value:
-            servers = extract_gameservers(child, depth - 1)
-            if servers:
-                return servers
-    else:
-        attrs = getattr(value, '__dict__', None)
-        if isinstance(attrs, dict):
-            return extract_gameservers(attrs, depth - 1)
-    return None
-
-def likely_game_server_list(value):
-    return bool(normalize_servers(value))
-
-def record_servers(module, result, value, source):
-    servers = extract_gameservers(value)
-    if not servers:
-        return None
-    state = steering_state(module)
-    selected_index = state.get('selectedIndex')
-    selected_url = servers[selected_index] if isinstance(selected_index, int) and selected_index < len(servers) else None
-    state['servers'] = list(servers)
-    state['selectedServerUrl'] = selected_url
-    state['serversSource'] = source
-    result['serverCount'] = len(servers)
-    result['serversSource'] = source
-    if selected_url:
-        result['selectedServerUrl'] = selected_url
-    return servers
-
-def collect_server_manager_classes(module):
-    classes = []
-    seen_classes = set()
-
-    def add_class(candidate):
-        if candidate is None or not isinstance(candidate, type):
-            return
-        ident = id(candidate)
-        if ident not in seen_classes and callable(getattr(candidate, 'get_gameservers', None)):
-            seen_classes.add(ident)
-            classes.append(candidate)
-
-    add_class(getattr(module, 'ServerManager', None))
-    for value in list(vars(module).values()):
-        if type(value).__name__ == 'ServerManager':
-            add_class(type(value))
-    for value in gc.get_objects():
-        try:
-            if type(value).__name__ == 'ServerManager':
-                add_class(type(value))
-        except Exception:
-            pass
-    return classes
-
-def patch_server_manager_classes(module, classes, result):
-    def make_wrapper(cls, original):
-        def get_gameservers(self, *args, **kwargs):
-            value = original(self, *args, **kwargs)
-            record_servers(module, result, value, '%s.get_gameservers' % getattr(cls, '__name__', 'ServerManager'))
-            return value
-        setattr(get_gameservers, '_codex_region_steering_wrapper', True)
-        return get_gameservers
-
-    for cls in classes:
-        try:
-            current = getattr(cls, 'get_gameservers', None)
-            original = getattr(cls, GET_GAMESERVERS_ORIGINAL, None)
-            if original is None:
-                original = current
-                if original is not None:
-                    setattr(cls, GET_GAMESERVERS_ORIGINAL, original)
-            if callable(original):
-                setattr(cls, 'get_gameservers', make_wrapper(cls, original))
-                result['patchedServerManager'] = True
-                result['patchedServerManagerClasses'].append(getattr(cls, '__name__', 'ServerManager'))
-            else:
-                result['notes'].append('ServerManager.get_gameservers was not callable.')
-            result['patchedClasses'].append('%s.get_gameservers' % getattr(cls, '__name__', 'ServerManager'))
-        except Exception as exc:
-            result['notes'].append('Could not patch %s.get_gameservers: %r' % (getattr(cls, '__name__', 'ServerManager'), exc))
-
-def in_latency_measurement():
-    frame = inspect.currentframe()
-    while frame is not None:
-        if frame.f_code.co_name == 'measure_ws_latency':
-            return True
-        frame = frame.f_back
-    return False
-
-def connection_url(args, kwargs):
-    if args:
-        return args[0]
-    return kwargs.get('url')
-
-def websocket_exception_class():
-    for module_name in ('websocket', 'websocket._exceptions'):
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        for name in ('WebSocketException', 'WebSocketConnectionClosedException', 'WebSocketTimeoutException'):
-            candidate = getattr(module, name, None)
-            if isinstance(candidate, type):
-                return candidate
-    return RuntimeError
-
-def should_shape_latency(module, url):
-    if not isinstance(url, str) or not in_latency_measurement():
-        return False
-    state = steering_state(module)
-    servers = state.get('servers') or []
-    selected = state.get('selectedServerUrl')
-    if not selected or url not in servers:
-        return False
-    return url != selected
-
-def make_create_connection_wrapper(module, result, original, label):
-    def create_connection(*args, **kwargs):
-        url = connection_url(args, kwargs)
-        if should_shape_latency(module, url):
-            state = steering_state(module)
-            if url not in state['blockedLatencyUrls']:
-                state['blockedLatencyUrls'].append(url)
-            result['blockedLatencyUrls'] = list(state['blockedLatencyUrls'])
-            time.sleep(0.25)
-            raise websocket_exception_class()('Region steering made this latency probe unreachable.')
-        return original(*args, **kwargs)
-    setattr(create_connection, '_codex_region_steering_wrapper', True)
-    setattr(create_connection, '_codex_region_steering_label', label)
-    return create_connection
-
-def patch_create_connection_owner(module, result, owner, attr, label):
-    if owner is None:
-        return
-    try:
-        current = getattr(owner, attr, None)
-        if not callable(current):
-            return
-        original = getattr(owner, CREATE_CONNECTION_ORIGINAL, None)
-        if original is None:
-            original = current
-            setattr(owner, CREATE_CONNECTION_ORIGINAL, original)
-        if not callable(original):
-            return
-        setattr(owner, attr, make_create_connection_wrapper(module, result, original, label))
-        result['patchedCreateConnection'] = True
-        result['patchedCreateConnectionTargets'].append(label)
-    except Exception as exc:
-        result['notes'].append('Could not patch %s: %r' % (label, exc))
-
-def patch_create_connection(module, result):
-    patch_create_connection_owner(module, result, module, 'create_connection', '__main__.create_connection')
-    websocket_module = sys.modules.get('websocket')
-    patch_create_connection_owner(module, result, websocket_module, 'create_connection', 'websocket.create_connection')
-    websocket_core = sys.modules.get('websocket._core')
-    patch_create_connection_owner(module, result, websocket_core, 'create_connection', 'websocket._core.create_connection')
-
-def main():
-    module = sys.modules.get('__main__')
-    result = {
-        'status': 'armed',
-        'selectedRegion': REGION,
-        'patchedClasses': [],
-        'patchedServerManager': False,
-        'patchedServerManagerClasses': [],
-        'patchedCreateConnection': False,
-        'patchedCreateConnectionTargets': [],
-        'blockedLatencyUrls': [],
-        'notes': [],
-    }
-    if module is None:
-        result['status'] = 'failed'
-        result['notes'].append('__main__ module was not available')
-        write_result(result)
-        return
-    if REGION not in REGION_NAMES:
-        result['status'] = 'invalid_region'
-        result['notes'].append('Region must be NA, EU, or ASIA.')
-        write_result(result)
-        return
-
-    state = steering_state(module)
-    result['selectedIndex'] = state.get('selectedIndex')
-    result['selectedServerUrl'] = state.get('selectedServerUrl')
-    result['serverCount'] = len(state.get('servers') or [])
-    result['serversSource'] = state.get('serversSource')
-
-    classes = collect_server_manager_classes(module)
-    result['serverManagerClassCount'] = len(classes)
-    patch_server_manager_classes(module, classes, result)
-    patch_create_connection(module, result)
-    result['message'] = 'Region steering active. Queue normally.'
-    write_result(result)
-
-try:
-    main()
-except Exception as exc:
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH + '.error.txt', 'w', encoding='utf-8') as handle:
-        handle.write(repr(exc) + '\n' + traceback.format_exc())
-"#
-    .replace("__OUTPUT_PATH__", &escaped_output)
-    .replace("__REGION__", &escaped_region)
-}
-
-fn region_index(region: &str) -> Option<usize> {
-    REGION_NAMES
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(region.trim()))
-}
-
-fn normalize_region(region: &str) -> Result<&'static str, String> {
-    region_index(region)
-        .map(|index| REGION_NAMES[index])
-        .ok_or_else(|| "Region must be NA, EU, or ASIA.".to_string())
-}
-
-fn inject_region_selection_into_game(app: &AppHandle, region: &str) -> Result<Value, String> {
-    let process = real_game_processes()
-        .into_iter()
-        .next()
-        .ok_or_else(|| "War of Dots is not running.".to_string())?;
-    let process_id = process
-        .process_id
-        .ok_or_else(|| "War of Dots process id was unavailable.".to_string())?;
-
-    let source_dll = find_python_probe_dll(app).ok_or_else(|| {
-        "Python probe DLL is missing; build tools\\python-probe-dll first.".to_string()
-    })?;
-    let injector = find_python_probe_injector(app)
-        .ok_or_else(|| "Python probe injector script is missing.".to_string())?;
-
-    let probe_root = app_runtime_dir(app)?
-        .join("probes")
-        .join("region-selection");
-    fs::create_dir_all(&probe_root).map_err(|error| error.to_string())?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let probe_dll = probe_root.join(format!("wod_python_probe_{unique}.dll"));
-    let payload_path = probe_root.join("wod_python_probe_payload.py");
-    let output_path = probe_root.join("region-selection-result.json");
-    let status_path = probe_root.join("wod_python_probe.status.json");
-    let _ = fs::remove_file(&output_path);
-    let _ = fs::remove_file(output_path.with_extension("json.error.txt"));
-    let _ = fs::remove_file(&status_path);
-    fs::copy(&source_dll, &probe_dll).map_err(|error| {
-        format!(
-            "Could not stage Python probe DLL {} to {}: {error}",
-            source_dll.display(),
-            probe_dll.display()
-        )
-    })?;
-    fs::write(
-        &payload_path,
-        region_selection_payload(&output_path, region),
-    )
-    .map_err(|error| format!("Could not write {}: {error}", payload_path.display()))?;
-
-    let script = format!(
-        "& {} -ProcessId {} -ProbeDll {} -TimeoutSeconds 10",
-        quote_ps_arg(&injector),
-        process_id,
-        quote_ps_arg(&probe_dll)
-    );
-    let output = run_hidden_powershell(&script)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "Region selection probe injection failed: {}",
-            if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            }
-        ));
-    }
-
-    let deadline = Instant::now() + REGION_SELECTION_WAIT;
-    while Instant::now() < deadline {
-        if output_path.is_file() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    let value = read_json_file(&output_path).ok_or_else(|| {
-        let status = read_json_file(&status_path)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "no probe status".to_string());
-        format!("Region selection probe did not produce a result ({status}).")
-    })?;
-    match value.get("status").and_then(Value::as_str) {
-        Some("armed") => {}
-        Some("invalid_region") => {
-            return Err("Region must be NA, EU, or ASIA.".to_string());
-        }
-        Some("failed") => {
-            return Err(value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Region steering probe could not be armed.")
-                .to_string());
-        }
-        _ => {
-            return Err("Region steering probe returned an unexpected result.".to_string());
-        }
-    }
-    Ok(value)
-}
-
-fn region_status_value(app: &AppHandle) -> Result<Value, String> {
-    let game_running = real_game_is_running();
-    let selection_path = region_selection_path(app)?;
-    let selected = if game_running {
-        load_region_selection(&selection_path)
-    } else {
-        None
-    };
-    let message = if game_running {
-        "War of Dots detected. Choose a region to apply it live."
-    } else {
-        "Start War of Dots to apply a region."
-    };
-
-    Ok(json!({
-        "gameRunning": game_running,
-        "selectedRegion": selected.as_ref().map(|selection| selection.region.clone()),
-        "selectedAt": selected.as_ref().map(|selection| selection.selected_at),
-        "message": message,
-    }))
 }
 
 fn sample_delta_max_bytes() -> usize {
@@ -1315,9 +691,81 @@ fn steam_game_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STEAM_GAME_DIR))
 }
 
+#[cfg(test)]
 fn png_data_url(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     Some(format!("data:image/png;base64,{}", BASE64.encode(bytes)))
+}
+
+fn sha256_text(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn media_cache_dir(app: &AppHandle, category: &str) -> Result<PathBuf, String> {
+    let path = app_runtime_dir(app)?.join("media-cache").join(category);
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn cache_media_file(app: &AppHandle, category: &str, source: &Path) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(source)
+        .map_err(|error| format!("Could not inspect {}: {error}", source.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("Media file does not exist: {}", source.display()));
+    }
+    let signature = format!(
+        "{}|{}|{}",
+        path_key(source),
+        metadata.len(),
+        metadata.modified().map(system_time_millis).unwrap_or(0)
+    );
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| {
+            value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or("bin");
+    let destination =
+        media_cache_dir(app, category)?.join(format!("{}.{}", sha256_text(&signature), extension));
+    let current_length = fs::metadata(&destination).ok().map(|value| value.len());
+    if current_length != Some(metadata.len()) {
+        fs::copy(source, &destination).map_err(|error| {
+            format!(
+                "Could not cache media {} as {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(destination)
+}
+
+fn cache_base64_png(
+    app: &AppHandle,
+    category: &str,
+    cache_key: &str,
+    encoded: &str,
+) -> Result<PathBuf, String> {
+    let payload = encoded
+        .split_once(",")
+        .filter(|(prefix, _)| prefix.starts_with("data:") && prefix.ends_with(";base64"))
+        .map(|(_, payload)| payload)
+        .unwrap_or(encoded);
+    let destination = media_cache_dir(app, category)?.join(format!("{cache_key}.png"));
+    if destination.is_file() {
+        return Ok(destination);
+    }
+    let bytes = BASE64
+        .decode(payload.as_bytes())
+        .map_err(|error| format!("Could not decode cached PNG data: {error}"))?;
+    fs::write(&destination, bytes)
+        .map_err(|error| format!("Could not write {}: {error}", destination.display()))?;
+    Ok(destination)
 }
 
 fn discover_replay_dirs() -> Vec<PathBuf> {
@@ -1461,7 +909,8 @@ fn map_team_count(data: &Value) -> usize {
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
-    infantry.max(tanks).clamp(2, 4)
+    let motorised = data.get("motorised").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    infantry.max(tanks).max(motorised).clamp(2, 4)
 }
 
 fn map_dimensions(data: &Value) -> (u32, u32) {
@@ -1513,6 +962,7 @@ fn default_game_map_value(mode: &str) -> Result<Value, String> {
         "mode": mode,
         "infantry": vec![Vec::<Value>::new(); team_count],
         "tanks": vec![Vec::<Value>::new(); team_count],
+        "motorised": vec![Vec::<Value>::new(); team_count],
         "cities": Vec::<Value>::new(),
         "capitals": Vec::<Value>::new(),
         "bridges": Vec::<Value>::new(),
@@ -1825,11 +1275,7 @@ fn replay_home_player(
         .filter_map(|player| {
             candidates
                 .iter()
-                .find(|candidate| {
-                    candidate
-                        .normalized_name
-                        .eq_ignore_ascii_case(&player.name)
-                })
+                .find(|candidate| candidate.normalized_name.eq_ignore_ascii_case(&player.name))
                 .map(|candidate| (player, candidate.replay_count))
         })
         .collect::<Vec<_>>();
@@ -1914,12 +1360,16 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
         summary: ReplaySummary {
             file_name,
             file_path: path.to_string_lossy().to_string(),
-            version: raw.get("version").and_then(Value::as_str).map(str::to_string),
+            version: raw
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             players,
             draw: result.as_ref().is_some_and(replay_result_is_draw),
             length: format_duration_seconds(duration_seconds),
             duration_seconds,
             thumbnail_data_url: None,
+            thumbnail_key: None,
             modified,
             score_delta: None,
             event_label: replay_event_label(&raw),
@@ -1930,61 +1380,25 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
     })
 }
 
-fn replay_event_label(raw: &Value) -> Option<String> {
-    is_red_blue_event_replay(raw).then(|| RED_BLUE_EVENT_LABEL.to_string())
+// Official image paths and embedded PNGs from the shipped vanilla map collection.
+fn vanilla_map_catalog() -> &'static Value {
+    static CATALOG: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| serde_json::from_str(include_str!("vanilla-maps.json")).expect("vanilla catalog"))
 }
 
-fn is_red_blue_event_replay(raw: &Value) -> bool {
-    let Some(map) = raw.get("map").and_then(Value::as_object) else {
-        return false;
-    };
-    if map.get("mode").and_then(Value::as_str) != Some("1v1")
-        || map
-            .get("map_surface")
-            .and_then(Value::as_str)
-            .and_then(png_dimensions_from_base64)
-            != Some((960, 540))
-        || map
-            .get("bridges")
-            .and_then(Value::as_array)
-            .is_none_or(|bridges| !bridges.is_empty())
-    {
-        return false;
-    }
-
-    let Some(cities) = map.get("cities").and_then(Value::as_array) else {
-        return false;
-    };
-    let (infantry_per_team, tanks_per_team) = match cities.len() {
-        8 => (16, 4),
-        10 => (20, 5),
-        _ => return false,
-    };
-    let has_equal_teams = |key: &str, units_per_team: usize| {
-        map.get(key).and_then(Value::as_array).is_some_and(|teams| {
-            teams.len() == 2
-                && teams.iter().all(|team| {
-                    team.as_array()
-                        .is_some_and(|units| units.len() == units_per_team)
-                })
+fn replay_event_label(raw: &Value) -> Option<String> {
+    let vanilla = if let Some(surface) = custom_map_surface(raw) {
+        let payload = surface.strip_prefix("data:image/png;base64,").unwrap_or(&surface);
+        BASE64.decode(payload).ok().is_some_and(|bytes| {
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            vanilla_map_catalog()["pngHashes"].as_array()
+                .is_some_and(|hashes| hashes.iter().any(|entry| entry.as_str() == Some(&hash)))
         })
-    };
-    let valid_capitals = map
-        .get("capitals")
-        .and_then(Value::as_array)
-        .is_some_and(|capitals| {
-            capitals.len() == 2
-                && capitals[0] != capitals[1]
-                && capitals.iter().all(|capital| {
-                    capital
-                        .as_u64()
-                        .is_some_and(|index| index < cities.len() as u64)
-                })
-        });
-
-    has_equal_teams("infantry", infantry_per_team)
-        && has_equal_teams("tanks", tanks_per_team)
-        && valid_capitals
+    } else if let Some(id) = replay_map_id(raw) {
+        id.chars().all(|c| c.is_ascii_digit()) || vanilla_map_catalog()["paths"]
+            .as_array().is_some_and(|paths| paths.iter().any(|path| path.as_str() == Some(&id)))
+    } else { false };
+    (!vanilla && raw.get("map").is_some()).then(|| "Custom".to_string())
 }
 
 fn replay_player_names(raw: &Value) -> Vec<String> {
@@ -2171,6 +1585,7 @@ fn replay_map_id(raw: &Value) -> Option<String> {
     let id = match map {
         Value::String(text) => text.trim().to_string(),
         Value::Number(number) => number.to_string(),
+        Value::Object(map) => map.get("path")?.as_str()?.trim().replace('\\', "/"),
         _ => return None,
     };
 
@@ -2187,51 +1602,54 @@ fn custom_map_surface(raw: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn thumbnail_for_replay(
+fn thumbnail_source_for_replay(
     replay_dir: &Path,
     replay: &ParsedReplay,
-    map_cache: &mut HashMap<String, Option<String>>,
-) -> Option<String> {
+) -> Option<(String, ReplayThumbnailSource)> {
     if let Some(surface) = replay.custom_map_surface.as_deref() {
-        if surface.starts_with("data:image/") {
-            return Some(surface.to_string());
-        }
-
-        return Some(format!("data:image/png;base64,{surface}"));
+        let payload = surface
+            .split_once(',')
+            .filter(|(prefix, _)| prefix.starts_with("data:") && prefix.ends_with(";base64"))
+            .map(|(_, payload)| payload)
+            .unwrap_or(surface);
+        let key = format!("custom-{}", sha256_text(payload));
+        return Some((key, ReplayThumbnailSource::Base64(payload.to_string())));
     }
 
     let map_id = replay.map_id.as_deref()?;
     let game_root = replay_dir.parent()?;
-    let cache_key = format!("{}|{map_id}", path_key(game_root));
-    if let Some(cached) = map_cache.get(&cache_key) {
-        return cached.clone();
-    }
-
-    let data_url = map_image_data_url(game_root, map_id);
-    map_cache.insert(cache_key, data_url.clone());
-    data_url
+    let path = map_image_path(game_root, map_id)?;
+    let metadata = path.metadata().ok()?;
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    let key = format!("map-{}", sha256_text(&format!("{}:{}:{modified}", path_key(&path), metadata.len())));
+    Some((key, ReplayThumbnailSource::File(path)))
 }
 
-fn map_image_data_url(game_root: &Path, map_id: &str) -> Option<String> {
-    let safe_map_id = map_id
-        .chars()
-        .filter(|character| character.is_ascii_digit())
-        .collect::<String>();
-    if safe_map_id.is_empty() {
-        return None;
+fn map_image_path(game_root: &Path, map_id: &str) -> Option<PathBuf> {
+    let normalized = map_id.replace('\\', "/");
+    if normalized.ends_with(".png") {
+        // Replays are untrusted. Only relative map image paths within the game are allowed.
+        if normalized.split('/').any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
+            || !(normalized.starts_with("assets/") || normalized.starts_with("map_editor/")) {
+            return None;
+        }
+        let root = game_root.canonicalize().ok()?;
+        let path = root.join(normalized).canonicalize().ok()?;
+        return (path.starts_with(&root) && path.is_file()).then_some(path);
     }
+    if normalized.is_empty() || !normalized.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let file_name = format!("map{normalized}.png");
+    let assets = game_root.join("assets");
+    [assets.join("fahero_maps").join(&file_name),
+     assets.join("zolamare_maps").join(&file_name),
+     assets.join("eronion_maps").join(&file_name),
+     game_root.join("map_editor").join(format!("generated_map{normalized}.png"))]
+        .into_iter().find(|path| path.is_file())
+}
 
-    let file_name = format!("map{safe_map_id}.png");
-    let assets_root = game_root.join("assets");
-    [
-        assets_root.join("fahero_maps").join(&file_name),
-        assets_root.join("zolamare_maps").join(&file_name),
-        game_root
-            .join("map_editor")
-            .join(format!("generated_map{safe_map_id}.png")),
-    ]
-    .into_iter()
-    .find_map(|path| png_data_url(&path))
+#[cfg(test)]
+fn map_image_data_url(game_root: &Path, map_id: &str) -> Option<String> {
+    map_image_path(game_root, map_id).and_then(|path| png_data_url(&path))
 }
 
 fn system_time_to_secs(time: SystemTime) -> Option<u64> {
@@ -2371,6 +1789,11 @@ fn resolve_recorder_path() -> Result<PathBuf, String> {
 async fn recorder_status(app: AppHandle) -> Result<Value, String> {
     let recorder_path = resolve_recorder_path()?;
     let mut value = run_backend(&app, "recorder-capabilities", Vec::new()).await?;
+    if value.pointer("/supported_versions/target_game_version").and_then(Value::as_str)
+        != Some(REQUIRED_RECORDER_GAME_VERSION)
+    {
+        return Err(format!("Update More of Dots Recorder to record with game {REQUIRED_RECORDER_GAME_VERSION}. Older recorders cannot record the new game mode."));
+    }
     if let Some(object) = value.as_object_mut() {
         object.insert("installed".to_string(), Value::Bool(true));
         object.insert("executable".to_string(), json!(recorder_path));
@@ -2383,7 +1806,9 @@ async fn recorder_status(app: AppHandle) -> Result<Value, String> {
 /// "present but broken", and both answer the same way here: reinstall.
 async fn installed_recorder(app: &AppHandle) -> Option<Value> {
     resolve_recorder_path().ok()?;
-    run_backend(app, "recorder-capabilities", Vec::new()).await.ok()
+    run_backend(app, "recorder-capabilities", Vec::new())
+        .await
+        .ok()
 }
 
 #[tauri::command]
@@ -2439,7 +1864,10 @@ fn recording_default_directory(app: AppHandle) -> Result<PathBuf, String> {
 fn open_recording_output_directory(output_path: String) -> Result<bool, String> {
     let output_path = PathBuf::from(output_path);
     if !output_path.is_file() {
-        return Err(format!("Recorded video was not found: {}", output_path.display()));
+        return Err(format!(
+            "Recorded video was not found: {}",
+            output_path.display()
+        ));
     }
     let directory = output_path
         .parent()
@@ -2479,12 +1907,17 @@ fn list_replays_impl(
     offset: usize,
     limit: usize,
 ) -> Result<ReplayListPayload, String> {
-    let candidates = collect_replay_candidates(&app)?;
+    let index_path = replay_index_path(app)?;
+    let mut index = load_replay_index(&index_path);
+    let candidates = collect_replay_candidates(app, &index)?;
     let (candidates, dedupe_errors) = dedupe_replay_candidates_by_hash(candidates);
     for error in dedupe_errors {
         eprintln!("{error}");
     }
     if candidates.is_empty() {
+        if let Ok(mut thumbnails) = app.state::<ReplayMediaCatalog>().thumbnails.lock() {
+            thumbnails.clear();
+        }
         return Ok(ReplayListPayload {
             replays: Vec::new(),
             total_candidates: 0,
@@ -2494,9 +1927,7 @@ fn list_replays_impl(
     }
 
     let backup_dir = replay_backup_dir(app)?;
-    let index_path = replay_index_path(app)?;
-    let mut index = load_replay_index(&index_path);
-    let mut map_cache = HashMap::new();
+    let mut thumbnail_sources = HashMap::new();
     let mut parsed_replays = Vec::new();
     let mut index_changed = false;
     let offset = offset.min(candidates.len());
@@ -2531,9 +1962,16 @@ fn list_replays_impl(
         };
 
         parsed.summary.score_delta = None;
+        parsed.summary.thumbnail_data_url = None;
+        parsed.summary.thumbnail_key = None;
         if let Some(replay_dir) = candidate.thumbnail_replay_dir.as_deref() {
-            parsed.summary.thumbnail_data_url =
-                thumbnail_for_replay(replay_dir, &parsed, &mut map_cache);
+            if let Some((thumbnail_key, source)) = thumbnail_source_for_replay(replay_dir, &parsed)
+            {
+                thumbnail_sources
+                    .entry(thumbnail_key.clone())
+                    .or_insert(source);
+                parsed.summary.thumbnail_key = Some(thumbnail_key);
+            }
         }
         parsed_replays.push(parsed);
     }
@@ -2541,15 +1979,15 @@ fn list_replays_impl(
     if index_changed {
         write_replay_index(&index_path, &index)?;
     }
+    if let Ok(mut thumbnails) = app.state::<ReplayMediaCatalog>().thumbnails.lock() {
+        *thumbnails = thumbnail_sources;
+    }
 
     let home_candidates = home_player_candidates(&parsed_replays);
     let replays = parsed_replays
         .into_iter()
         .map(|mut parsed| {
-            let home_player = replay_home_player(
-                &parsed.summary.players,
-                &home_candidates,
-            );
+            let home_player = replay_home_player(&parsed.summary.players, &home_candidates);
             parsed.summary.draw = parsed.result.as_ref().is_some_and(replay_result_is_draw);
             let winner_index = replay_winner_index(
                 parsed.result.as_ref(),
@@ -2653,7 +2091,12 @@ fn safe_recording_file_name(requested_name: &str) -> String {
     let mut safe = requested
         .chars()
         .map(|character| {
-            if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
                 '_'
             } else {
                 character
@@ -3043,7 +2486,12 @@ fn append_recording_manifest(
         .unwrap_or_else(|| json!({"version": 1, "replays": []}));
     let entries = manifest
         .as_object_mut()
-        .and_then(|object| object.entry("replays").or_insert_with(|| json!([])).as_array_mut())
+        .and_then(|object| {
+            object
+                .entry("replays")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+        })
         .ok_or_else(|| format!("Recording manifest is invalid: {}", manifest_path.display()))?;
     entries.push(json!({
         "sourceFile": source_path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
@@ -3058,7 +2506,9 @@ fn append_recording_manifest(
     if let Some(object) = manifest.as_object_mut() {
         object.insert(
             "updatedAt".to_string(),
-            json!(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs())),
+            json!(SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs())),
         );
     }
     let temporary_path = manifest_directory.join("war-of-dots-replays.json.tmp");
@@ -3408,7 +2858,10 @@ async fn record_replays_inner(
     for replay in &replays {
         let source_path = PathBuf::from(&replay.file_path);
         if !source_path.is_file() || !is_replay_file(&source_path) {
-            return Err(format!("Replay file is not readable: {}", source_path.display()));
+            return Err(format!(
+                "Replay file is not readable: {}",
+                source_path.display()
+            ));
         }
     }
 
@@ -3425,7 +2878,10 @@ async fn record_replays_inner(
     let concurrency = options.concurrency.clamp(1, total.min(20));
     let destination_dir = PathBuf::from(&options.destination_dir);
     if !destination_dir.is_dir() {
-        return Err(format!("Replay video destination is not a folder: {}", destination_dir.display()));
+        return Err(format!(
+            "Replay video destination is not a folder: {}",
+            destination_dir.display()
+        ));
     }
     let _ = app.emit(
         "replay-recording-progress",
@@ -3457,13 +2913,11 @@ async fn record_replays_inner(
         .enumerate()
         .map(|(index, replay)| {
             let source_path = PathBuf::from(&replay.file_path);
-            let final_path = available_recording_path(
-                &destination_dir,
-                &replay.file_name,
-                &mut reserved_paths,
-            );
+            let final_path =
+                available_recording_path(&destination_dir, &replay.file_name, &mut reserved_paths);
             let partial_path = final_path.with_extension("partial.mp4");
-            let status_path = recording_root.join(format!("recording-{unique}-{index}.status.json"));
+            let status_path =
+                recording_root.join(format!("recording-{unique}-{index}.status.json"));
             let cancel_path = recording_root.join(format!("recording-{unique}-{index}.cancel"));
             let display_name = final_path
                 .file_name()
@@ -3627,7 +3081,11 @@ async fn cancel_replay_recording(app: AppHandle) -> Result<bool, String> {
             return Ok(false);
         }
         state.cancel_requested = true;
-        state.current_cancel_paths.iter().cloned().collect::<Vec<_>>()
+        state
+            .current_cancel_paths
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
     };
     for path in cancel_paths {
         fs::write(&path, b"cancel")
@@ -3647,6 +3105,57 @@ async fn list_replays(
     tauri::async_runtime::spawn_blocking(move || list_replays_impl(&app, offset, limit))
         .await
         .map_err(|error| format!("Replay loading task failed: {error}"))?
+}
+
+fn replay_thumbnail_paths_impl(
+    app: &AppHandle,
+    thumbnail_keys: Vec<String>,
+) -> Result<Vec<ReplayThumbnailPath>, String> {
+    let keys = thumbnail_keys
+        .into_iter()
+        .filter(|key| {
+            key.len() <= 80
+                && key.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                })
+        })
+        .take(32)
+        .collect::<Vec<_>>();
+    let sources = {
+        let catalog = app.state::<ReplayMediaCatalog>();
+        let guard = catalog
+            .thumbnails
+            .lock()
+            .map_err(|_| "Replay thumbnail catalog is unavailable.".to_string())?;
+        keys.iter()
+            .filter_map(|key| guard.get(key).cloned().map(|source| (key.clone(), source)))
+            .collect::<Vec<_>>()
+    };
+
+    let mut paths = Vec::with_capacity(sources.len());
+    for (thumbnail_key, source) in sources {
+        let path = match source {
+            ReplayThumbnailSource::Base64(encoded) => {
+                cache_base64_png(app, "replay-thumbnails", &thumbnail_key, &encoded)?
+            }
+            ReplayThumbnailSource::File(path) => cache_media_file(app, "replay-thumbnails", &path)?,
+        };
+        paths.push(ReplayThumbnailPath {
+            thumbnail_key,
+            file_path: path.to_string_lossy().to_string(),
+        });
+    }
+    Ok(paths)
+}
+
+#[tauri::command]
+async fn replay_thumbnail_paths(
+    app: AppHandle,
+    thumbnail_keys: Vec<String>,
+) -> Result<Vec<ReplayThumbnailPath>, String> {
+    tauri::async_runtime::spawn_blocking(move || replay_thumbnail_paths_impl(&app, thumbnail_keys))
+        .await
+        .map_err(|error| format!("Replay thumbnail task failed: {error}"))?
 }
 
 fn list_maps_impl() -> Result<Vec<GameMapRecord>, String> {
@@ -3759,34 +3268,21 @@ fn delete_maps(file_names: Vec<String>) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn region_status(app: AppHandle) -> Result<Value, String> {
-    region_status_value(&app)
-}
-
-#[tauri::command]
-fn select_region(app: AppHandle, region: String) -> Result<Value, String> {
-    if !real_game_is_running() {
-        return Err("War of Dots is not running.".to_string());
+fn leaderboard_identity() -> Option<String> {
+    let mut roots = vec![steam_game_dir()];
+    roots.extend(discover_steamapps_dirs().into_iter().map(|dir| dir.join("common").join(GAME_DIR_NAME)));
+    for root in roots {
+        // Read settings locally and return only the account name. Passwords never cross IPC.
+        let Ok(file) = File::open(root.join("config.txt")) else { continue; };
+        let mut text = String::new();
+        if GzDecoder::new(file).take(1024 * 1024).read_to_string(&mut text).is_err() { continue; }
+        let Ok(config) = serde_json::from_str::<Value>(&text) else { continue; };
+        if let Some(name) = config.get("login").and_then(|login| login.get("username")).and_then(Value::as_str) {
+            let name = name.trim();
+            if !name.is_empty() && name.chars().count() <= 100 { return Some(name.to_owned()); }
+        }
     }
-    let region = normalize_region(&region)?;
-    let apply_result = inject_region_selection_into_game(&app, region)?;
-    let selection = RegionSelection {
-        region: region.to_string(),
-        selected_at: now_unix_secs(),
-    };
-    write_region_selection(&region_selection_path(&app)?, &selection)?;
-    let message = apply_result
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| "Region steering active. Queue normally.");
-
-    Ok(json!({
-        "gameRunning": true,
-        "selectedRegion": selection.region,
-        "selectedAt": selection.selected_at,
-        "message": message,
-        "applyResult": apply_result,
-    }))
+    None
 }
 
 #[tauri::command]
@@ -4056,8 +3552,7 @@ async fn capture_sample_delta(
     }))
 }
 
-#[tauri::command]
-async fn unit_assets() -> Result<UnitAssetsPayload, String> {
+fn unit_assets_impl(app: &AppHandle) -> Result<UnitAssetsPayload, String> {
     let asset_dir = steam_game_dir().join("assets");
     let colors = ["blue", "red", "purple", "orange"];
     let mut names = Vec::new();
@@ -4085,8 +3580,9 @@ async fn unit_assets() -> Result<UnitAssetsPayload, String> {
     let mut assets = BTreeMap::new();
     for name in names {
         let path = asset_dir.join(format!("{name}.png"));
-        if let Some(data_url) = png_data_url(&path) {
-            assets.insert(name, data_url);
+        if path.is_file() {
+            let cached = cache_media_file(app, "unit-assets", &path)?;
+            assets.insert(name, cached.to_string_lossy().to_string());
         }
     }
 
@@ -4094,6 +3590,13 @@ async fn unit_assets() -> Result<UnitAssetsPayload, String> {
         asset_dir: asset_dir.to_string_lossy().to_string(),
         assets,
     })
+}
+
+#[tauri::command]
+async fn unit_assets(app: AppHandle) -> Result<UnitAssetsPayload, String> {
+    tauri::async_runtime::spawn_blocking(move || unit_assets_impl(&app))
+        .await
+        .map_err(|error| format!("Unit asset task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -4238,6 +3741,7 @@ pub fn run() {
         .manage(WindowOwnerProcesses::default())
         .manage(ReplayRecordingControl::default())
         .manage(RecorderInstallControl::default())
+        .manage(ReplayMediaCatalog::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
@@ -4270,6 +3774,7 @@ pub fn run() {
             open_recording_output_directory,
             list_jobs,
             list_replays,
+            replay_thumbnail_paths,
             upload_replay,
             delete_replay,
             download_replay,
@@ -4281,8 +3786,7 @@ pub fn run() {
             save_map,
             create_map,
             delete_maps,
-            region_status,
-            select_region,
+            leaderboard_identity,
             capture_replay,
             capture_replay_path,
             release_job_artifacts,
@@ -4318,10 +3822,7 @@ mod tests {
         let result = json!(0.5);
 
         assert!(replay_result_is_draw(&result));
-        assert_eq!(
-            replay_winner_index(Some(&result), &players, None),
-            None
-        );
+        assert_eq!(replay_winner_index(Some(&result), &players, None), None);
     }
 
     #[test]
@@ -4367,7 +3868,40 @@ mod tests {
     }
 
     #[test]
-    fn red_blue_event_label_uses_procedural_map_signature() {
+    fn replay_summary_uses_a_thumbnail_key_without_embedding_image_data() {
+        let mut replay = ParsedReplay {
+            summary: ReplaySummary {
+                file_name: "match.rep".to_string(),
+                file_path: r"C:\replays\match.rep".to_string(),
+                version: Some("1.2.18.3".to_string()),
+                players: Vec::new(),
+                draw: false,
+                length: "0:00".to_string(),
+                duration_seconds: 0,
+                thumbnail_data_url: None,
+                thumbnail_key: None,
+                modified: 123,
+                score_delta: None,
+                event_label: None,
+            },
+            result: None,
+            map_id: None,
+            custom_map_surface: Some("YWJj".to_string()),
+        };
+
+        let (thumbnail_key, source) =
+            thumbnail_source_for_replay(Path::new(r"C:\replays"), &replay).unwrap();
+        assert!(thumbnail_key.starts_with("custom-"));
+        assert!(matches!(source, ReplayThumbnailSource::Base64(value) if value == "YWJj"));
+
+        replay.summary.thumbnail_key = Some(thumbnail_key.clone());
+        let serialized = serde_json::to_value(&replay.summary).unwrap();
+        assert_eq!(serialized["thumbnailKey"], thumbnail_key);
+        assert!(serialized.get("thumbnailDataUrl").is_none());
+    }
+
+    #[test]
+    fn procedural_map_is_custom() {
         let surface = solid_map_surface_base64(960, 540).unwrap();
         let infantry = vec![vec![json!([0, 0]); 16]; 2];
         let tanks = vec![vec![json!([0, 0]); 4]; 2];
@@ -4383,12 +3917,12 @@ mod tests {
             }
         });
 
-        assert_eq!(replay_event_label(&raw).as_deref(), Some("World"));
+        assert_eq!(replay_event_label(&raw).as_deref(), Some("Custom"));
         assert_eq!(replay_event_label(&json!({ "map": "35" })), None);
     }
 
     #[test]
-    fn arbitrary_custom_map_is_not_labeled_as_red_blue_event() {
+    fn arbitrary_custom_map_is_labeled_custom() {
         let raw = json!({
             "map": {
                 "map_surface": solid_map_surface_base64(960, 540).unwrap(),
@@ -4401,7 +3935,33 @@ mod tests {
             }
         });
 
-        assert_eq!(replay_event_label(&raw), None);
+        assert_eq!(replay_event_label(&raw).as_deref(), Some("Custom"));
+    }
+
+    #[test]
+    fn new_vanilla_paths_are_not_custom() {
+        for path in ["assets/fahero_maps/map50.png", "assets/eronion_maps/azure_rivers.png", "assets\\zolamare_maps\\map45.png"] {
+            let raw = json!({ "mode": "experiment", "map": { "path": path, "motorised": [[], []] } });
+            assert_eq!(replay_map_id(&raw), Some(path.replace('\\', "/")));
+            assert_eq!(replay_event_label(&raw), None);
+        }
+        assert_eq!(replay_event_label(&json!({"map": {"path": "assets/custom_maps/my_map.png"}})).as_deref(), Some("Custom"));
+        assert_eq!(replay_event_label(&json!({"map": "custom", "custom_map": {"map_surface": "custom-png"}})).as_deref(), Some("Custom"));
+    }
+
+    #[test]
+    fn new_map_paths_resolve_pngs_without_allowing_traversal() {
+        let root = env::temp_dir().join(format!("mod-map-path-test-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let directory = root.join("assets/eronion_maps");
+        fs::create_dir_all(&directory).unwrap();
+        let png = directory.join("azure_rivers.png");
+        fs::write(&png, b"test-image").unwrap();
+        assert_eq!(map_image_path(&root, "assets/eronion_maps/azure_rivers.png"), Some(png.canonicalize().unwrap()));
+        for path in ["assets/../../private.png", "C:/private.png", "assets/C:/private.png", "assets/eronion_maps/missing.png", "abc50"] {
+            assert!(map_image_path(&root, path).is_none());
+        }
+        assert!(root.starts_with(env::temp_dir()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4480,6 +4040,7 @@ mod tests {
                 length: "0:00".to_string(),
                 duration_seconds: 0,
                 thumbnail_data_url: None,
+                thumbnail_key: None,
                 modified: 123,
                 score_delta: None,
                 event_label: None,
@@ -4502,12 +4063,7 @@ mod tests {
         assert!(replay_index_entry_matches(&entry, &candidate));
 
         let mut missing_version = entry.clone();
-        missing_version
-            .parsed
-            .as_mut()
-            .unwrap()
-            .summary
-            .version = None;
+        missing_version.parsed.as_mut().unwrap().summary.version = None;
         assert!(!replay_index_entry_matches(&missing_version, &candidate));
 
         let mut changed = candidate.clone();

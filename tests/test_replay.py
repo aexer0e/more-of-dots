@@ -36,7 +36,7 @@ def test_validate_valid_replay_extracts_metadata() -> None:
     assert replay.metadata["first_tick"] == 180
     assert replay.metadata["max_tick"] == 240
     assert replay.metadata["source_version"] == "1.2.18.3"
-    assert replay.metadata["target_game_version"] == "1.3.4"
+    assert replay.metadata["target_game_version"] == "1.4.1"
     assert replay.metadata["move_order_count"] == 2
 
 
@@ -121,8 +121,8 @@ def test_missing_or_unknown_version_uses_schema_fallback() -> None:
 
         assert replay.metadata["source_version"] == source_version
         assert replay.metadata["version_inference"] == "compatible-replay-schema"
-        assert replay.metadata["target_game_version"] == "1.3.4"
-        assert recording_payload["version"] == "1.3.4"
+        assert replay.metadata["target_game_version"] == "1.4.1"
+        assert recording_payload["version"] == "1.4.1"
 
 
 def test_1_2_23_conversion_preserves_orders_and_modern_names() -> None:
@@ -138,14 +138,14 @@ def test_1_2_23_conversion_preserves_orders_and_modern_names() -> None:
     replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
     recording_payload = json.loads(gzip.decompress(replay.recording_bytes))
 
-    assert recording_payload["version"] == "1.3.4"
+    assert recording_payload["version"] == "1.4.1"
     assert recording_payload["player_usernames"] == payload["player_usernames"]
     assert recording_payload["180"] == payload["180"]
     assert replay.metadata["move_order_count"] == 2
     assert replay.metadata["waypoint_count"] == 3
 
 
-def test_legacy_player_labels_are_normalized_for_1_3_4() -> None:
+def test_legacy_player_labels_are_normalized_for_current_game() -> None:
     payload = valid_payload()
     payload["version"] = None
     payload["player_usernames"] = [["one [Friend]"], ["two"]]
@@ -178,3 +178,36 @@ def test_rejects_decompressed_payload_over_limit() -> None:
 
     with pytest.raises(ReplayValidationError, match="exceeds"):
         validate_replay(gzipped(payload), max_json_bytes=100)
+
+
+def test_classic_replay_gains_mode_without_changing_original() -> None:
+    payload = valid_payload()
+    original = gzipped(payload)
+    replay = validate_replay(original, max_json_bytes=1_000_000)
+    assert replay.payload["mode"] == "1v1"
+    assert replay.payload["map"] == payload["map"]
+    assert json.loads(gzip.decompress(original)) == payload
+    assert replay.payload["180"] == payload["180"]
+
+
+def test_experimental_replay_preserves_motorised_and_production_orders() -> None:
+    payload = valid_payload()
+    payload.update(mode="experiment", version="1.4.1", map={
+        "path": "assets/fahero_maps/map15.png", "infantry": [[], []],
+        "tanks": [[], []], "motorised": [[[100, 200]], [[300, 400]]],
+    })
+    payload["180"]["production0"] = {"color": 0, "ratio": [0.2, 0.3, 0.5]}
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+    assert replay.payload["mode"] == "experiment"
+    assert replay.payload["map"] == payload["map"]
+    assert replay.payload["180"] == payload["180"]
+
+
+def test_old_custom_map_gains_empty_motorised_buckets() -> None:
+    payload = valid_payload()
+    payload["map"] = {"mode": "v3", "infantry": [[], [], []], "tanks": [[], [], []]}
+    payload["player_usernames"] = [["one"], ["two"], ["three"]]
+    replay = validate_replay(gzipped(payload), max_json_bytes=1_000_000)
+    assert replay.payload["mode"] == "v3"
+    assert replay.payload["map"]["motorised"] == [[], [], []]
+    assert "motorised" not in payload["map"]

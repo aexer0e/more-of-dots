@@ -4,18 +4,22 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev:web": "vite --host 127.0.0.1",
-    "dev": "node scripts/version.mjs tauri dev",
+    "dev:web": "node scripts/dev.mjs",
+    "dev": "node scripts/dev.mjs",
     "tauri": "tauri",
     "version:config": "node scripts/version.mjs config",
     "version:release-config": "node scripts/version.mjs config --release",
     "check:version": "node --test scripts/version.test.mjs",
     "check:web": "tsc --noEmit",
-    "check": "npm run check:version && npm run check:web",
+    "check": "npm run check:version && npm run check:leaderboard && npm run check:map && npm run check:examples && npm run check:web",
     "build:web": "tsc && vite build",
     "build:recorder": "powershell.exe -NoProfile -File scripts/build-recorder.ps1",
     "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
-    "build": "node scripts/version.mjs tauri build && npm run size:audit"
+    "build": "node scripts/version.mjs tauri build && npm run size:audit",
+    "check:leaderboard": "node --test scripts/leaderboard.test.mjs scripts/leaderboard-chart.test.mjs",
+    "check:map": "node --test scripts/map-codec.test.mjs",
+    "dev:desktop": "node scripts/version.mjs tauri dev",
+    "check:examples": "node --test scripts/dev-data.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

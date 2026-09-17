@@ -1,5 +1,6 @@
+import { invoke, exampleMode } from "./platform";
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -7,6 +8,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { LeaderboardApp } from "./leaderboard/App";
 import MapEditorApp from "./map-editor/App";
 import "./styles.css";
 
@@ -260,9 +262,15 @@ type ReplayBrowserItem = {
   length: string;
   durationSeconds: number;
   thumbnailDataUrl?: string | null;
+  thumbnailKey?: string | null;
   modified: number;
   scoreDelta?: number | null;
   eventLabel?: string | null;
+};
+
+type ReplayThumbnailPath = {
+  thumbnailKey: string;
+  filePath: string;
 };
 
 type ReplayBrowserPayload = {
@@ -358,14 +366,14 @@ type BrowserFilterState = {
   query: string;
   enabledTypes: Set<string>;
   durationRange: { min: number; max: number };
-  nationGamesOnly: boolean;
+  customMapsOnly: boolean;
 };
 type BrowserRenderedCard = {
   element: HTMLElement;
   searchText: string;
   matchType: string;
   durationSeconds: number;
-  isNationGame: boolean;
+  isCustomMap: boolean;
   modified: number;
   names: string[];
   normalizedNames: string[];
@@ -376,15 +384,7 @@ type BrowserRenderedCard = {
   winnerNameElement: HTMLElement | null;
   visible: boolean;
 };
-type BrowserPage = "replays" | "region" | "mapEditor";
-type RegionName = "NA" | "EU" | "ASIA";
-type RegionStatusPayload = {
-  gameRunning: boolean;
-  selectedRegion?: RegionName | null;
-  selectedAt?: number | null;
-  message?: string | null;
-  applyResult?: unknown;
-};
+type BrowserPage = "replays" | "leaderboard" | "mapEditor";
 type AppUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "current" | "error";
 type AppUpdateSnooze = {
   version: string;
@@ -471,12 +471,6 @@ const RECORDING_RESOLUTION_OPTIONS = [480, 720, 1080] as const;
 const RECORDING_DEFAULT_SPEED_INDEX = RECORDING_SPEED_OPTIONS.length - 1;
 const RECORDING_DEFAULT_BITRATE_INDEX = 3;
 const RECORDING_DEFAULT_RESOLUTION_INDEX = 2;
-const REGION_NAMES: RegionName[] = ["NA", "EU", "ASIA"];
-const REGION_LABELS: Record<RegionName, string> = {
-  NA: "North America",
-  EU: "Europe",
-  ASIA: "Asia",
-};
 const FALLBACK_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(`
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">
   <rect width="640" height="360" fill="#9fbd42"/>
@@ -566,7 +560,7 @@ let recorderInstallError = "";
 let browserError = "";
 let browserSearch = "";
 let browserHideUnmatched = true;
-let browserNationGamesOnly = false;
+let browserCustomMapsOnly = false;
 let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
 let browserDurationBounds = { min: 0, max: 0 };
 let browserDurationRange = { min: 0, max: 0 };
@@ -575,6 +569,12 @@ let browserSelectedSuggestion = -1;
 let browserSuggestionItems: BrowserSuggestion[] = [];
 let browserRenderedCards: BrowserRenderedCard[] = [];
 let pendingBrowserSearchFrame = 0;
+let browserRenderGeneration = 0;
+let browserThumbnailObserver: IntersectionObserver | null = null;
+let browserThumbnailFlushTimer = 0;
+const browserThumbnailUrls = new Map<string, string>();
+const browserThumbnailPending = new Set<string>();
+const browserThumbnailInFlight = new Set<string>();
 let browserOpeningPaths = new Set<string>();
 let browserGridCapped = loadBrowserGridCapped();
 let browserGridCardSize = loadBrowserGridCardSize();
@@ -584,11 +584,6 @@ let browserDocumentEventsBound = false;
 let currentLaunchSignature = "";
 let browserPage: BrowserPage = "replays";
 let mapEditorRoot: Root | null = null;
-let regionStatusPayload: RegionStatusPayload | null = null;
-let regionLoading = false;
-let regionApplying: RegionName | "" = "";
-let regionError = "";
-let regionPollTimer = 0;
 let appVersion = "";
 let appUpdateStatus: AppUpdateStatus = "idle";
 let appUpdateManual = false;
@@ -607,6 +602,11 @@ function escapeHtml(value: unknown): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function mediaSrc(pathOrUrl: string | null | undefined): string {
+  if (!pathOrUrl) return "";
+  return /^(?:data:|blob:|https?:|\/__examples\/)/i.test(pathOrUrl) ? pathOrUrl : convertFileSrc(pathOrUrl);
 }
 
 function formatTime(value: number): string {
@@ -1067,14 +1067,14 @@ function currentBrowserFilterState(): BrowserFilterState {
     query: normalizeSearchText(browserSearchValue()),
     enabledTypes: selectedBrowserMatchTypes(),
     durationRange: currentBrowserDurationRange(),
-    nationGamesOnly: document.querySelector<HTMLInputElement>("#nationGamesToggle")?.checked ?? browserNationGamesOnly,
+    customMapsOnly: document.querySelector<HTMLInputElement>("#customMapsToggle")?.checked ?? browserCustomMapsOnly,
   };
 }
 
 function cardMatchesNonSearchFilters(card: BrowserRenderedCard, filterState: BrowserFilterState): boolean {
   return (
     filterState.enabledTypes.has(card.matchType) &&
-    (!filterState.nationGamesOnly || card.isNationGame) &&
+    (!filterState.customMapsOnly || card.isCustomMap) &&
     card.durationSeconds >= filterState.durationRange.min &&
     card.durationSeconds <= filterState.durationRange.max
   );
@@ -1632,9 +1632,13 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
   const accessibleLabel = replay.eventLabel ? `${label}, ${replay.eventLabel}` : label;
   const replayAge = formatReplayAge(replay.modified);
   const replayDate = formatReplayDate(replay.modified);
+  const thumbnailKey = replay.thumbnailKey ?? "";
+  const thumbnailSource = (thumbnailKey && browserThumbnailUrls.get(thumbnailKey))
+    || replay.thumbnailDataUrl
+    || FALLBACK_THUMBNAIL;
   return `
     <article class="replay-card ${browserSelectedReplayPaths.has(replay.filePath) ? "is-selected" : ""}" data-card-index="${replayIndex}" aria-label="${escapeHtml(accessibleLabel)}">
-      <img class="replay-thumb" alt="" loading="lazy" src="${escapeHtml(replay.thumbnailDataUrl || FALLBACK_THUMBNAIL)}">
+      <img class="replay-thumb" alt="" loading="lazy" decoding="async" src="${escapeHtml(thumbnailSource)}" ${thumbnailKey ? `data-thumbnail-key="${escapeHtml(thumbnailKey)}"` : ""}>
       <div class="replay-shade"></div>
       <div class="replay-labels">
         <div class="replay-label-group">
@@ -1682,7 +1686,7 @@ function renderBrowserGrid(): string {
       style="--replay-card-min-width:${browserGridCardSize}px;--replay-card-scale:${browserGridCardScale()}"
       aria-live="polite"
     >
-      ${browserReplays.map((replay, index) => renderReplayCard(replay, index)).join("")}
+      ${browserReplays.slice(0, 36).map((replay, index) => renderReplayCard(replay, index)).join("")}
     </section>
     <div id="searchEmpty" class="state-message search-empty" hidden>No matching replays.</div>
   `;
@@ -2057,82 +2061,17 @@ function renderBrowserNav(): string {
   return `
     <nav class="browser-nav" aria-label="Main navigation">
       <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
-      <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
+      <button class="browser-nav-button ${browserPage === "leaderboard" ? "is-active" : ""}" type="button" data-browser-page="leaderboard">Leaderboard</button>
       <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
       <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
     </nav>
   `;
 }
 
-function renderRegionPage(): string {
-  const gameRunning = Boolean(regionStatusPayload?.gameRunning);
-  const canSelect = gameRunning && !regionLoading && !regionApplying;
-  const selectedRegion = gameRunning ? regionStatusPayload?.selectedRegion ?? null : null;
-  const statusText = gameRunning
-    ? regionStatusPayload?.message || "War of Dots is running."
-    : regionStatusPayload?.message || "Start War of Dots to change region.";
-  const regionCards = REGION_NAMES.map((region) => {
-    const isSelected = selectedRegion === region;
-    const isApplying = regionApplying === region;
-    const disabled = !canSelect || isSelected;
-    const actionLabel = isApplying ? "Applying..." : isSelected ? "Selected" : gameRunning ? "Select" : "Unavailable";
-    return `
-      <button
-        class="region-option ${isSelected ? "is-selected" : ""} ${isApplying ? "is-loading" : ""}"
-        type="button"
-        data-region="${region}"
-        aria-pressed="${isSelected}"
-        aria-label="${escapeHtml(`${actionLabel} ${REGION_LABELS[region]}`)}"
-        ${disabled ? "disabled" : ""}
-      >
-        <span class="region-option-copy">
-          <strong>${escapeHtml(REGION_LABELS[region])}</strong>
-          <small>${escapeHtml(region)}</small>
-        </span>
-        <span class="region-option-action">${escapeHtml(actionLabel)}</span>
-      </button>
-    `;
-  }).join("");
 
-  return `
-    <section class="region-page" aria-label="Region selector">
-      <div class="region-actions">
-        <div>
-          <h1>Region</h1>
-          <p>Select the region used by the running game.</p>
-        </div>
-        <button id="refreshRegion" class="refresh-user-button region-refresh ${regionLoading ? "is-loading" : ""}" type="button" ${regionLoading || Boolean(regionApplying) ? "disabled" : ""}>
-          ${regionLoading ? "Refreshing..." : "Refresh"}
-        </button>
-      </div>
-      ${regionError ? `<div class="region-error" role="alert">${escapeHtml(regionError)}</div>` : ""}
-      <div class="region-status ${gameRunning ? "is-online" : "is-offline"}" aria-live="polite">
-        <span class="region-status-copy">
-          <span>
-            <strong>${gameRunning ? "Game running" : "Game offline"}</strong>
-            <small>${escapeHtml(statusText)}</small>
-          </span>
-        </span>
-        <span class="region-current">
-          <small>Current region</small>
-          <strong>${selectedRegion ? escapeHtml(REGION_LABELS[selectedRegion]) : "None"}</strong>
-        </span>
-      </div>
-      <div class="region-grid" role="group" aria-label="Available regions">
-        ${regionCards}
-      </div>
-      <div class="region-help">
-        <strong>How it works</strong>
-        <span>Start War of Dots, then select a region. The change is applied immediately.</span>
-      </div>
-    </section>
-  `;
-}
-
-function hydrateBrowserCards() {
-  browserRenderedCards = [];
-  const cardElements = document.querySelectorAll<HTMLElement>("#replayGrid .replay-card");
-  cardElements.forEach((element) => {
+function hydrateBrowserCards(cardElements: Iterable<HTMLElement>, reset = false) {
+  if (reset) browserRenderedCards = [];
+  for (const element of cardElements) {
     const replayIndex = Number(element.dataset.cardIndex);
     const replay = browserReplays[replayIndex];
     if (!replay) return;
@@ -2143,7 +2082,7 @@ function hydrateBrowserCards() {
       searchText: normalizeSearchText(replay.players.map((player) => player.name).join(" ")),
       matchType: replayMatchType(replay),
       durationSeconds: Number(replay.durationSeconds) || 0,
-      isNationGame: Boolean(replay.eventLabel),
+      isCustomMap: replay.eventLabel === "Custom",
       modified: Number(replay.modified) || 0,
       names: replay.players.map((player) => player.name),
       normalizedNames: replay.players.map((player) => normalizeSearchText(player.name)),
@@ -2154,7 +2093,103 @@ function hydrateBrowserCards() {
       winnerNameElement: element.querySelector<HTMLElement>("[data-winner-name]"),
       visible: true,
     });
+  }
+}
+
+function applyLoadedReplayThumbnail(thumbnailKey: string, source: string) {
+  document.querySelectorAll<HTMLImageElement>(`[data-thumbnail-key="${CSS.escape(thumbnailKey)}"]`).forEach((image) => {
+    if (image.src !== source) image.src = source;
   });
+}
+
+async function flushReplayThumbnailRequests() {
+  browserThumbnailFlushTimer = 0;
+  const keys = [...browserThumbnailPending]
+    .filter((key) => !browserThumbnailUrls.has(key) && !browserThumbnailInFlight.has(key))
+    .slice(0, 24);
+  keys.forEach((key) => {
+    browserThumbnailPending.delete(key);
+    browserThumbnailInFlight.add(key);
+  });
+  if (!keys.length) return;
+  try {
+    const paths = await invoke<ReplayThumbnailPath[]>("replay_thumbnail_paths", {
+      thumbnailKeys: keys,
+    });
+    for (const item of paths) {
+      const source = mediaSrc(item.filePath);
+      browserThumbnailUrls.set(item.thumbnailKey, source);
+      applyLoadedReplayThumbnail(item.thumbnailKey, source);
+    }
+  } catch {
+    // A missing map image should leave the lightweight fallback in place.
+  } finally {
+    keys.forEach((key) => browserThumbnailInFlight.delete(key));
+    if (browserThumbnailPending.size) {
+      browserThumbnailFlushTimer = window.setTimeout(() => void flushReplayThumbnailRequests(), 0);
+    }
+  }
+}
+
+function queueReplayThumbnail(thumbnailKey: string) {
+  const loaded = browserThumbnailUrls.get(thumbnailKey);
+  if (loaded) {
+    applyLoadedReplayThumbnail(thumbnailKey, loaded);
+    return;
+  }
+  browserThumbnailPending.add(thumbnailKey);
+  if (!browserThumbnailFlushTimer) {
+    browserThumbnailFlushTimer = window.setTimeout(() => void flushReplayThumbnailRequests(), 0);
+  }
+}
+
+function observeReplayThumbnails(elements: Iterable<Element>) {
+  if (!browserThumbnailObserver) {
+    browserThumbnailObserver = new IntersectionObserver((entries, observer) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const image = entry.target as HTMLImageElement;
+        observer.unobserve(image);
+        const thumbnailKey = image.dataset.thumbnailKey;
+        if (thumbnailKey) queueReplayThumbnail(thumbnailKey);
+      }
+    }, { rootMargin: "600px 0px" });
+  }
+  for (const element of elements) {
+    const image = element.matches("[data-thumbnail-key]")
+      ? element as HTMLImageElement
+      : element.querySelector<HTMLImageElement>("[data-thumbnail-key]");
+    if (!image) continue;
+    const loaded = browserThumbnailUrls.get(image.dataset.thumbnailKey ?? "");
+    if (loaded) image.src = loaded;
+    else browserThumbnailObserver.observe(image);
+  }
+}
+
+function scheduleBrowserCardChunk(renderGeneration: number, startIndex: number) {
+  if (startIndex >= browserReplays.length) return;
+  const append = () => {
+    if (renderGeneration !== browserRenderGeneration || browserPage !== "replays") return;
+    const grid = document.querySelector<HTMLElement>("#replayGrid");
+    if (!grid) return;
+    const endIndex = Math.min(startIndex + 32, browserReplays.length);
+    const template = document.createElement("template");
+    template.innerHTML = browserReplays
+      .slice(startIndex, endIndex)
+      .map((replay, offset) => renderReplayCard(replay, startIndex + offset))
+      .join("");
+    const cards = Array.from(template.content.querySelectorAll<HTMLElement>(".replay-card"));
+    grid.append(template.content);
+    hydrateBrowserCards(cards);
+    observeReplayThumbnails(cards);
+    scheduleBrowserSearch();
+    scheduleBrowserCardChunk(renderGeneration, endIndex);
+  };
+  if ("requestIdleCallback" in window) {
+    window.requestIdleCallback(append, { timeout: 120 });
+  } else {
+    globalThis.setTimeout(append, 8);
+  }
 }
 
 function updateReplayAgeLabels() {
@@ -2214,7 +2249,15 @@ function mountMapEditor() {
   mapEditorRoot.render(createElement(MapEditorApp));
 }
 
+let leaderboardRoot: Root | null = null;
+
 function renderReplayBrowser() {
+  if (browserPage !== "leaderboard" && leaderboardRoot) {
+    leaderboardRoot.unmount();
+    leaderboardRoot = null;
+  }
+  const renderGeneration = ++browserRenderGeneration;
+  browserThumbnailObserver?.disconnect();
   const minPosition = secondsToDurationPosition(browserDurationRange.min);
   const maxPosition = secondsToDurationPosition(browserDurationRange.max);
   const fillLeft = (minPosition / DURATION_SLIDER_STEPS) * 100;
@@ -2222,7 +2265,7 @@ function renderReplayBrowser() {
   if (browserPage === "mapEditor") {
     appRoot.innerHTML = `
       <main class="replay-browser map-editor-page" aria-label="War of Dots map editor">
-        ${renderBrowserNav()}
+        ${renderBrowserNav()}${exampleMode ? `<div class="example-banner">Example workspace <span>Latest copied data · up to 100 replays · edits stay in this session</span></div>` : ""}
         <section id="mapEditorRoot" class="map-editor-host" aria-label="Map editor"></section>
       </main>
     `;
@@ -2231,20 +2274,19 @@ function renderReplayBrowser() {
     return;
   }
   unmountMapEditor();
-  if (browserPage === "region") {
-    appRoot.innerHTML = `
-      <main class="replay-browser" aria-label="War of Dots region selector">
-        ${renderBrowserNav()}
-        ${renderRegionPage()}
-      </main>
-    `;
-    bindBrowserEvents();
+  if (browserPage === "leaderboard") {
+    if (!leaderboardRoot) {
+      appRoot.innerHTML = `<main class="replay-browser" aria-label="War of Dots leaderboard">${renderBrowserNav()}${exampleMode ? `<div class="example-banner">Example workspace <span>Latest copied data · up to 100 replays · edits stay in this session</span></div>` : ""}<div id="leaderboardRoot" style="display:flex;flex:1;min-height:0;overflow:hidden"></div></main>`;
+      bindBrowserEvents();
+      leaderboardRoot = createRoot(document.querySelector<HTMLElement>("#leaderboardRoot")!);
+      leaderboardRoot.render(createElement(LeaderboardApp));
+    }
     return;
   }
 
   appRoot.innerHTML = `
     <main class="replay-browser" aria-label="War of Dots replays">
-      ${renderBrowserNav()}
+      ${renderBrowserNav()}${exampleMode ? `<div class="example-banner">Example workspace <span>Latest copied data · up to 100 replays · edits stay in this session</span></div>` : ""}
       <div class="search-row">
         <div class="search-controls">
           <div
@@ -2277,9 +2319,9 @@ function renderReplayBrowser() {
             <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
             <span aria-hidden="true">&#128123;&#65039;</span>
           </label>
-          <label class="match-mode-toggle nation-mode-toggle" title="World games only">
-            <input id="nationGamesToggle" type="checkbox" aria-label="World games only" ${browserNationGamesOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
-            <span aria-hidden="true">&#127760;</span>
+          <label class="match-mode-toggle custom-map-toggle" title="Custom maps only">
+            <input id="customMapsToggle" type="checkbox" aria-label="Custom maps only" ${browserCustomMapsOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
+            <span>Custom</span>
           </label>
         </div>
         <div class="filter-controls">
@@ -2327,11 +2369,16 @@ function renderReplayBrowser() {
       ${renderReplayRecordingDialog()}
     </main>
   `;
-  hydrateBrowserCards();
+  const initialCards = document.querySelectorAll<HTMLElement>("#replayGrid .replay-card");
+  hydrateBrowserCards(initialCards, true);
+  observeReplayThumbnails(initialCards);
   bindBrowserEvents();
   updateBrowserClearButton();
   refreshBrowserSuggestions(browserSuggestionOpen);
   scheduleBrowserSearch();
+  if (!browserError && browserReplays.length > 36) {
+    scheduleBrowserCardChunk(renderGeneration, 36);
+  }
 }
 
 function handleBrowserSuggestionPointerDown(event: PointerEvent) {
@@ -2357,7 +2404,6 @@ async function switchBrowserPage(nextPage: BrowserPage) {
   if (!(await confirmMapEditorLeave())) return;
   browserPage = nextPage;
   renderReplayBrowser();
-  if (browserPage === "region" && !regionStatusPayload && !regionLoading) void loadRegionStatus();
 }
 
 function refreshBrowserSelectionUi() {
@@ -2482,17 +2528,8 @@ function bindBrowserEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const page = button.dataset.browserPage;
-      const nextPage: BrowserPage = page === "region" ? "region" : page === "mapEditor" ? "mapEditor" : "replays";
+      const nextPage: BrowserPage = page === "leaderboard" ? "leaderboard" : page === "mapEditor" ? "mapEditor" : "replays";
       void switchBrowserPage(nextPage);
-    });
-  });
-  document.querySelector<HTMLButtonElement>("#refreshRegion")?.addEventListener("click", () => {
-    void loadRegionStatus();
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-region]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const region = button.dataset.region as RegionName | undefined;
-      if (region && REGION_NAMES.includes(region)) void selectRegion(region);
     });
   });
   document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("input", (event) => {
@@ -2536,8 +2573,8 @@ function bindBrowserEvents() {
     browserHideUnmatched = !(event.target as HTMLInputElement).checked;
     scheduleBrowserSearch();
   });
-  document.querySelector<HTMLInputElement>("#nationGamesToggle")?.addEventListener("change", (event) => {
-    browserNationGamesOnly = (event.target as HTMLInputElement).checked;
+  document.querySelector<HTMLInputElement>("#customMapsToggle")?.addEventListener("change", (event) => {
+    browserCustomMapsOnly = (event.target as HTMLInputElement).checked;
     refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
     scheduleBrowserSearch();
   });
@@ -2734,41 +2771,6 @@ function bindBrowserEvents() {
   if (!browserDocumentEventsBound) {
     document.addEventListener("pointerdown", handleBrowserOutsidePointerDown);
     browserDocumentEventsBound = true;
-  }
-}
-
-async function loadRegionStatus(options: { quiet?: boolean } = {}) {
-  if (regionLoading) return;
-  regionLoading = true;
-  if (!options.quiet) regionError = "";
-  if (!options.quiet && browserPage === "region") renderReplayBrowser();
-  // The region page polls every 5s. Re-render only when something actually moved,
-  // otherwise the whole page rebuilds on a timer and visibly flashes.
-  const previous = JSON.stringify(regionStatusPayload);
-  const previousError = regionError;
-  try {
-    regionStatusPayload = await invoke<RegionStatusPayload>("region_status");
-  } catch (error) {
-    if (!options.quiet) regionError = error instanceof Error ? error.message : String(error || "Could not load region status.");
-  } finally {
-    regionLoading = false;
-    const changed = JSON.stringify(regionStatusPayload) !== previous || regionError !== previousError;
-    if (browserPage === "region" && (changed || !options.quiet)) renderReplayBrowser();
-  }
-}
-
-async function selectRegion(region: RegionName) {
-  if (regionApplying) return;
-  regionApplying = region;
-  regionError = "";
-  renderReplayBrowser();
-  try {
-    regionStatusPayload = await invoke<RegionStatusPayload>("select_region", { region });
-  } catch (error) {
-    regionError = error instanceof Error ? error.message : String(error || "Could not apply region.");
-  } finally {
-    regionApplying = "";
-    if (browserPage === "region") renderReplayBrowser();
   }
 }
 
@@ -3182,6 +3184,7 @@ function replayListSignature(replays: ReplayBrowserItem[]): string {
         replay.filePath,
         replay.modified,
         replay.durationSeconds,
+        replay.thumbnailKey ?? "",
         replay.scoreDelta ?? "",
         replay.draw ? "draw" : "",
         replay.players.map((player) => `${player.name}:${player.winner ? "1" : "0"}`).join(","),
@@ -3198,7 +3201,7 @@ async function loadBrowserReplays(
   let shouldRender = !options.quiet;
   browserLoading = true;
   browserError = "";
-  if (!options.quiet) renderReplayBrowser();
+  if (!options.quiet && browserPage === "replays") renderReplayBrowser();
   try {
     const payload = await invoke<ReplayBrowserPayload>("list_replays", {
       offset: 0,
@@ -3222,21 +3225,13 @@ async function loadBrowserReplays(
     }
   } finally {
     browserLoading = false;
-    if (shouldRender) renderReplayBrowser();
+    if (shouldRender && browserPage === "replays") renderReplayBrowser();
   }
 }
 
 function startBrowserRelativeTimeUpdates() {
   window.clearInterval(browserRelativeTimeTimer);
   browserRelativeTimeTimer = window.setInterval(updateReplayAgeLabels, 15_000);
-}
-
-function startRegionPolling() {
-  window.clearInterval(regionPollTimer);
-  regionPollTimer = window.setInterval(() => {
-    if (browserPage !== "region" || regionLoading || regionApplying) return;
-    void loadRegionStatus({ quiet: true });
-  }, 5000);
 }
 
 function resetMapImage() {
@@ -3274,7 +3269,9 @@ async function loadUnitAssets() {
   unitAssetsLoading = true;
   try {
     const payload = await invoke<UnitAssetsPayload>("unit_assets");
-    unitAssetUrls = payload.assets ?? {};
+    unitAssetUrls = Object.fromEntries(
+      Object.entries(payload.assets ?? {}).map(([key, path]) => [key, mediaSrc(path)]),
+    );
     unitImageCache.clear();
     renderCanvas();
   } catch {
@@ -5984,7 +5981,7 @@ async function loadCurrentLaunchRequest() {
 }
 
 if (appMode === "browser") {
-  void listen<ReplayRecordingProgressEvent>("replay-recording-progress", (event) => {
+  if (!exampleMode) void listen<ReplayRecordingProgressEvent>("replay-recording-progress", (event) => {
     if (!browserRecordingInFlight) return;
     browserRecordingProgress = mergeReplayRecordingProgress(event.payload);
     if (event.payload.sourcePath) {
@@ -6009,7 +6006,7 @@ if (appMode === "browser") {
   }).catch((error) => {
     console.error("Replay recording progress listener failed", error);
   });
-  void listen<RecorderInstallProgressEvent>("recorder-install-progress", (event) => {
+  if (!exampleMode) void listen<RecorderInstallProgressEvent>("recorder-install-progress", (event) => {
     recorderInstallStep = event.payload.step;
     if (event.payload.step === "downloading") {
       recorderInstallDownloaded = event.payload.downloaded ?? 0;
@@ -6022,16 +6019,19 @@ if (appMode === "browser") {
   });
   renderReplayBrowser();
   refreshRecordingQueueUi();
-  void initializeAppUpdater();
+  if (!exampleMode) void initializeAppUpdater();
   void loadBrowserReplays();
   startBrowserRelativeTimeUpdates();
-  startRegionPolling();
   window.addEventListener("keydown", (event) => {
     const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";
     if (!wantsSearch) return;
+    const input = browserPage === "leaderboard"
+      ? document.querySelector<HTMLInputElement>('[aria-label="Search leaderboard"]')
+      : document.querySelector<HTMLInputElement>("#playerSearch");
+    if (!input) return;
     event.preventDefault();
-    document.querySelector<HTMLInputElement>("#playerSearch")?.focus();
-    document.querySelector<HTMLInputElement>("#playerSearch")?.select();
+    input.focus();
+    input.select();
   });
 } else {
   window.addEventListener("resize", () => {

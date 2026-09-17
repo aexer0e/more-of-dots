@@ -89,6 +89,25 @@ function MapThumbnail({ map }: { map: StoredMap }) {
               />
             ));
           })}
+          {map.data.motorised.flatMap((team, teamIndex) => {
+            const teamColor = teamColorForIndex(teamIndex);
+            const sprite = spriteAssets[teamColor].motorised;
+            return team.map(([x, y], unitIndex) => (
+              <img
+                alt=""
+                className="map-thumb-sprite"
+                draggable={false}
+                key={`motorised-${teamIndex}-${unitIndex}`}
+                  src={sprite}
+                  style={{
+                  height: `${thumbnailPercentHeight(map, thumbnailIconSize(map, SPRITE_SIZE))}%`,
+                  left: `${thumbnailPercentX(map, x)}%`,
+                  top: `${thumbnailPercentY(map, y)}%`,
+                  width: `${thumbnailPercentWidth(map, thumbnailIconSize(map, SPRITE_SIZE))}%`,
+                }}
+              />
+            ));
+          })}
           {map.data.cities.map(([x, y], cityIndex) => {
             const isCapital = capitalIndexes.has(cityIndex);
             const size = thumbnailIconSize(map, isCapital ? CAPITAL_SIZE : CITY_SIZE);

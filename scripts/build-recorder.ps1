@@ -48,6 +48,7 @@ $RecorderOutputRoot = Join-Path $Root 'recorder-dist'
 $DistRoot = Join-Path $RecorderOutputRoot 'more-of-dots-recorder'
 $AddData = @(
     "$(Join-Path $Root 'scripts\local-runner.ps1');scripts",
+    "$(Join-Path $Root 'scripts\recorder-audio.py');scripts",
     "$(Join-Path $Root 'scripts\invoke-python-probe.ps1');scripts",
     "$ProbeDll;tools\python-probe-dll\target\release",
     "$(Join-Path $Root 'wod_replay_server\supported_versions.json');wod_replay_server",

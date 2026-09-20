@@ -23,6 +23,8 @@ param(
     [int]$PlaybackSpeed = 10,
     [int]$VideoBitrateKbps = 5000,
     [int]$VideoHeight = 720,
+    [ValidateRange(0, 100)][int]$MusicVolume = 0,
+    [ValidateRange(0, 100)][int]$SfxVolume = 0,
     [int]$VideoMaxFrames = 90,
     [string]$ShareRoot = '',
     [string]$GameSourceDir = '',
@@ -693,8 +695,8 @@ function New-AutomationGameConfig($ReplaySlot, $GameVersion) {
         login = [ordered]@{ username = $null; password = $null }
         welcome = $false
         last_support_reminder = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        music_volume = 0.0
-        sfx_volume = 0.0
+        music_volume = if ($RecordReplay -or $CaptureVideoPoc) { $MusicVolume / 100.0 } else { 0.0 }
+        sfx_volume = if ($RecordReplay -or $CaptureVideoPoc) { $SfxVolume / 100.0 } else { 0.0 }
         custom_map = $null
         community_option = 'map_hub'
         skin = $null
@@ -1678,11 +1680,14 @@ except Exception:
 }
 
 function New-LiveGameCapturePayload([string]$RequestPath, [string]$StatsPath, [string]$ArtifactPath, [string]$Mode, [int]$SampleHz, [int]$MaxSamples) {
+    $audioCaptureSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'recorder-audio.py') -Raw
     $escapedRequest = $RequestPath.Replace('\', '\\').Replace("'", "\\'")
     $escapedStats = $StatsPath.Replace('\', '\\').Replace("'", "\\'")
     $escapedArtifact = $ArtifactPath.Replace('\', '\\').Replace("'", "\\'")
     $escapedMode = $Mode.Replace("'", "\\'")
     return @"
+$audioCaptureSource
+
 import gc
 import gzip
 import inspect
@@ -1716,11 +1721,12 @@ except Exception:
     FRAME_CAPTURE_TICK = 300
 FRAME_CAPTURE_COMPLETE = False
 VIDEO_OUTPUT_PATH = os.environ.get('WOD_VIDEO_OUTPUT_PATH', '').strip()
+VIDEO_AUDIO_ENABLED = os.environ.get('WOD_VIDEO_AUDIO_ENABLED', '0') == '1'
 VIDEO_FFMPEG_PATH = os.environ.get('WOD_VIDEO_FFMPEG_PATH', 'ffmpeg').strip() or 'ffmpeg'
 VIDEO_CANCEL_PATH = os.environ.get('WOD_VIDEO_CANCEL_PATH', '').strip()
 VIDEO_STATUS_PATH = os.environ.get('WOD_VIDEO_STATUS_PATH', '').strip()
 try:
-    VIDEO_PLAYBACK_SPEED = max(1, min(10, int(os.environ.get('WOD_VIDEO_PLAYBACK_SPEED', '10'))))
+    VIDEO_PLAYBACK_SPEED = max(1, min(30, int(os.environ.get('WOD_VIDEO_PLAYBACK_SPEED', '10'))))
 except Exception:
     VIDEO_PLAYBACK_SPEED = 10
 try:
@@ -5572,6 +5578,8 @@ def install_main_thread_frame_hook():
         'speed_method': None,
         'frame_count': 0,
         'encoder': None,
+        'audio': None,
+        'last_status_at': 0.0,
         'replay_end_reached': False,
         'end_hold_frame_count': 0,
     }
@@ -5587,10 +5595,35 @@ def install_main_thread_frame_hook():
                 write_video_status(payload)
             else:
                 write_json_atomic(status_path, payload)
+            state['last_status_at'] = time.monotonic()
         except Exception:
             pass
 
+    def write_recording_progress(tick):
+        write_frame_status({
+            'status': 'finishing' if state['replay_end_reached'] else 'recording',
+            'step': 'exporting' if state['replay_end_reached'] else 'recording',
+            'path': capture_path,
+            'output_size': [VIDEO_WIDTH, VIDEO_HEIGHT],
+            'fps': VIDEO_FPS,
+            'bitrate_kbps': VIDEO_BITRATE_KBPS,
+            'tick': tick,
+            'end_tick': requested_end_tick,
+            'current_seconds': round(max(0.0, float(tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
+            'total_seconds': round(max(0.0, float(requested_end_tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
+            'progress_percent': round(max(0.0, min(100.0, (float(tick or 0) / max(1.0, float(requested_end_tick or 0))) * 100.0)), 2),
+            'frame_count': state['frame_count'],
+            'speed_after': state.get('speed_after'),
+            'speed_method': state.get('speed_method'),
+            'simulation_speed': state.get('simulation_speed'),
+            'end_hold_frames': state['end_hold_frame_count'],
+            'end_hold_target_frames': end_hold_target_frames,
+        })
+
     def stop_encoder():
+        audio = state.get('audio')
+        if audio is not None:
+            audio.close()
         encoder = state.get('encoder')
         if encoder is None:
             return 0, ''
@@ -5643,38 +5676,47 @@ def install_main_thread_frame_hook():
             creationflags=creation_flags,
         )
         state['encoder_command'] = command
+        if VIDEO_AUDIO_ENABLED:
+            import pygame
+            mixer_directory = os.path.dirname(pygame.mixer.__file__)
+            if not os.path.isfile(os.path.join(mixer_directory, 'sdl2_mixer.dll')):
+                mixer_directory = os.path.dirname(sys.executable)
+            state['audio'] = ReplayAudioCapture(mixer_directory, capture_path + '.pcm', VIDEO_FPS)
         return state['encoder']
 
     def apply_playback_speed(scene):
         if state['speed_applied']:
             return
         before = to_float(attrs_of(scene).get('ips'))
-        try:
-            import pygame
-            event_check = getattr(scene, 'event_check', None)
-            if callable(event_check):
-                events = [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0, unicode='') for _ in range(max(0, VIDEO_PLAYBACK_SPEED - 1))]
-                if events:
-                    event_check(events)
-                    state['speed_method'] = 'up-arrow-events'
-        except Exception:
-            pass
+        # Keep the native single-tick path; batch complete scene updates below.
+        # The game's speed shortcut does not reproduce normal replay simulation.
+        simulation_speed = 1 if INSTALL_VIDEO_HOOK else VIDEO_PLAYBACK_SPEED
         after = to_float(attrs_of(scene).get('ips'))
-        if after != float(VIDEO_PLAYBACK_SPEED):
+        if after != float(simulation_speed):
             try:
-                setattr(scene, 'ips', float(VIDEO_PLAYBACK_SPEED))
+                setattr(scene, 'ips', simulation_speed)
                 after = to_float(attrs_of(scene).get('ips'))
-                state['speed_method'] = 'direct-ips-fallback'
             except Exception:
                 pass
-        elif state.get('speed_method') is None:
-            state['speed_method'] = 'already-at-target'
+        state['speed_method'] = 'batched-updates' if INSTALL_VIDEO_HOOK else 'direct-ips'
         state['speed_before'] = before
-        state['speed_after'] = after
-        state['speed_applied'] = after == float(VIDEO_PLAYBACK_SPEED)
+        state['simulation_speed'] = after
+        state['speed_after'] = VIDEO_PLAYBACK_SPEED if INSTALL_VIDEO_HOOK else after
+        state['speed_applied'] = after == float(simulation_speed)
 
     def render_wrapper(scene, *args, **kwargs):
         apply_playback_speed(scene)
+        # The outer loop already advanced one tick. Preserve the first frame,
+        # then run the remaining ticks without intermediate draws or frame waits.
+        if INSTALL_VIDEO_HOOK and state['speed_applied'] and state['frame_count'] and not state['complete'] and not state['replay_end_reached']:
+            for _ in range(max(0, VIDEO_PLAYBACK_SPEED - 1)):
+                tick = read_tick([scene, attrs_of(scene).get('core'), attrs_of(scene).get('game')])
+                if (requested_end_tick is not None and tick is not None and tick >= requested_end_tick) or (VIDEO_CANCEL_PATH and os.path.exists(VIDEO_CANCEL_PATH)):
+                    break
+                scene.update()
+                if time.monotonic() - state['last_status_at'] >= 1.0:
+                    tick = read_tick([scene, attrs_of(scene).get('core'), attrs_of(scene).get('game')])
+                    write_recording_progress(tick)
         rendered = original(scene, *args, **kwargs)
         if state['complete'] or not state['speed_applied']:
             return rendered
@@ -5711,6 +5753,8 @@ def install_main_thread_frame_hook():
                     frame_surface = pygame.transform.scale(frame_surface, (VIDEO_WIDTH, VIDEO_HEIGHT))
                 encoder = start_encoder()
                 encoder.stdin.write(pygame.image.tostring(frame_surface, 'RGB'))
+                if state['audio'] is not None:
+                    state['audio'].capture_frame()
                 state['frame_count'] += 1
                 reached_limit = VIDEO_MAX_FRAMES > 0 and state['frame_count'] >= VIDEO_MAX_FRAMES
                 reached_end = requested_end_tick is not None and tick is not None and tick >= requested_end_tick
@@ -5723,6 +5767,13 @@ def install_main_thread_frame_hook():
                     return_code, error_text = stop_encoder()
                     if return_code != 0:
                         raise RuntimeError('ffmpeg exited with code %s: %s' % (return_code, error_text))
+                    if state['audio'] is not None:
+                        def audio_export_heartbeat():
+                            write_frame_status({'status': 'finishing', 'step': 'exporting',
+                                                'frame_count': state['frame_count'], 'audio_export_at': time.time()})
+                        audio_export_heartbeat()
+                        mux_replay_audio(VIDEO_FFMPEG_PATH, capture_path, state['audio'].path,
+                                         audio_export_heartbeat, VIDEO_CANCEL_PATH, state['audio'].rate, state['audio'].channels)
                     state['complete'] = True
                     write_frame_status({
                         'status': 'completed',
@@ -5746,25 +5797,8 @@ def install_main_thread_frame_hook():
                         'end_hold_frames': state['end_hold_frame_count'],
                         'completion_reason': 'frame-limit' if reached_limit else 'replay-end-hold',
                     })
-                elif state['frame_count'] == 1 or state['frame_count'] % VIDEO_FPS == 0:
-                    write_frame_status({
-                        'status': 'finishing' if state['replay_end_reached'] else 'recording',
-                        'step': 'exporting' if state['replay_end_reached'] else 'recording',
-                        'path': capture_path,
-                        'output_size': [VIDEO_WIDTH, VIDEO_HEIGHT],
-                        'fps': VIDEO_FPS,
-                        'bitrate_kbps': VIDEO_BITRATE_KBPS,
-                        'tick': tick,
-                        'end_tick': requested_end_tick,
-                        'current_seconds': round(max(0.0, float(tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
-                        'total_seconds': round(max(0.0, float(requested_end_tick or 0) / REPLAY_TICKS_PER_SECOND), 3),
-                        'progress_percent': round(max(0.0, min(100.0, (float(tick or 0) / max(1.0, float(requested_end_tick or 0))) * 100.0)), 2),
-                        'frame_count': state['frame_count'],
-                        'speed_after': state.get('speed_after'),
-                        'speed_method': state.get('speed_method'),
-                        'end_hold_frames': state['end_hold_frame_count'],
-                        'end_hold_target_frames': end_hold_target_frames,
-                    })
+                elif state['frame_count'] == 1 or state['frame_count'] % VIDEO_FPS == 0 or time.monotonic() - state['last_status_at'] >= 1.0:
+                    write_recording_progress(tick)
             else:
                 state['frame_count'] += 1
                 parent = os.path.dirname(capture_path)
@@ -7201,6 +7235,19 @@ function Invoke-FrameCapturePoc([string]$Id) {
     }
 }
 
+function Get-RecordingGameFailure($Status, [string]$ErrorPath) {
+    if (-not (Test-Path -LiteralPath $ErrorPath)) { return $null }
+    $gameError = Get-Content -LiteralPath $ErrorPath -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($gameError)) { return $null }
+    if ($gameError -notmatch 'Traceback \(most recent call last\):') { return $null }
+    if (-not $Status) { $Status = [pscustomobject]@{ protocol_version = 1; frame_count = 0 } }
+    Set-JsonProperty -Object $Status -Name 'status' -Value 'failed'
+    Set-JsonProperty -Object $Status -Name 'step' -Value 'failed'
+    Set-JsonProperty -Object $Status -Name 'phase' -Value 'game-error'
+    Set-JsonProperty -Object $Status -Name 'error' -Value $gameError.Trim()
+    return $Status
+}
+
 function Invoke-VideoCapturePoc([string]$Id) {
     $jobRoot = Get-JobRoot $Id
     $requestPath = Join-Path $jobRoot 'capture-request.json'
@@ -7230,6 +7277,10 @@ function Invoke-VideoCapturePoc([string]$Id) {
     Copy-Item -LiteralPath $builtDll -Destination $probeDll -Force
     Set-Content -LiteralPath $payloadPath -Value (New-LiveGameCapturePayload -RequestPath $requestPath -StatsPath '' -ArtifactPath $artifactPath -Mode 'install-video-hook' -SampleHz 1 -MaxSamples 1) -Encoding UTF8
 
+    $previousAudioDriver = $env:SDL_AUDIODRIVER
+    $previousVideoAudio = $env:WOD_VIDEO_AUDIO_ENABLED
+    $env:WOD_VIDEO_AUDIO_ENABLED = if ($MusicVolume -gt 0 -or $SfxVolume -gt 0) { '1' } else { '0' }
+    if ($env:WOD_VIDEO_AUDIO_ENABLED -eq '1') { $env:SDL_AUDIODRIVER = 'dummy' }
     $previousVideoOutput = $env:WOD_VIDEO_OUTPUT_PATH
     $previousVideoFfmpeg = $env:WOD_VIDEO_FFMPEG_PATH
     $previousVideoMaxFrames = $env:WOD_VIDEO_MAX_FRAMES
@@ -7245,7 +7296,7 @@ function Invoke-VideoCapturePoc([string]$Id) {
     $env:WOD_VIDEO_FFMPEG_PATH = $resolvedFfmpeg
     $env:WOD_VIDEO_MAX_FRAMES = [string]([Math]::Max(0, $VideoMaxFrames))
     $env:WOD_VIDEO_STATUS_PATH = $videoStatusPath
-    $env:WOD_VIDEO_PLAYBACK_SPEED = [string]([Math]::Max(1, [Math]::Min(10, $PlaybackSpeed)))
+    $env:WOD_VIDEO_PLAYBACK_SPEED = [string]([Math]::Max(1, [Math]::Min(30, $PlaybackSpeed)))
     $env:WOD_VIDEO_BITRATE_KBPS = [string]([Math]::Max(500, [Math]::Min(10000, $VideoBitrateKbps)))
     $env:WOD_VIDEO_WIDTH = [string]$resolvedVideoWidth
     $env:WOD_VIDEO_HEIGHT = [string]$resolvedVideoHeight
@@ -7282,6 +7333,8 @@ function Invoke-VideoCapturePoc([string]$Id) {
         })
         [void](Use-JobGameRuntime -Id $Id)
         $slotState = Prepare-ReplaySlot -Id $Id
+        $gameErrorPath = Join-Path (Get-JobGameDir -Id $Id) 'error_log.txt'
+        Remove-Item -LiteralPath $gameErrorPath -Force -ErrorAction SilentlyContinue
         $process = Start-GameProcess -OwnerJobId $Id
         $hWnd = Find-GameWindow -ProcessId $process.Id -TimeoutSeconds 60
         if ($hWnd -eq [IntPtr]::Zero) {
@@ -7331,6 +7384,14 @@ function Invoke-VideoCapturePoc([string]$Id) {
                 if ($videoStatus -and $videoStatus.status -in @('completed', 'cancelled', 'failed')) {
                     break
                 }
+            }
+            # The game catches simulation exceptions and returns to Home. Its
+            # process stays alive, so report its error instead of a stall timeout.
+            $gameFailure = Get-RecordingGameFailure -Status $videoStatus -ErrorPath $gameErrorPath
+            if ($gameFailure) {
+                $videoStatus = $gameFailure
+                Write-JsonFile -Path $videoStatusPath -Data $videoStatus
+                break
             }
             if (-not $firstFrameSeen -and [DateTime]::UtcNow -ge $startupDeadline) {
                 $videoStatus = [pscustomobject]@{
@@ -7399,9 +7460,21 @@ function Invoke-VideoCapturePoc([string]$Id) {
                 Stop-Process -Id ([int]$encoder.ProcessId) -Force -ErrorAction SilentlyContinue
             }
         }
+        # Keep each attempt's diagnostics before the disposable game and the
+        # app's shared progress file are removed.
+        if (Test-Path -LiteralPath $videoStatusPath) {
+            Copy-Item -LiteralPath $videoStatusPath -Destination (Join-Path $jobRoot 'video-recording-status.json') -Force -ErrorAction SilentlyContinue
+        }
+        $gameErrorPath = Join-Path (Get-JobGameDir -Id $Id) 'error_log.txt'
+        if (Test-Path -LiteralPath $gameErrorPath) {
+            Copy-Item -LiteralPath $gameErrorPath -Destination (Join-Path $jobRoot 'game-error.txt') -Force -ErrorAction SilentlyContinue
+        }
         Close-AutomationDesktop
         Restore-ReplaySlot $slotState
         Clear-JobGameRuntime -Id $Id
+        Remove-Item -LiteralPath ($resolvedVideoOutput + '.pcm'), ($resolvedVideoOutput + '.audio.mp4') -Force -ErrorAction SilentlyContinue
+        if ($null -eq $previousAudioDriver) { Remove-Item Env:SDL_AUDIODRIVER -ErrorAction SilentlyContinue } else { $env:SDL_AUDIODRIVER = $previousAudioDriver }
+        if ($null -eq $previousVideoAudio) { Remove-Item Env:WOD_VIDEO_AUDIO_ENABLED -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_AUDIO_ENABLED = $previousVideoAudio }
         if ($null -eq $previousVideoOutput) { Remove-Item Env:WOD_VIDEO_OUTPUT_PATH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_OUTPUT_PATH = $previousVideoOutput }
         if ($null -eq $previousVideoFfmpeg) { Remove-Item Env:WOD_VIDEO_FFMPEG_PATH -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_FFMPEG_PATH = $previousVideoFfmpeg }
         if ($null -eq $previousVideoMaxFrames) { Remove-Item Env:WOD_VIDEO_MAX_FRAMES -ErrorAction SilentlyContinue } else { $env:WOD_VIDEO_MAX_FRAMES = $previousVideoMaxFrames }

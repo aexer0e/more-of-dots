@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 1.2.0 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.2.0/More.of.Dots_1.2.0_x64-setup.exe)
+[Download More of Dots 1.3.2 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.3.2/More.of.Dots_1.3.2_x64-setup.exe)
 
 - Browse, search, and download War of Dots replays
 - Back up discovered replays automatically
@@ -12,6 +12,10 @@
 Replay video export is provided by the optional **More of Dots Recorder** package. The main app no longer bundles the PowerShell runner, process-injection DLL, Python worker, or FFmpeg, so a recorder quarantine does not remove the replay browser.
 
 The recorder bundles only the immutable War of Dots `1.4.1` build in `%LOCALAPPDATA%\More of Dots Recorder\versions` and copies it into a disposable job runtime. Older replays are normalized to `1.4.1` before launch, including structured player names, an explicit classic game mode, and empty motorised unit lists for older custom maps. Experimental replays retain their mode, units, and orders. Missing or unknown version labels use the same structural fallback when player names and tick orders can be derived. Recordings never launch the user's live Steam `game.exe`.
+
+Recording speeds are 1×, 2×, 4×, 6×, 10×, 15×, 20×, and 30×, with 10× selected by default. The recorder batches complete simulation updates between video frames to preserve replay orders and unit production. Export time depends on simulation cost, resolution, and the computer's speed; 30× does not guarantee an export thirty times faster than real time.
+
+Recording attempts keep `logs.txt`, `job.json`, `video-recording-status.json`, and any `game-error.txt` in `%APPDATA%\local.more-of-dots\jobs\<job-id>`. The status and game error survive disposable runtime cleanup. Collect them soon after a failure, before older jobs are pruned for space.
 
 ### Installing and updating from the app
 

@@ -2422,6 +2422,10 @@ struct ReplayRecordingOptions {
     playback_speed: u32,
     bitrate_kbps: u32,
     resolution_height: u32,
+    #[serde(default)]
+    music_volume: u32,
+    #[serde(default)]
+    sfx_volume: u32,
 }
 
 #[tauri::command]
@@ -2500,6 +2504,8 @@ fn append_recording_manifest(
         "speed": options.playback_speed,
         "bitrateKbps": options.bitrate_kbps,
         "resolutionHeight": options.resolution_height,
+        "musicVolume": options.music_volume,
+        "sfxVolume": options.sfx_volume,
         "exportedAt": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs()),
         "recording": status,
     }));
@@ -2697,7 +2703,19 @@ async fn record_one_replay(
                     options.bitrate_kbps.to_string(),
                     "--resolution-height".to_string(),
                     options.resolution_height.to_string(),
-                ],
+                ]
+                .into_iter()
+                .chain(if options.music_volume > 0 || options.sfx_volume > 0 {
+                    vec![
+                        "--music-volume".to_string(),
+                        options.music_volume.to_string(),
+                        "--sfx-volume".to_string(),
+                        options.sfx_volume.to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                })
+                .collect(),
             )
             .await;
 
@@ -2865,14 +2883,27 @@ async fn record_replays_inner(
         }
     }
 
-    if ![1, 2, 4, 6, 10].contains(&options.playback_speed) {
-        return Err("Playback speed must be 1x, 2x, 4x, 6x, or 10x.".to_string());
+    if ![1, 2, 4, 6, 10, 15, 20, 30].contains(&options.playback_speed) {
+        return Err("Playback speed must be 1x, 2x, 4x, 6x, 10x, 15x, 20x, or 30x.".to_string());
     }
     if ![500, 1000, 2500, 5000, 10000].contains(&options.bitrate_kbps) {
         return Err("Video bitrate must use one of the supported presets.".to_string());
     }
     if ![480, 720, 1080].contains(&options.resolution_height) {
         return Err("Video resolution must be 480p, 720p, or 1080p.".to_string());
+    }
+    if options.music_volume > 100 || options.sfx_volume > 100 {
+        return Err("Music and sound effect volumes must be between 0 and 100.".to_string());
+    }
+    if options.music_volume > 0 || options.sfx_volume > 0 {
+        let capabilities = recorder_status(app.clone()).await?;
+        let controls = capabilities.get("audio_controls").and_then(Value::as_array);
+        let supports_audio = ["music", "sfx"].iter().all(|control| {
+            controls.is_some_and(|items| items.iter().any(|item| item.as_str() == Some(control)))
+        });
+        if !supports_audio {
+            return Err("Update More of Dots Recorder to record music and sound effects.".to_string());
+        }
     }
     let total = replays.len();
     let concurrency = options.concurrency.clamp(1, total.min(20));

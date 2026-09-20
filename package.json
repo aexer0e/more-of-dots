@@ -16,7 +16,7 @@
     "build:recorder": "powershell.exe -NoProfile -File scripts/build-recorder.ps1",
     "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
     "build": "node scripts/version.mjs tauri build && npm run size:audit",
-    "check:leaderboard": "node --test scripts/leaderboard.test.mjs scripts/leaderboard-chart.test.mjs",
+    "check:leaderboard": "node --test scripts/leaderboard.test.mjs scripts/leaderboard-chart.test.mjs scripts/leaderboard-activity.test.mjs",
     "check:map": "node --test scripts/map-codec.test.mjs",
     "dev:desktop": "node scripts/version.mjs tauri dev",
     "check:examples": "node --test scripts/dev-data.test.mjs"

@@ -42,3 +42,13 @@
 .lb-list-footer { justify-content:flex-end; padding:6px 13px; }
 
 .lb-chart-date { position:absolute; top:0; right:12px; color:var(--lb-muted); font-size:9px; pointer-events:none; }
+.leaderboard-page th:has(.lb-sort) { padding-top:3px; padding-bottom:3px; }
+.leaderboard-page .lb-sort { display:inline-flex; align-items:center; gap:5px; padding:0 2px; border:0; background:transparent; color:inherit; white-space:nowrap; font-size:9px; letter-spacing:inherit; text-transform:none; cursor:pointer; }
+.lb-sort svg { opacity:.45; flex-shrink:0; }
+th[aria-sort=ascending] .lb-sort, th[aria-sort=descending] .lb-sort { color:var(--lb-accent); }
+th[aria-sort=ascending] .lb-sort svg, th[aria-sort=descending] .lb-sort svg { opacity:1; }
+.lb-activity { width:105px; white-space:nowrap; text-align:right; color:var(--lb-muted); font-size:10px; }
+.lb-activity-note { margin-right:auto; text-align:left; }
+.lb-list-footer { gap:8px; }
+.lb-rankings { min-width:0; }
+@media(min-width:741px) and (max-width:1050px) { .lb-workspace { grid-template-columns:minmax(380px,1.35fr) minmax(250px,1fr); } }

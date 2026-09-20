@@ -13,6 +13,7 @@ export async function exampleLeaderboard<T>(url: string): Promise<T> {
   const data = await examples();
   if (url === '/v1/leaderboard') return structuredClone(data.leaderboard.latest) as T;
   const query = new URL(url, 'http://localhost').searchParams;
+  if (url.startsWith('/v1/leaderboard/history?')) return { rows: data.leaderboard.history.filter((row) => row.capturedAt >= Number(query.get('from')) && row.capturedAt <= Number(query.get('to'))) } as T;
   const board = query.get('board') as Board, names = query.getAll('player');
   const to = Number(query.get('to')), days = Number(query.get('days')), from = days === 0 ? 0 : to - days * 86400, step = days === 7 ? 21600 : 86400;
   const buckets = new Map<number, Snapshot>();

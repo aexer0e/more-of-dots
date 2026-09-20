@@ -378,7 +378,11 @@ class LocalSessionRunner:
         bitrate_kbps: int,
         resolution_height: int,
         timeout_seconds: int,
+        music_volume: int = 0,
+        sfx_volume: int = 0,
     ) -> dict[str, Any]:
+        if not 0 <= music_volume <= 100 or not 0 <= sfx_volume <= 100:
+            raise ValueError("Music and sound effect volumes must be between 0 and 100.")
         try:
             command = self._runner_command(
                 [
@@ -399,6 +403,10 @@ class LocalSessionRunner:
                     str(bitrate_kbps),
                     "-VideoHeight",
                     str(resolution_height),
+                    "-MusicVolume",
+                    str(music_volume),
+                    "-SfxVolume",
+                    str(sfx_volume),
                     "-VideoMaxFrames",
                     "0",
                     "-MaxSeconds",

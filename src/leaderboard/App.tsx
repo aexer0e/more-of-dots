@@ -1,8 +1,9 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { invoke } from '../platform';
 import { cached, historyPath, retrieve, type Board, type History, type Player, type Snapshot } from './client';
-import { Check, Crosshair, Pencil, Plus, RefreshCw, Search, Trophy, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, Check, Crosshair, Pencil, Plus, RefreshCw, Search, Trophy, X } from 'lucide-react';
 import { chartAxis, MAX_COMPARISONS, playerColors, seriesPath, snapshotDelay } from './chart';
+import { activityColor, activityLabel, lastActivities, sortPlayers, type TableSort } from './activity';
 import './styles.css';
 
 const LATEST = '/v1/leaderboard';
@@ -53,10 +54,17 @@ function ProgressChart({ history, players, colors, metric, onInspect }: { histor
 
 export function LeaderboardApp() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(() => cached<Snapshot>(LATEST)?.data ?? null);
+  const [activityHistory, setActivityHistory] = useState<Snapshot[]>([]);
+  const [activityStatus, setActivityStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [sort, setSort] = useState<TableSort>(() => {
+    const saved = preference('sort');
+    return { key: saved.startsWith('activity:') ? 'activity' : 'rank', descending: saved.endsWith(':desc') };
+  });
   const [board, setBoard] = useState<Board>('elo');
   const [identity, setIdentity] = useState('');
   const [manualName, setManualName] = useState(() => preference('player'));
   const [search, setSearch] = useState('');
+  const [includeMe, setIncludeMe] = useState(() => preference('includeMe', 'true') !== 'false');
   const [nearMe, setNearMe] = useState(false);
   const [editingMe, setEditingMe] = useState(false);
   const mineRef = useRef<HTMLTableRowElement>(null);
@@ -75,7 +83,7 @@ export function LeaderboardApp() {
   const colorMap = useRef(new Map<string, string>());
   const chosenName = manualName.trim() || identity;
   const me = snapshot?.[board].find((p) => p.nickname.toLocaleLowerCase() === chosenName.toLocaleLowerCase())?.nickname ?? chosenName;
-  const names = [...new Set([me, ...comparisons].filter(Boolean))].slice(0, MAX_COMPARISONS + 1);
+  const names = [...new Set([includeMe ? me : '', ...comparisons.filter((name) => name !== me)].filter(Boolean))].slice(0, MAX_COMPARISONS + 1);
   colorMap.current = playerColors(names, colorMap.current);
   const colors = colorMap.current;
   const nameKey = JSON.stringify(names);
@@ -107,7 +115,7 @@ export function LeaderboardApp() {
   }, []);
 
   useEffect(() => {
-    if (!snapshot || !names.length) { setHistory(null); return; }
+    if (!snapshot || !names.length) { setHistory(null); setHistoryLoading(false); setHistoryError(''); return; }
     let active = true;
     const path = historyPath(board, names, days, snapshot.capturedAt);
     const scope = `${board}-${days}`;
@@ -121,18 +129,42 @@ export function LeaderboardApp() {
     return () => { active = false; };
   }, [board, nameKey, days, snapshot?.capturedAt, retry]);
 
+  useEffect(() => {
+    if (!snapshot) return;
+    let active = true;
+    setActivityStatus('loading');
+    const path = `/v1/leaderboard/history?from=${snapshot.capturedAt - 30 * 86400}&to=${snapshot.capturedAt + 1}&step=21600&limit=336&top=100`;
+    void retrieve<{ rows: Snapshot[] }>(path).then((result) => {
+      if (active) { setActivityHistory(result.rows); setActivityStatus('ready'); }
+    }).catch(() => { if (active) setActivityStatus('error'); });
+    return () => { active = false; };
+  }, [snapshot?.capturedAt, retry]);
+
+  const activity = useMemo(() => lastActivities([...activityHistory, ...(snapshot ? [snapshot] : [])]), [activityHistory, snapshot]);
+  function changeSort(key: TableSort['key']) {
+    const next = { key, descending: key === sort.key ? !sort.descending : key === 'activity' };
+    setSort(next); remember('sort', `${next.key}:${next.descending ? 'desc' : 'asc'}`);
+  }
+  function sortHeader(key: TableSort['key'], label: string) {
+    const Icon = sort.key !== key ? ArrowUpDown : sort.descending ? ArrowDown : ArrowUp;
+    const direction = sort.key === key ? !sort.descending : key === 'activity';
+    return <button className="lb-sort" onClick={() => changeSort(key)} aria-label={`Sort by ${label.toLowerCase()}, ${direction ? 'descending' : 'ascending'}`} title={`Sort by ${label.toLowerCase()}`}>
+      {label}<Icon size={11} aria-hidden="true" />
+    </button>;
+  }
+
   function togglePlayer(player: Player) {
-    if (player.nickname === me) return;
+    if (player.nickname === me) { setIncludeMe(!includeMe); remember('includeMe', String(!includeMe)); return; }
     const otherPlayers = comparisons.filter((name) => name !== me);
     const next = otherPlayers.includes(player.nickname) ? otherPlayers.filter((name) => name !== player.nickname) : [...otherPlayers, player.nickname].slice(0, MAX_COMPARISONS);
     setComparisons(next); remember('comparisons', JSON.stringify(next));
   }
   const previousPoint = history?.rows.find((row) => row.players.some((p) => p.nickname === me && p.rank != null));
   const previous = previousPoint?.players.find((p) => p.nickname === me);
-  const visibleRows = rows.filter((p) => p.nickname.toLocaleLowerCase().includes(search.toLocaleLowerCase()) && (!nearMe || !mine || Math.abs(p.rank - mine.rank) <= 5));
+  const visibleRows = sortPlayers(rows.filter((p) => p.nickname.toLocaleLowerCase().includes(search.toLocaleLowerCase()) && (!nearMe || !mine || Math.abs(p.rank - mine.rank) <= 5)), activity, sort);
   const rivals = comparisons.filter((name) => name !== me);
   const nextRank = mine ? rows.find((p) => p.rank === mine.rank - 1) : undefined;
-  const removePlayer = (name: string) => { const next = comparisons.filter((p) => p !== name); setComparisons(next); remember('comparisons', JSON.stringify(next)); };
+  const removePlayer = (name: string) => { if (name === me) { setIncludeMe(false); remember('includeMe', 'false'); return; } const next = comparisons.filter((p) => p !== name); setComparisons(next); remember('comparisons', JSON.stringify(next)); };
   const change = mine && previous?.value != null ? mine.value - previous.value : null;
   const rankChange = mine && previous?.rank != null ? previous.rank - mine.rank : null;
   function findMe() { setSearch(''); setNearMe(false); requestAnimationFrame(() => mineRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })); }
@@ -146,7 +178,7 @@ export function LeaderboardApp() {
     {error && <p role="alert" className="lb-error">{error} {snapshot && 'Showing saved rankings.'}</p>}
     {snapshot && delay && <p className="lb-error">Snapshot delayed · Last snapshot {delay} · {new Date(snapshot.capturedAt * 1000).toLocaleString()}</p>}
     <section className="lb-self" aria-label="Your standing">
-      <div className="lb-self-name"><span className="lb-avatar">{(me || '?').slice(0, 1).toUpperCase()}</span><div><span className="lb-caption">Your player</span><strong>{me || 'Choose a player'}</strong></div><button className="lb-icon-button" aria-label="Change your player" onClick={() => setEditingMe(!editingMe)}><Pencil size={12}/></button></div>
+      <div className="lb-self-name"><span className="lb-avatar">{(me || '?').slice(0, 1).toUpperCase()}</span><div><span className="lb-caption">Your player</span><strong>{me || 'Choose a player'}</strong></div><button className="lb-icon-button" aria-label="Change your player" onClick={() => setEditingMe(!editingMe)}><Pencil size={12}/></button>{me && <button className="lb-icon-button" aria-label={includeMe ? 'Remove me from graph' : 'Add me to graph'} aria-pressed={includeMe} onClick={() => { setIncludeMe(!includeMe); remember('includeMe', String(!includeMe)); }}>{includeMe ? <Check size={13}/> : <Plus size={13}/>}</button>}</div>
       <div className="lb-self-stat"><span className="lb-caption">Rank</span><strong>{mine ? `#${mine.rank}` : snapshot ? 'Unranked' : '—'}</strong>{rankChange != null && <small className={rankChange > 0 ? 'lb-positive' : rankChange < 0 ? 'lb-negative' : 'lb-muted'}>{rankChange === 0 ? 'No change' : `${rankChange > 0 ? '↑' : '↓'} ${Math.abs(rankChange)} ${Math.abs(rankChange) === 1 ? 'place' : 'places'}`}</small>}</div>
       <div className="lb-self-stat"><span className="lb-caption">{scoreLabel}</span><strong>{mine ? number(mine.value) : '—'}</strong>{change != null && <small className={change > 0 ? 'lb-positive' : change < 0 ? 'lb-negative' : 'lb-muted'}>{signed(change)} since {date(previousPoint!.capturedAt)}</small>}</div>
       <div className="lb-next"><span className="lb-caption">{nextRank ? `To #${nextRank.rank}` : 'Next rank'}</span><strong>{nextRank && mine ? `${number(nextRank.value - mine.value)} ${board === 'elo' ? 'Elo' : 'wins'}` : mine ? 'Leading' : 'Top 100 required'}</strong>{nextRank && <small>{nextRank.nickname}</small>}</div>
@@ -156,16 +188,16 @@ export function LeaderboardApp() {
       <section className="lb-rankings" aria-label="Rankings">
         <div className="lb-list-toolbar"><label className="lb-search"><Search size={14}/><input type="search" aria-label="Search leaderboard" placeholder="Find a player…" value={search} onChange={(event) => { setSearch(event.target.value); setNearMe(false); }} /></label><button className="lb-icon-button" aria-label="Find me" disabled={!mine} onClick={findMe}><Crosshair size={16}/></button></div>
         <div className="lb-list-context"><div className="lb-list-tabs"><button aria-pressed={!nearMe} onClick={() => setNearMe(false)}>All players</button><button aria-pressed={nearMe} disabled={!mine} onClick={() => setNearMe(true)}>Near me</button></div><span>{visibleRows.length} players</span></div>
-        <div className="lb-ranking-scroll"><table><thead><tr><th className="lb-rank">#</th><th>Player</th><th className="lb-numeric">{scoreLabel}</th><th className="lb-numeric lb-gap">Gap</th><th className="lb-compare-col"><span className="lb-sr-only">Compare</span></th></tr></thead><tbody>{visibleRows.map((p) => { const isMe = p.nickname === me, selected = rivals.includes(p.nickname); return <tr key={p.nickname} ref={isMe ? mineRef : undefined} className={isMe ? 'lb-you' : selected ? 'lb-comparing' : ''}><td className={`lb-rank ${p.rank <= 3 ? 'lb-podium' : ''}`}>{p.rank}</td><td className="lb-player-name"><span className={`lb-faction lb-faction-${p.faction}`} style={colors.has(p.nickname) ? { background: colors.get(p.nickname) } : undefined} /><span>{p.nickname}</span>{isMe && <span className="lb-you-tag">You</span>}</td><td className="lb-numeric lb-score">{number(p.value)}</td><td className="lb-numeric lb-muted lb-gap">{mine && !isMe ? signed(p.value - mine.value) : '—'}</td><td className="lb-compare-col"><button className={`lb-compare ${selected || isMe ? 'is-selected' : ''}`} aria-label={isMe ? 'Your player is included' : `${selected ? 'Remove' : 'Compare'} ${p.nickname}`} aria-pressed={selected || isMe} style={colors.has(p.nickname) ? { color: colors.get(p.nickname), borderColor: colors.get(p.nickname) } : undefined} disabled={isMe || (!selected && rivals.length >= MAX_COMPARISONS)} onClick={() => togglePlayer(p)}>{selected || isMe ? <Check size={13}/> : <Plus size={13}/>}</button></td></tr>; })}</tbody></table>
+        <div className="lb-ranking-scroll"><table><thead><tr><th className="lb-rank" aria-sort={sort.key === 'rank' ? sort.descending ? 'descending' : 'ascending' : 'none'}>{sortHeader('rank', 'Rank')}</th><th>Player</th><th className="lb-numeric">{scoreLabel}</th><th className="lb-numeric lb-gap">Gap</th><th className="lb-activity" aria-sort={sort.key === 'activity' ? sort.descending ? 'descending' : 'ascending' : 'none'}>{sortHeader('activity', 'Last activity')}</th><th className="lb-compare-col"><span className="lb-sr-only">Compare</span></th></tr></thead><tbody>{visibleRows.map((p) => { const isMe = p.nickname === me, selected = isMe ? includeMe : rivals.includes(p.nickname); return <tr key={p.nickname} ref={isMe ? mineRef : undefined} className={isMe ? 'lb-you' : selected ? 'lb-comparing' : ''}><td className={`lb-rank ${p.rank <= 3 ? 'lb-podium' : ''}`}>{p.rank}</td><td className="lb-player-name"><span className={`lb-faction lb-faction-${p.faction}`} style={colors.has(p.nickname) ? { background: colors.get(p.nickname) } : undefined} /><span title={p.nickname}>{p.nickname}</span>{isMe && <span className="lb-you-tag">You</span>}</td><td className="lb-numeric lb-score">{number(p.value)}</td><td className="lb-numeric lb-muted lb-gap">{mine && !isMe ? signed(p.value - mine.value) : '—'}</td><td className="lb-activity" style={{ color: activityColor(activity.get(p.nickname), now) }} title={activity.has(p.nickname) ? `Score change observed ${new Date(activity.get(p.nickname)! * 1000).toLocaleString()}. Estimated from six-hour leaderboard samples.` : activityStatus === 'loading' ? 'Loading activity history' : activityStatus === 'error' ? 'Activity history unavailable. Use Check for updates to retry.' : 'No score change observed in the past 30 days of available history.'}>{activity.has(p.nickname) ? <time dateTime={new Date(activity.get(p.nickname)! * 1000).toISOString()}>{activityLabel(activity.get(p.nickname)!, now)}</time> : activityStatus === 'loading' ? '…' : activityStatus === 'error' ? '—' : '>30d ago'}</td><td className="lb-compare-col"><button className={`lb-compare ${selected ? 'is-selected' : ''}`} aria-label={`${selected ? 'Remove' : 'Compare'} ${p.nickname}`} aria-pressed={selected} style={colors.has(p.nickname) ? { color: colors.get(p.nickname), borderColor: colors.get(p.nickname) } : undefined} disabled={!isMe && !selected && rivals.length >= MAX_COMPARISONS} onClick={() => togglePlayer(p)}>{selected ? <Check size={13}/> : <Plus size={13}/>}</button></td></tr>; })}</tbody></table>
         {!visibleRows.length && <div className="lb-empty">{loading && !snapshot ? 'Loading rankings…' : search ? 'No players found.' : 'No rankings available.'}{search && <button className="lb-text-button" onClick={() => setSearch('')}>Clear search</button>}</div>}</div>
-        <footer className="lb-list-footer"><span>{rivals.length}/{MAX_COMPARISONS}</span></footer>
+        <footer className="lb-list-footer"><span className="lb-activity-note">{activityStatus === 'error' ? 'Activity unavailable · refresh to retry' : 'Activity based on observed score changes'}</span><span>{rivals.length}/{MAX_COMPARISONS}</span></footer>
       </section>
       <aside className="lb-progress" aria-label="Player progress">
         <div className="lb-panel-heading"><h2>Progress</h2><div className="lb-period" aria-label="History period">{[7, 30, 90, 0].map((period) => <button key={period} aria-pressed={days === period} onClick={() => setDays(period)}>{period === 0 ? 'All' : `${period}d`}</button>)}</div></div>
         <div className="lb-chart-controls"><div className="lb-list-tabs" aria-label="Chart metric"><button aria-pressed={metric === 'value'} onClick={() => setMetric('value')}>{scoreLabel}</button><button aria-pressed={metric === 'rank'} onClick={() => setMetric('rank')}>Rank</button></div>{historyLoading && <span className="lb-muted">Updating…</span>}</div>
         {historyError && <p role="alert" className="lb-error">{historyError}</p>}
         {history ? <ProgressChart key={`${board}-${days}`} history={history} players={names} colors={colors} metric={metric} onInspect={setInspectedAt} /> : <div className="lb-empty lb-chart-empty">{historyLoading ? 'Loading history…' : 'Select a player'}</div>}
-        <div className="lb-comparison-list">{names.map((name) => { const player = inspectedAt == null ? rows.find((p) => p.nickname === name) : history?.rows.find((r) => r.capturedAt === inspectedAt)?.players.find((p) => p.nickname === name); const first = history?.rows.find((r) => r.players.some((p) => p.nickname === name && p.value != null))?.players.find((p) => p.nickname === name); const delta = player?.value != null && first?.value != null ? player.value - first.value : null; return <div className="lb-comparison-player" key={name}><i style={{ background: colors.get(name) }}/><div><strong>{name}{name === me && <span className="lb-you-tag">You</span>}</strong><small>{player?.rank != null ? `#${player.rank}` : 'Unranked'}{delta != null && <span className={delta > 0 ? 'lb-positive' : delta < 0 ? 'lb-negative' : ''}>{signed(delta)}</span>}</small></div><b>{player?.value != null ? number(player.value) : '—'}</b>{name !== me && <button className="lb-icon-button" aria-label={`Remove ${name} from comparison`} onClick={() => removePlayer(name)}><X size={12}/></button>}</div>; })}</div>
+        <div className="lb-comparison-list">{names.map((name) => { const player = inspectedAt == null ? rows.find((p) => p.nickname === name) : history?.rows.find((r) => r.capturedAt === inspectedAt)?.players.find((p) => p.nickname === name); const first = history?.rows.find((r) => r.players.some((p) => p.nickname === name && p.value != null))?.players.find((p) => p.nickname === name); const delta = player?.value != null && first?.value != null ? player.value - first.value : null; return <div className="lb-comparison-player" key={name}><i style={{ background: colors.get(name) }}/><div><strong>{name}{name === me && <span className="lb-you-tag">You</span>}</strong><small>{player?.rank != null ? `#${player.rank}` : 'Unranked'}{delta != null && <span className={delta > 0 ? 'lb-positive' : delta < 0 ? 'lb-negative' : ''}>{signed(delta)}</span>}</small></div><b>{player?.value != null ? number(player.value) : '—'}</b><button className="lb-icon-button" aria-label={`Remove ${name} from comparison`} onClick={() => removePlayer(name)}><X size={12}/></button></div>; })}</div>
 
         {rivals.length > 0 && <button className="lb-text-button lb-clear" onClick={() => { setComparisons([]); remember('comparisons', '[]'); }}>Clear comparisons</button>}
 

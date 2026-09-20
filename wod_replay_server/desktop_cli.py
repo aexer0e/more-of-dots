@@ -470,6 +470,7 @@ def command_recorder_capabilities() -> dict[str, Any]:
         "name": "More of Dots Recorder",
         "version": recorder_version(),
         "protocol_versions": [1],
+        "audio_controls": ["music", "sfx"],
         "commands": [
             "record-replay",
             "capture-file",
@@ -623,7 +624,11 @@ def command_record_replay(
     bitrate_kbps: int,
     resolution_height: int,
     owner_pid: int | None = None,
+    music_volume: int = 0,
+    sfx_volume: int = 0,
 ) -> dict[str, Any]:
+    if not 0 <= music_volume <= 100 or not 0 <= sfx_volume <= 100:
+        raise ValueError("Music and sound effect volumes must be between 0 and 100.")
     ctx = _load_backend(runtime_dir, owner_pid)
     paths, document = _create_capture_job(ctx, input_path, filename)
     if document is None:
@@ -633,8 +638,8 @@ def command_record_replay(
     ffmpeg_path = _resolve_ffmpeg_path(ffmpeg_path)
     cancel_path = cancel_path.expanduser().resolve()
     status_path = status_path.expanduser().resolve()
-    if playback_speed not in {1, 2, 4, 6, 10}:
-        raise ValueError("Playback speed must be 1x, 2x, 4x, 6x, or 10x.")
+    if playback_speed not in {1, 2, 4, 6, 10, 15, 20, 30}:
+        raise ValueError("Playback speed must be 1x, 2x, 4x, 6x, 10x, 15x, 20x, or 30x.")
     if bitrate_kbps not in {500, 1000, 2500, 5000, 10000}:
         raise ValueError("Video bitrate must use one of the supported presets.")
     if resolution_height not in {480, 720, 1080}:
@@ -655,6 +660,8 @@ def command_record_replay(
         playback_speed=playback_speed,
         bitrate_kbps=bitrate_kbps,
         resolution_height=resolution_height,
+        music_volume=music_volume,
+        sfx_volume=sfx_volume,
         timeout_seconds=max(60, ctx.settings.capture_timeout_seconds),
     )
     ctx.store.append_log(paths, f"record-replay result: {result}")
@@ -703,6 +710,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playback-speed", type=int, default=10)
     parser.add_argument("--bitrate-kbps", type=int, default=5000)
     parser.add_argument("--resolution-height", type=int, default=720)
+    parser.add_argument("--music-volume", type=int, default=0)
+    parser.add_argument("--sfx-volume", type=int, default=0)
     parser.add_argument("--owner-pid", type=int, default=None)
     return parser
 
@@ -750,6 +759,8 @@ def run(argv: list[str] | None = None) -> int:
                 args.bitrate_kbps,
                 args.resolution_height,
                 args.owner_pid,
+                args.music_volume,
+                args.sfx_volume,
             )
         else:
             raise ValueError(f"Unknown desktop command: {args.desktop_command}")

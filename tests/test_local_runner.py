@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import gzip
 import json
+import io
+import os
 import shutil
 import subprocess
 import threading
@@ -35,7 +37,8 @@ def test_replay_setup_overrides_new_game_offline_defaults() -> None:
 
 
 @pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell required")
-def test_staged_config_acknowledges_target_game_not_old_replay(tmp_path: Path) -> None:
+@pytest.mark.parametrize("recording,music,sfx", [(False, 0, 0), (True, 35, 70), (True, 0, 60)])
+def test_staged_config_acknowledges_target_game_not_old_replay(tmp_path: Path, recording: bool, music: int, sfx: int) -> None:
     root = Path(__file__).resolve().parents[1]
     game = tmp_path / "game"
     job = tmp_path / "job"
@@ -49,7 +52,8 @@ def test_staged_config_acknowledges_target_game_not_old_replay(tmp_path: Path) -
     }), encoding="utf-8")
     script = tmp_path / "test-config.ps1"
     script.write_text(r'''
-param($Runner, $Game, $Job)
+param($Runner, $Game, $Job, $Recording, [int]$MusicVolume, [int]$SfxVolume)
+$RecordReplay = $Recording -eq 'True'
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
@@ -70,9 +74,11 @@ Restore-ReplaySlot $state
 ''', encoding="utf-8")
     subprocess.run([
         "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-        str(root / "scripts/local-runner.ps1"), str(game), str(job),
+        str(root / "scripts/local-runner.ps1"), str(game), str(job), str(recording), str(music), str(sfx),
     ], check=True, capture_output=True, text=True)
     config = json.loads(gzip.decompress((job / "prepared-config.gz").read_bytes()))
+    assert config["music_volume"] == (music / 100 if recording else 0)
+    assert config["sfx_volume"] == (sfx / 100 if recording else 0)
     assert config["version"] == "1.4.1"
     assert config["welcome"] is False
     assert config["login"] == {"username": None, "password": None}
@@ -276,6 +282,151 @@ def test_video_recording_starts_replay_on_main_thread_with_watchdogs() -> None:
     assert "Replay startup produced no first video frame within 30 seconds." in content
     assert "Replay recording made no frame or status progress for 45 seconds." in content
     assert "if ($CancelPath -and (Test-Path -LiteralPath $CancelPath))" in content
+
+
+@pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell required")
+def test_recording_reports_game_exception_with_last_progress(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = tmp_path / "game-error.ps1"
+    script.write_text(r'''
+param($Runner, $ErrorLog)
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Runner, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+foreach ($statement in $ast.EndBlock.Statements) {
+    if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $statement.Name -in @('Get-RecordingGameFailure', 'Set-JsonProperty')) {
+        Invoke-Expression $statement.Extent.Text
+    }
+}
+$status = [pscustomobject]@{ status = 'recording'; tick = 2991; frame_count = 300 }
+if ($null -ne (Get-RecordingGameFailure $status $ErrorLog)) { throw 'Missing log is not a crash' }
+New-Item -ItemType File -Path $ErrorLog | Out-Null
+if ($null -ne (Get-RecordingGameFailure $status $ErrorLog)) { throw 'Empty log is not a crash' }
+Set-Content -LiteralPath $ErrorLog -Value '[GL: NVIDIA]'
+if ($null -ne (Get-RecordingGameFailure $status $ErrorLog)) { throw 'GPU banner is not a crash' }
+Set-Content -LiteralPath $ErrorLog -Value "Traceback (most recent call last):`nIndexError: index 51 is out of bounds"
+Get-RecordingGameFailure $status $ErrorLog | ConvertTo-Json -Compress
+''', encoding="utf-8")
+    result = subprocess.run([
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+        str(root / "scripts/local-runner.ps1"), str(tmp_path / "error_log.txt"),
+    ], check=True, capture_output=True, text=True)
+    status = json.loads(result.stdout)
+    assert status["status"] == "failed"
+    assert status["phase"] == "game-error"
+    assert status["tick"] == 2991
+    assert status["frame_count"] == 300
+    assert "IndexError: index 51" in status["error"]
+
+
+@pytest.mark.parametrize("speed", [1, 2, 4, 6, 10, 15, 20, 30])
+@pytest.mark.parametrize("audio_enabled", [False, True])
+@pytest.mark.parametrize("finish", ["end", "cancel", "frame-limit"])
+def test_video_speed_batches_complete_updates_and_preserves_end_hold(monkeypatch, tmp_path: Path, speed: int, finish: str, audio_enabled: bool) -> None:
+    content = (Path(__file__).resolve().parents[1] / "scripts/local-runner.ps1").read_text(encoding="utf-8")
+    source = "def install_main_thread_frame_hook" + content.split(
+        "def install_main_thread_frame_hook", 1
+    )[1].split("\ndef pump_live_scene_updates", 1)[0]
+    frames = []
+    audio_frames = []
+    audio_closed = []
+    audio_muxed = []
+    statuses = []
+    wall_time = [0.0]
+    cancel = tmp_path / "cancel"
+
+    class Scene:
+        def __init__(self):
+            self.ips = 1
+            self.core = SimpleNamespace(frame=0)
+            self.renders = 0
+            self.updates = []
+
+        def update(self):
+            assert self.ips == 1
+            if self.core.frame < 60:
+                self.core.frame += 1
+                self.updates.append(self.core.frame)
+                if finish == "cancel" and self.core.frame == 3:
+                    cancel.touch()
+            wall_time[0] += 1.1
+
+        def render(self):
+            self.renders += 1
+
+    scene = Scene()
+    surface = SimpleNamespace(get_size=lambda: (2, 2))
+    monkeypatch.setitem(sys.modules, "__main__", SimpleNamespace(aaadaa=Scene))
+    monkeypatch.setitem(sys.modules, "pygame", SimpleNamespace(
+        mixer=SimpleNamespace(__file__="pygame/mixer.pyd"),
+        display=SimpleNamespace(get_surface=lambda: surface),
+        image=SimpleNamespace(fromstring=lambda *args: surface, tostring=lambda *args: bytes([scene.core.frame])),
+    ))
+    monkeypatch.setitem(sys.modules, "OpenGL", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "OpenGL.GL", SimpleNamespace(
+        GL_RGB=1, GL_UNSIGNED_BYTE=2, glReadPixels=lambda *args: b"pixels",
+    ))
+    encoder = SimpleNamespace(
+        stdin=SimpleNamespace(write=frames.append, close=lambda: None),
+        stderr=io.BytesIO(), wait=lambda **kwargs: 0,
+    )
+    output = tmp_path / "test.mp4"
+    output.touch()
+    namespace = {
+        "sys": sys, "os": os,
+        "time": SimpleNamespace(monotonic=lambda: wall_time[0], time=lambda: wall_time[0]),
+        "subprocess": SimpleNamespace(Popen=lambda *args, **kwargs: encoder, PIPE=-1, DEVNULL=-3),
+        "VIDEO_AUDIO_ENABLED": audio_enabled,
+        "ReplayAudioCapture": lambda *args: SimpleNamespace(
+            path="audio.pcm", rate=44100, channels=2, capture_frame=lambda: audio_frames.append(len(frames)), close=lambda: audio_closed.append(True)),
+        "mux_replay_audio": lambda *args: audio_muxed.append(args),
+        "INSTALL_VIDEO_HOOK": True, "VIDEO_OUTPUT_PATH": str(output),
+        "VIDEO_STATUS_PATH": "status.json", "VIDEO_CANCEL_PATH": str(cancel),
+        "VIDEO_FFMPEG_PATH": "ffmpeg", "VIDEO_PLAYBACK_SPEED": speed,
+        "VIDEO_WIDTH": 2, "VIDEO_HEIGHT": 2, "VIDEO_FPS": 30,
+        "VIDEO_END_HOLD_SECONDS": 2, "VIDEO_BITRATE_KBPS": 5000, "VIDEO_MAX_FRAMES": 2 if finish == "frame-limit" else 0,
+        "REPLAY_TICKS_PER_SECOND": 30, "request": {"replay_metadata": {"end": 60}},
+        "to_int": int, "to_float": float, "attrs_of": vars,
+        "read_tick": lambda candidates: candidates[0].core.frame,
+        "write_video_status": statuses.append,
+    }
+    exec(source, namespace)
+    namespace["install_main_thread_frame_hook"]()
+    for _ in range(160):
+        scene.update()
+        scene.render()
+        if statuses[-1]["status"] in ("completed", "cancelled"):
+            break
+
+    assert statuses[-1]["status"] in ("completed", "cancelled"), statuses[-1]
+    assert len(audio_frames) == (len(frames) if audio_enabled else 0)
+    assert bool(audio_closed) == audio_enabled
+    assert bool(audio_muxed) == (audio_enabled and finish != "cancel")
+    if finish == "cancel":
+        assert statuses[-1]["status"] == "cancelled"
+        assert scene.updates == [1, 2, 3]
+        assert all(frame[0] < 3 for frame in frames)
+        return
+    if finish == "frame-limit":
+        assert statuses[-1]["completion_reason"] == "frame-limit"
+        assert frames == [bytes([1]), bytes([1 + speed])]
+        assert scene.updates == list(range(1, 2 + speed))
+        return
+
+    expected_ticks = list(range(1, 60, speed)) + [60] * 61
+    assert scene.updates == list(range(1, 61))
+    assert scene.renders == len(expected_ticks)
+    assert frames == [bytes([tick]) for tick in expected_ticks]
+    # A slow simulation still emits heartbeats within a batch of updates.
+    if speed > 1:
+        assert any(status.get("tick") == 3 for status in statuses)
+    assert statuses[-1]["status"] == "completed"
+    assert statuses[-1]["end_hold_frames"] == 61
+    assert statuses[-1]["speed_after"] == speed
+    assert any(status.get("simulation_speed") == 1 for status in statuses)
 
 
 def test_main_thread_replay_start_advances_one_scene_per_update(monkeypatch) -> None:

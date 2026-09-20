@@ -318,6 +318,9 @@ type ReplayRecordingSetup = {
   playbackSpeedIndex: number;
   bitrateIndex: number;
   resolutionIndex: number;
+  musicVolume: number;
+  sfxVolume: number;
+  audioSupported: boolean;
   replays: ReplayBrowserItem[];
   readiness: "checking" | "ready" | "error" | "recorder";
   error: string;
@@ -465,10 +468,10 @@ const BROWSER_GRID_CARD_SIZE_DEFAULT = 300;
 const BROWSER_GRID_CARD_SIZE_STEP = 10;
 const RECORDING_DIRECTORY_STORAGE_KEY = "moreOfDotsRecordingDirectory";
 const BROWSER_REPLAY_PLAYBACK_ENABLED = false;
-const RECORDING_SPEED_OPTIONS = [1, 2, 4, 6, 10] as const;
+const RECORDING_SPEED_OPTIONS = [1, 2, 4, 6, 10, 15, 20, 30] as const;
 const RECORDING_BITRATE_OPTIONS = [0.5, 1, 2.5, 5, 10] as const;
 const RECORDING_RESOLUTION_OPTIONS = [480, 720, 1080] as const;
-const RECORDING_DEFAULT_SPEED_INDEX = RECORDING_SPEED_OPTIONS.length - 1;
+const RECORDING_DEFAULT_SPEED_INDEX = RECORDING_SPEED_OPTIONS.indexOf(10);
 const RECORDING_DEFAULT_BITRATE_INDEX = 3;
 const RECORDING_DEFAULT_RESOLUTION_INDEX = 2;
 const FALLBACK_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(`
@@ -1545,7 +1548,7 @@ function refreshRecordingQueueUi() {
   if (!panel || !list) return;
 
   const items = recordingQueueItems();
-  panel.hidden = items.length === 0;
+  panel.hidden = browserPage !== "replays" || items.length === 0;
   if (!items.length) {
     list.replaceChildren();
     recordingQueueRows.clear();
@@ -1933,6 +1936,16 @@ function renderReplayRecordingDialog(): string {
           </label>
         </div>
 
+        <div class="recording-option-grid">
+          ${([['musicVolume', 'Music'], ['sfxVolume', 'Sound effects']] as const).map(([key, label]) => `
+            <label class="recording-option-card" for="recording${key}">
+              <span class="recording-option-heading"><strong>${label}</strong><output id="recording${key}Value">${setup[key]}%</output></span>
+              <input id="recording${key}" type="range" min="0" max="100" step="1" value="${setup[key]}" aria-valuetext="${setup[key]} percent" ${setup.audioSupported ? '' : 'disabled'}>
+              <div class="recording-slider-endpoints" aria-hidden="true"><span>Off</span><span>100%</span></div>
+            </label>`).join('')}
+        </div>
+        <p class="recording-audio-hint">${setup.audioSupported ? 'Set both volumes to zero for silent video. Audio may increase export time.' : 'Music and sound effects need a recorder version with audio support.'}</p>
+
         <div id="recordingPowerWarning" class="recording-power-warning" ${needsPowerWarning ? "" : "hidden"} role="status">
           <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17h.01"/></svg>
           <span><strong>Powerful PC recommended</strong><small>More than 5 simultaneous games can heavily load your CPU, GPU, memory, and storage.</small></span>
@@ -2252,6 +2265,7 @@ function mountMapEditor() {
 let leaderboardRoot: Root | null = null;
 
 function renderReplayBrowser() {
+  refreshRecordingQueueUi();
   if (browserPage !== "leaderboard" && leaderboardRoot) {
     leaderboardRoot.unmount();
     leaderboardRoot = null;
@@ -2761,6 +2775,15 @@ function bindBrowserEvents() {
     input.setAttribute("aria-valuetext", `${RECORDING_BITRATE_OPTIONS[browserRecordingSetup.bitrateIndex] ?? 5} megabits per second`);
     updateRecordingSetupUi();
   });
+  for (const key of ['musicVolume', 'sfxVolume'] as const) {
+    document.querySelector<HTMLInputElement>(`#recording${key}`)?.addEventListener('input', (event) => {
+      if (!browserRecordingSetup) return;
+      const input = event.currentTarget as HTMLInputElement;
+      browserRecordingSetup[key] = Number(input.value);
+      input.setAttribute('aria-valuetext', `${input.value} percent`);
+      updateRecordingSetupUi();
+    });
+  }
   document.querySelector<HTMLInputElement>("#recordingResolution")?.addEventListener("input", (event) => {
     if (!browserRecordingSetup) return;
     const input = event.currentTarget as HTMLInputElement;
@@ -2950,6 +2973,9 @@ async function recordSelectedReplays() {
     playbackSpeedIndex: RECORDING_DEFAULT_SPEED_INDEX,
     bitrateIndex: RECORDING_DEFAULT_BITRATE_INDEX,
     resolutionIndex: RECORDING_DEFAULT_RESOLUTION_INDEX,
+    musicVolume: 0,
+    sfxVolume: 0,
+    audioSupported: false,
     replays: [...replays],
     readiness: "checking",
     error: "",
@@ -2968,6 +2994,7 @@ async function evaluateRecordingReadiness(setup: ReplayRecordingSetup) {
     const [recorder, vault, defaultDirectory] = await Promise.all([
       invoke<{
       protocol_versions: number[];
+      audio_controls?: string[];
       supported_versions: {
         versions: string[];
         target_game_version: string;
@@ -2986,6 +3013,7 @@ async function evaluateRecordingReadiness(setup: ReplayRecordingSetup) {
       throw new Error(`Bundled game data is missing for ${targetGameVersion}. Repair or reinstall More of Dots Recorder.`);
     }
     if (browserRecordingSetup !== setup) return;
+    setup.audioSupported = ["music", "sfx"].every((control) => recorder.audio_controls?.includes(control));
     setup.destinationDir = defaultDirectory;
     setup.readiness = "ready";
     rememberRecordingDirectory(defaultDirectory);
@@ -3048,6 +3076,10 @@ function updateRecordingSetupUi() {
   if (speedOutput) speedOutput.value = `${speed}×`;
   if (bitrateOutput) bitrateOutput.value = `${bitrate} Mbps`;
   if (resolutionOutput) resolutionOutput.value = `${resolution}p`;
+  for (const key of ['musicVolume', 'sfxVolume'] as const) {
+    const output = document.querySelector<HTMLOutputElement>(`#recording${key}Value`);
+    if (output) output.value = `${setup[key]}%`;
+  }
   document.querySelector<HTMLElement>("#recordingPowerWarning")?.toggleAttribute("hidden", setup.concurrency <= 5);
   const summary = document.querySelector<HTMLElement>(".recording-setup-summary strong");
   if (summary) summary.textContent = `${speed}× · ${resolution}p · ${bitrate} Mbps`;
@@ -3111,6 +3143,8 @@ async function startConfiguredRecording() {
         playbackSpeed,
         bitrateKbps: Math.round(bitrateMbps * 1000),
         resolutionHeight,
+        musicVolume: setup.musicVolume,
+        sfxVolume: setup.sfxVolume,
       },
     });
     void result;

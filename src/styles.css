@@ -1912,7 +1912,7 @@ p {
 
 .recording-setup-backdrop {
   -webkit-backdrop-filter: blur(14px) saturate(0.8);
-  align-items: center;
+  align-items: flex-start;
   backdrop-filter: blur(14px) saturate(0.8);
   background: rgba(3, 6, 5, 0.78);
   display: flex;
@@ -1931,6 +1931,7 @@ p {
   border-radius: var(--r-md);
   box-shadow: var(--shadow), 0 0 0 2px rgba(238, 244, 240, 0.05) inset;
   color: var(--browser-text);
+  margin: auto 0;
   max-width: 760px;
   overflow: hidden;
   width: 100%;
@@ -2105,6 +2106,12 @@ p {
   padding: 16px 26px 18px;
 }
 
+.recording-audio-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 24px 16px;
+}
+
 .recording-option-card {
   background: var(--surface-2);
   border: 1px solid rgba(238, 244, 240, 0.05);
@@ -2197,6 +2204,22 @@ p {
   font-weight: var(--fw-medium);
   justify-content: space-between;
   margin-top: 2px;
+}
+
+/* Tick labels mark exact slider stops, so they are inset by half the thumb width
+   and drawn as zero-width boxes that centre their text on the thumb position.
+   Laying them out as normal boxes would let their differing widths push the
+   middle labels away from the stops they belong to. */
+.recording-slider-scale {
+  margin-left: 8px;
+  margin-right: 8px;
+}
+
+.recording-slider-scale span {
+  display: flex;
+  justify-content: center;
+  white-space: nowrap;
+  width: 0;
 }
 
 .recording-power-warning {

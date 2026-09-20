@@ -297,10 +297,10 @@
     </svg>
     <p class="tagline">A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.</p>
     <div class="buttons">
-      <a class="btn primary" id="download-btn" href="https://github.com/aexer0e/more-of-dots/releases/download/v1.3.2/More.of.Dots_1.3.2_x64-setup.exe">Download for Windows</a>
+      <a class="btn primary" id="download-btn" href="https://github.com/aexer0e/more-of-dots/releases/download/v1.3.3/More.of.Dots_1.3.3_x64-setup.exe">Download for Windows</a>
       <a class="btn" href="https://github.com/aexer0e/more-of-dots">Source on GitHub</a>
     </div>
-    <p class="fine-print" id="fine-print">Free · Open source · Windows installer · v1.3.2</p>
+    <p class="fine-print" id="fine-print">Free · Open source · Windows installer · v1.3.3</p>
 
     <figure class="shot-hero tilt-l">
       <div class="shot">
@@ -382,7 +382,7 @@
 
   <script>
     // Point the download button at the newest installer; the hardcoded
-    // v1.3.2 app link stays as the fallback if this fails or JS is off.
+    // v1.3.3 app link stays as the fallback if this fails or JS is off.
     fetch("https://api.github.com/repos/aexer0e/more-of-dots/releases/latest")
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((release) => {

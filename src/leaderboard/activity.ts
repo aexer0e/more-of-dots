@@ -41,5 +41,5 @@ export function activityColor(stamp: number | undefined, now: number) {
   const strength = minutes <= 300
     ? 1 - .5 * Math.log(minutes / 5) / Math.log(300 / 5)
     : .5 * (1 - Math.log(minutes / 300) / Math.log(4320 / 300));
-  return `hsl(200 ${(strength * 70).toFixed(2)}% ${(56 + strength * 32).toFixed(2)}%)`;
+  return `hsl(145 ${(strength * 70).toFixed(2)}% ${(56 + strength * 8).toFixed(2)}%)`;
 }

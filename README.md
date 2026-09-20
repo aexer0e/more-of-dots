@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 1.3.2 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.3.2/More.of.Dots_1.3.2_x64-setup.exe)
+[Download More of Dots 1.3.3 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.3.3/More.of.Dots_1.3.3_x64-setup.exe)
 
 - Browse, search, and download War of Dots replays
 - Back up discovered replays automatically
@@ -106,7 +106,7 @@ The Leaderboard tab replaces Region because servers are now mixed. It reads publ
 
 Search runs locally. Compare up to ten players alongside your own rank and score over 7, 30, 90 days, or all available history. Each player keeps a distinct color. The worker samples six-hour intervals for the week view and daily intervals for longer views. Charts connect missing observations with straight lines; the recorded values table retains missing values. Axis ticks use uniform round intervals.
 
-The app persists the latest snapshot and up to 12 history queries. It combines concurrent requests, waits until the next expected snapshot before fetching again, and revalidates expired entries with ETags. Hidden tabs do not poll the network. Saved snapshots remain visible if a refresh fails. Only player histories requested by the current comparison are downloaded.
+The app persists the latest snapshot and up to 12 history queries. It combines concurrent requests, uses the server's published refresh interval to wait for the next expected snapshot, and revalidates expired entries with ETags. Hidden tabs do not poll the network. Saved snapshots remain visible if a refresh fails. Only player histories requested by the current comparison are downloaded.
 
 ## Development examples
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { lastActivities, sortPlayers, activityLabel } from '../src/leaderboard/activity.ts';
+import { activityColor, lastActivities, sortPlayers, activityLabel } from '../src/leaderboard/activity.ts';
 
 const player = (nickname, rank, value) => ({ nickname, rank, value, faction: 'neutral' });
 const snapshot = (capturedAt, elo, world = []) => ({ capturedAt, elo, world });
@@ -32,4 +32,9 @@ test('compact activity times handle boundaries and clock skew', () => {
   assert.equal(activityLabel(100, 160_000), '1m ago');
   assert.equal(activityLabel(100, 3_700_000), '1h ago');
   assert.equal(activityLabel(100, 86_500_000), '1d ago');
+});
+
+test('recent activity is green and fades to gray', () => {
+  assert.equal(activityColor(100, 100_000), 'hsl(145 70.00% 64.00%)');
+  assert.equal(activityColor(undefined, 100_000), 'hsl(145 0.00% 56.00%)');
 });

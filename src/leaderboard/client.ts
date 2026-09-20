@@ -1,14 +1,29 @@
 export type Board = 'elo' | 'world';
 export type Player = { rank: number; nickname: string; value: number; faction: string };
-export type Snapshot = { capturedAt: number; elo: Player[]; world: Player[] };
+export type Snapshot = { capturedAt: number; refreshIntervalSeconds?: number; elo: Player[]; world: Player[] };
 export type HistoryPoint = { capturedAt: number; players: { nickname: string; rank: number | null; value: number | null }[] };
 export type History = { rows: HistoryPoint[]; from: number; to: number; step: number };
 type Entry<T> = { data: T; etag: string; expires: number; saved: number };
 const EXAMPLES = import.meta.env?.DEV && import.meta.env?.VITE_EXAMPLE_DATA === '1';
 const API = 'https://wod-nations-map.moreofdots.workers.dev';
-const PREFIX = 'mod.leaderboard.v1:';
+const PREFIX = 'mod.leaderboard.v2:';
 const pending = new Map<string, Promise<unknown>>();
 const memory = new Map<string, Entry<unknown>>();
+const DEFAULT_REFRESH_INTERVAL_SECONDS = 1800;
+const MIN_REFRESH_INTERVAL_SECONDS = 60;
+const MAX_REFRESH_INTERVAL_SECONDS = 86400;
+const STALE_RETRY_MS = 60_000;
+
+export function cacheExpiry(data: unknown, now = Date.now()): number {
+  const snapshot = data as Partial<Snapshot> | null;
+  const configured = Number(snapshot?.refreshIntervalSeconds);
+  const interval = Number.isFinite(configured) && configured >= MIN_REFRESH_INTERVAL_SECONDS && configured <= MAX_REFRESH_INTERVAL_SECONDS
+    ? configured
+    : DEFAULT_REFRESH_INTERVAL_SECONDS;
+  const capturedAt = Number(snapshot?.capturedAt);
+  const nextCapture = Number.isFinite(capturedAt) ? (capturedAt + interval) * 1000 : now + interval * 1000;
+  return Math.max(now + STALE_RETRY_MS, Math.min(now + interval * 1000, nextCapture));
+}
 
 export function cached<T>(path: string): Entry<T> | null {
   if (EXAMPLES) return null;
@@ -32,10 +47,10 @@ function save<T>(path: string, entry: Entry<T>) {
   } catch { /* Storage can be disabled or full. Network data remains usable. */ }
 }
 
-export async function retrieve<T>(path: string): Promise<T> {
+export async function retrieve<T>(path: string, force = false): Promise<T> {
   if (EXAMPLES) return (await import('../dev/examples')).exampleLeaderboard<T>(path);
   const existing = cached<T>(path);
-  if (existing && existing.expires > Date.now()) return existing.data;
+  if (!force && existing && existing.expires > Date.now()) return existing.data;
   if (pending.has(path)) return pending.get(path) as Promise<T>;
   const task = (async () => {
     const response = await fetch(API + path, {
@@ -44,9 +59,7 @@ export async function retrieve<T>(path: string): Promise<T> {
     });
     if (!response.ok && response.status !== 304) throw new Error(`Leaderboard is unavailable (${response.status}). Try again shortly.`);
     const data = response.status === 304 && existing ? existing.data : await response.json() as T;
-    const stamp = (data as Snapshot).capturedAt;
-    const nextCapture = Number.isFinite(stamp) ? (stamp + 1800) * 1000 : Date.now() + 1800_000;
-    const expires = Math.max(Date.now() + 300_000, Math.min(Date.now() + 1800_000, nextCapture));
+    const expires = cacheExpiry(data);
     save(path, { data, etag: response.headers.get('ETag') ?? existing?.etag ?? '', expires, saved: Date.now() });
     return data;
   })();

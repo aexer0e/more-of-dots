@@ -94,18 +94,19 @@ export function LeaderboardApp() {
 
   useEffect(() => {
     let active = true;
-    const refresh = async () => {
+    const refresh = async (force = false) => {
       setNow(Date.now());
       if (document.hidden) return;
       setLoading(true);
-      try { const result = await retrieve<Snapshot>(LATEST); if (active) { setSnapshot(result); setError(''); } }
+      try { const result = await retrieve<Snapshot>(LATEST, force); if (active) { setSnapshot(result); setError(''); } }
       catch (cause) { if (active) setError((cause as Error).message); }
       finally { if (active) setLoading(false); }
     };
-    void refresh();
+    void refresh(retry > 0);
     const timer = window.setInterval(() => void refresh(), 60_000);
-    document.addEventListener('visibilitychange', refresh);
-    return () => { active = false; clearInterval(timer); document.removeEventListener('visibilitychange', refresh); };
+    const onVisibilityChange = () => void refresh();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => { active = false; clearInterval(timer); document.removeEventListener('visibilitychange', onVisibilityChange); };
   }, [retry]);
 
   useEffect(() => {
@@ -123,7 +124,7 @@ export function LeaderboardApp() {
     historyScope.current = scope;
     setHistory((previous) => cached<History>(path)?.data ?? (keepHistory ? previous : null));
     setHistoryLoading(true); setHistoryError('');
-    void retrieve<History>(path).then((result) => { if (active) setHistory(result); }).catch((cause) => {
+    void retrieve<History>(path, retry > 0).then((result) => { if (active) setHistory(result); }).catch((cause) => {
       if (active) setHistoryError((cause as Error).message);
     }).finally(() => { if (active) setHistoryLoading(false); });
     return () => { active = false; };
@@ -134,7 +135,7 @@ export function LeaderboardApp() {
     let active = true;
     setActivityStatus('loading');
     const path = `/v1/leaderboard/history?from=${snapshot.capturedAt - 30 * 86400}&to=${snapshot.capturedAt + 1}&step=21600&limit=336&top=100`;
-    void retrieve<{ rows: Snapshot[] }>(path).then((result) => {
+    void retrieve<{ rows: Snapshot[] }>(path, retry > 0).then((result) => {
       if (active) { setActivityHistory(result.rows); setActivityStatus('ready'); }
     }).catch(() => { if (active) setActivityStatus('error'); });
     return () => { active = false; };

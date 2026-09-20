@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cached, historyPath, retrieve } from '../src/leaderboard/client.ts';
+import { cacheExpiry, cached, historyPath, retrieve } from '../src/leaderboard/client.ts';
 
 const values = new Map();
 globalThis.localStorage = {
@@ -15,19 +15,34 @@ test('history URLs are stable and encode player names', () => {
   assert.deepEqual(url.searchParams.getAll('player'), ['b&c']);
 });
 
+test('cache expiration follows the refresh interval published by the server', () => {
+  assert.equal(cacheExpiry({ capturedAt: 1000, refreshIntervalSeconds: 300 }, 1_120_000), 1_300_000);
+  assert.equal(cacheExpiry({ capturedAt: 1000, refreshIntervalSeconds: 300 }, 1_400_000), 1_460_000);
+  assert.equal(cacheExpiry({ capturedAt: 1000 }, 1_120_000), 2_800_000);
+});
+
 test('deduplicates concurrent requests and reuses persistent fresh data', async () => {
   let requests = 0;
-  globalThis.fetch = async () => { requests++; return new Response(JSON.stringify({ capturedAt: Date.now() / 1000, elo: [], world: [] }), { headers: { ETag: '"abc"' } }); };
+  globalThis.fetch = async () => { requests++; return new Response(JSON.stringify({ capturedAt: Date.now() / 1000, refreshIntervalSeconds: 300, elo: [], world: [] }), { headers: { ETag: '"abc"' } }); };
   const [a, b] = await Promise.all([retrieve('/v1/leaderboard'), retrieve('/v1/leaderboard')]);
   assert.deepEqual(a, b);
   await retrieve('/v1/leaderboard');
   assert.equal(requests, 1);
 });
 
+test('forced refresh bypasses a fresh cache entry', async () => {
+  const path = '/test-force';
+  values.set('mod.leaderboard.v2:' + path, JSON.stringify({ data: { rows: ['old'] }, etag: '"old"', expires: Date.now() + 60_000, saved: 0 }));
+  let requests = 0;
+  globalThis.fetch = async () => { requests++; return new Response('{"rows":["new"]}'); };
+  assert.deepEqual(await retrieve(path, true), { rows: ['new'] });
+  assert.equal(requests, 1);
+});
+
 test('expired cache sends ETag and keeps data after 304', async () => {
   const path = '/test-304';
   const data = { rows: [] };
-  values.set('mod.leaderboard.v1:' + path, JSON.stringify({ data, etag: '"old"', expires: 0, saved: 0 }));
+  values.set('mod.leaderboard.v2:' + path, JSON.stringify({ data, etag: '"old"', expires: 0, saved: 0 }));
   globalThis.fetch = async (_url, options) => {
     assert.equal(options.credentials, 'omit');
     assert.equal(options.headers['If-None-Match'], '"old"');
@@ -39,7 +54,7 @@ test('expired cache sends ETag and keeps data after 304', async () => {
 
 test('failed refresh leaves offline data intact and can retry', async () => {
   const path = '/test-offline';
-  values.set('mod.leaderboard.v1:' + path, JSON.stringify({ data: { rows: [] }, etag: '', expires: 0, saved: 0 }));
+  values.set('mod.leaderboard.v2:' + path, JSON.stringify({ data: { rows: [] }, etag: '', expires: 0, saved: 0 }));
   globalThis.fetch = async () => { throw new Error('offline'); };
   await assert.rejects(retrieve(path), /offline/);
   assert.deepEqual(cached(path).data, { rows: [] });

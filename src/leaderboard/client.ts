@@ -1,6 +1,6 @@
 export type Board = 'elo' | 'world';
 export type Player = { rank: number; nickname: string; value: number; faction: string };
-export type Snapshot = { capturedAt: number; refreshIntervalSeconds?: number; elo: Player[]; world: Player[] };
+export type Snapshot = { capturedAt: number; refreshIntervalSeconds?: number; activity?: Record<string, number>; elo: Player[]; world: Player[] };
 export type HistoryPoint = { capturedAt: number; players: { nickname: string; rank: number | null; value: number | null }[] };
 export type History = { rows: HistoryPoint[]; from: number; to: number; step: number };
 type Entry<T> = { data: T; etag: string; expires: number; saved: number };
@@ -71,4 +71,48 @@ export function historyPath(board: Board, players: string[], days: number, to: n
   const query = new URLSearchParams({ board, days: String(days), to: String(to) });
   [...new Set(players)].sort().forEach((player) => query.append('player', player));
   return '/v1/leaderboard/players?' + query;
+}
+
+
+export type Refresh = Snapshot & { history: (History & { replaceFrom: number }) | null };
+
+export function mergeHistory(previous: History | null, delta: History & { replaceFrom: number }): History {
+  const rows = new Map<number, HistoryPoint>();
+  for (const row of previous?.rows ?? []) {
+    if (row.capturedAt >= delta.from && row.capturedAt < delta.replaceFrom) rows.set(row.capturedAt, row);
+  }
+  for (const row of delta.rows) rows.set(row.capturedAt, row);
+  return { ...delta, rows: [...rows.values()].sort((a, b) => a.capturedAt - b.capturedAt) };
+}
+
+export async function refreshLeaderboard(board: Board, players: string[], days: number, force = false): Promise<Refresh> {
+  const query = new URLSearchParams({ board, days: String(days) });
+  [...new Set(players)].sort().forEach(name => query.append('player', name));
+  const key = '/v1/leaderboard/refresh?' + query;
+  const existing = cached<Refresh>(key);
+  if (!force && existing && existing.expires > Date.now()) return existing.data;
+  if (pending.has(key)) return pending.get(key) as Promise<Refresh>;
+  const task = (async () => {
+    let data: Refresh;
+    if (EXAMPLES) {
+      const latest = await retrieve<Snapshot>('/v1/leaderboard');
+      const history = players.length ? await retrieve<History>(historyPath(board, players, days, latest.capturedAt)) : null;
+      data = { ...latest, history: history ? { ...history, replaceFrom: history.from } : null };
+    } else {
+      if (existing?.data.history) query.set('since', String(existing.data.history.to));
+      const response = await fetch(API + '/v1/leaderboard/refresh?' + query, {
+        credentials: 'omit', signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error('Leaderboard is unavailable (' + response.status + '). Try again shortly.');
+      data = await response.json() as Refresh;
+      if (!Number.isFinite(data.capturedAt) || !Array.isArray(data.elo) || !Array.isArray(data.world)) throw new Error('Invalid leaderboard response.');
+      if (data.history) data.history = { ...data.history, ...mergeHistory(existing?.data.history ?? null, data.history) };
+    }
+    const entry = { data, expires: cacheExpiry(data), etag: '', saved: Date.now() };
+    save(key, entry);
+    save('/v1/leaderboard', { ...entry, data: { ...data, history: null } });
+    return data;
+  })();
+  pending.set(key, task);
+  try { return await task; } finally { pending.delete(key); }
 }

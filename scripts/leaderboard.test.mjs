@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cacheExpiry, cached, historyPath, retrieve } from '../src/leaderboard/client.ts';
+import { cacheExpiry, cached, historyPath, retrieve, mergeHistory, refreshLeaderboard } from '../src/leaderboard/client.ts';
 
 const values = new Map();
 globalThis.localStorage = {
@@ -60,4 +60,39 @@ test('failed refresh leaves offline data intact and can retry', async () => {
   assert.deepEqual(cached(path).data, { rows: [] });
   globalThis.fetch = async () => new Response('{"rows":[1]}');
   assert.deepEqual(await retrieve(path), { rows: [1] });
+});
+
+
+test('incremental history replaces an open interval and expires old points without filling gaps', () => {
+  const old = { from: 0, to: 200, step: 100, rows: [
+    { capturedAt: 10, players: [] }, { capturedAt: 120, players: [{ nickname: 'a', rank: null, value: null }] },
+    { capturedAt: 200, players: [{ nickname: 'a', rank: 1, value: 5 }] },
+  ] };
+  const delta = { from: 100, to: 240, step: 100, replaceFrom: 200, rows: [
+    { capturedAt: 240, players: [{ nickname: 'a', rank: 2, value: 6 }] },
+  ] };
+  const result = mergeHistory(old, delta);
+  assert.deepEqual(result.rows.map(r => r.capturedAt), [120, 240]);
+  assert.equal(result.rows[0].players[0].value, null);
+});
+
+test('combined refresh makes one request, caches by selection and merges its next delta', async () => {
+  let requests = 0;
+  const urls = [];
+  globalThis.fetch = async url => {
+    urls.push(new URL(url)); requests++;
+    const stamp = requests === 1 ? 1700000010 : 1700000130;
+    return new Response(JSON.stringify({ capturedAt: stamp, refreshIntervalSeconds: 120,
+      elo: [], world: [], activity: { a: stamp },
+      history: { from: 1600000000, to: stamp, step: 86400, replaceFrom: 1699920000,
+        rows: [{ capturedAt: stamp, players: [{ nickname: 'a', rank: 1, value: requests }] }] } }));
+  };
+  await refreshLeaderboard('elo', ['incremental-test'], 7, true);
+  const result = await refreshLeaderboard('elo', ['incremental-test'], 7, true);
+  assert.equal(requests, 2);
+  assert.equal(urls[0].pathname, '/v1/leaderboard/refresh');
+  assert.equal(urls[1].searchParams.get('since'), '1700000010');
+  assert.deepEqual(result.history.rows.map(r => r.capturedAt), [1700000130]);
+  await refreshLeaderboard('elo', ['incremental-test'], 7);
+  assert.equal(requests, 2);
 });

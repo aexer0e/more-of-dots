@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 1.3.3 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.3.3/More.of.Dots_1.3.3_x64-setup.exe)
+[Download More of Dots 1.3.4 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.3.4/More.of.Dots_1.3.4_x64-setup.exe)
 
 - Browse, search, and download War of Dots replays
 - Back up discovered replays automatically
@@ -117,3 +117,5 @@ Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to `%APPDATA
 `npm run dev:web` runs the same example workspace. `npm run dev:desktop` opens the native development app with that example UI. Release builds use the real backend.
 
 Replay previews support embedded PNGs, old numeric map IDs, and the new relative PNG paths, including Eronion maps. Only non-vanilla maps receive the Custom badge. Shock units use the game's `motorised` storage key and infantry artwork with an upward chevron.
+
+The leaderboard uses `/v1/leaderboard/refresh` to retrieve current rankings, exact last observed score changes, and selected player history in one request. Subsequent refreshes replace only the unfinished sampling interval and append new points. Selection caches persist separately; changing players or range loads that selection once. The server publishes the refresh interval, currently two minutes. Older public endpoints remain supported by the API for previous app releases.

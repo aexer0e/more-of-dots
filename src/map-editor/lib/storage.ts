@@ -18,10 +18,11 @@ export const mapStore = {
     return cloneStoredMapRecord(map);
   },
 
-  async put(map: StoredMap) {
+  async put(map: StoredMap, publish = false) {
     const saved = await invoke<StoredMap>('save_map', {
-      fileName: map.fileName || map.id,
+      fileName: map.id,
       data: mapDataForStorage(map),
+      publish,
     });
     return cloneStoredMapRecord(saved);
   },

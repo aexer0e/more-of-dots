@@ -5,6 +5,50 @@ import os from 'node:os';
 import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { decodeJson, latestReplayFiles, exampleReplayFiles, safeMapPath, replayNames } from './dev-data.mjs';
+import { readInstalledMaps } from './installed-maps.mjs';
+
+test('installed map discovery refreshes after updates and excludes user map folders', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mod-installed-maps-'));
+  try {
+    for (const folder of ['assets/zolamare_maps', 'assets/custom_maps', 'map_editor']) {
+      await fs.mkdir(path.join(root, folder), { recursive: true });
+    }
+    const replay = { map: { path: 'assets/zolamare_maps/map55.png' } };
+    assert.equal(await (await readInstalledMaps(root)).isVanilla(replay), false);
+    await fs.writeFile(path.join(root, replay.map.path), 'official image');
+    await fs.writeFile(path.join(root, 'assets/custom_maps/custom.png'), 'user map');
+    await fs.writeFile(path.join(root, 'map_editor/generated_map55.png'), 'editor map');
+    const catalog = await readInstalledMaps(root);
+    assert.equal(await catalog.isVanilla(replay), true);
+    const identity = await catalog.identity(replay);
+    assert.deepEqual(identity, { mapKey: 'vanilla:assets/zolamare_maps/map55.png', mapLabel: 'Zolamare 55' });
+    assert.deepEqual(await catalog.identity({ map: 55 }), identity);
+    assert.deepEqual(await catalog.identity({ map: { map_surface: Buffer.from('official image').toString('base64') } }), identity);
+    const custom = Buffer.from('user map').toString('base64');
+    const first = await catalog.identity({ map: { path: 'old.png', map_surface: custom } });
+    const renamed = await catalog.identity({ map: { path: 'new.png', map_surface: `data:image/png;base64,${custom}` } });
+    assert.deepEqual(first, renamed);
+    assert.match(first.mapKey, /^custom:[a-f0-9]{64}$/);
+    assert.match(first.mapLabel, /^#[a-f0-9]{10}$/);
+    assert.notDeepEqual(await catalog.identity({ map: { map_surface: Buffer.from('other image').toString('base64') } }), first);
+    assert.deepEqual(await catalog.identity({}), { mapKey: null, mapLabel: null });
+    assert.equal(await catalog.isVanilla({ map: replay.map.path.replaceAll('/', '\\') }), true);
+    assert.equal(await catalog.isVanilla({ custom_map: null, map: { map_surface: Buffer.from('official image').toString('base64') } }), true);
+    for (const map_surface of ['user map', 'editor map'].map((s) => Buffer.from(s).toString('base64'))) {
+      assert.equal(await catalog.isVanilla({ map: { ...replay.map, map_surface } }), false);
+    }
+    for (const file of ['assets/custom_maps/custom.png', 'map_editor/generated_map55.png', 'assets/zolamare_maps/../custom_maps/custom.png']) {
+      assert.equal(await catalog.isVanilla({ map: { path: file } }), false);
+    }
+    const missing = await readInstalledMaps(path.join(root, 'missing'));
+    assert.equal(await missing.isVanilla(replay), false);
+    assert.equal(await missing.isVanilla({ map: 35 }), true);
+    assert.equal(await catalog.isVanilla({}), false);
+  } finally {
+    assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep));
+    await fs.rm(root, { recursive: true });
+  }
+});
 
 test('fills from backups after live replays, skipping duplicates and preserving same-name files', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mod-examples-test-'));

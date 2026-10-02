@@ -1,0 +1,261 @@
+.map-editor-scope[data-screen='library'] {
+  background: #0a1015;
+}
+
+.map-editor-scope[data-screen='library'] .app-shell {
+  grid-template-rows: 1fr;
+}
+
+.map-editor-scope[data-screen='library'] .app-main {
+  padding: 12px 20px 24px;
+}
+
+.map-editor-scope[data-screen='library'] .library-shell {
+  gap: 12px;
+}
+
+.map-editor-scope[data-screen='library'] .library-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  gap: 14px;
+  background: #101920;
+  border-color: #283740;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.map-editor-scope[data-screen='library'] .brand-block {
+  min-width: 0;
+  gap: 12px;
+}
+
+.map-editor-scope[data-screen='library'] .brand-block img {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  box-shadow: none;
+}
+
+.map-editor-scope[data-screen='library'] .brand-block h1 {
+  font-size: 1.2rem;
+}
+
+.map-editor-scope[data-screen='library'] .library-toolbar-copy p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.map-editor-scope[data-screen='library'] .library-toolbar-actions {
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.map-editor-scope[data-screen='library'] .library-toolbar-actions button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 6px 11px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+
+.map-editor-scope[data-screen='library'] .library-toolbar-actions .primary-button {
+  background: #3879b2;
+  border-color: #508dbf;
+  color: #fff;
+}
+
+.map-editor-scope[data-screen='library'] button[aria-pressed='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.map-editor-scope[data-screen='library'] .map-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.map-editor-scope[data-screen='library'] .map-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 10px;
+  gap: 9px;
+  background: #111b22;
+  border-color: #2a3842;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.map-editor-scope[data-screen='library'] .map-card.selected {
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 1px var(--accent-soft) inset;
+}
+
+.map-editor-scope[data-screen='library'] .map-select-toggle {
+  top: 18px;
+  left: 18px;
+}
+
+.map-editor-scope[data-screen='library'] .map-thumb {
+  flex: 0 0 auto;
+  border-radius: 6px;
+}
+
+.map-editor-scope[data-screen='library'] .map-thumb-frame {
+  aspect-ratio: 16 / 9;
+}
+
+.map-editor-scope[data-screen='library'] .map-thumb-stage {
+  top: 50%;
+  left: 50%;
+  min-width: 0;
+  aspect-ratio: auto;
+  transform: translate(-50%, -50%);
+}
+
+.map-editor-scope[data-screen='library'] .map-preview-badges {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: flex;
+  gap: 5px;
+}
+
+.map-editor-scope[data-screen='library'] .map-mode-pill,
+.map-editor-scope[data-screen='library'] .map-status-pill {
+  position: static;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 7px;
+  gap: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  background: rgba(6, 10, 13, 0.88);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.map-editor-scope[data-screen='library'] .map-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #72bc8b;
+}
+
+.map-editor-scope[data-screen='library'] [data-status='draft'] .map-status-dot {
+  background: #94a8b1;
+}
+
+.map-editor-scope[data-screen='library'] [data-status='invalid'] .map-status-dot {
+  background: var(--danger);
+}
+
+.map-editor-scope[data-screen='library'] .map-card-body {
+  gap: 5px;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 8px;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-body h4 {
+  min-width: 0;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-body p {
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-meta {
+  min-width: 0;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-filename {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-editor-scope[data-screen='library'] .library-action-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-actions {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: 5px;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-actions button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 5px 7px;
+  gap: 4px;
+  border-radius: 5px;
+  border-color: #3a4d5b;
+  background: #17252f;
+  font-size: 0.74rem;
+  font-weight: 500;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-actions .danger-button {
+  border-color: #62403f;
+  background: transparent;
+  color: #f18d86;
+}
+
+.map-editor-scope[data-screen='library'] .map-card-actions .danger-button:hover {
+  border-color: #a15d59;
+  background: rgba(239, 107, 102, 0.12);
+}
+
+.map-editor-scope[data-screen='library'] .library-shell button:focus-visible,
+.map-editor-scope[data-screen='library'] .map-select-toggle input:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+@media (max-width: 900px) {
+  .map-editor-scope[data-screen='library'] .map-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .map-editor-scope[data-screen='library'] .app-main {
+    padding: 10px 12px 20px;
+  }
+
+  .map-editor-scope[data-screen='library'] .library-toolbar {
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    gap: 10px;
+  }
+
+  .map-editor-scope[data-screen='library'] .library-toolbar-actions {
+    margin-left: auto;
+  }
+
+  .map-editor-scope[data-screen='library'] .map-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .map-editor-scope[data-screen='library'] .library-selection-bar {
+    flex-wrap: wrap;
+  }
+}

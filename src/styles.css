@@ -2736,6 +2736,33 @@ p {
   white-space: nowrap;
 }
 
+.replay-player {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 1 auto;
+  gap: clamp(3px, calc(5px * var(--card-scale)), 7px);
+  min-width: 0;
+}
+
+.player-rank-badge {
+  align-items: center;
+  aspect-ratio: 1;
+  background: rgba(16, 21, 19, 0.82);
+  border: 1px solid rgba(139, 198, 164, 0.62);
+  border-radius: clamp(3px, calc(4px * var(--card-scale)), 5px);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.34);
+  color: #a9dfbf;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: clamp(6px, calc(10px * var(--card-scale)), 14px);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--fw-bold);
+  height: clamp(14px, calc(20px * var(--card-scale)), 28px);
+  justify-content: center;
+  line-height: 1;
+  text-shadow: none;
+}
+
 .matchup-separator {
   color: var(--browser-muted);
   flex: 0 0 auto;

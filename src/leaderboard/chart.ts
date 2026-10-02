@@ -25,10 +25,43 @@ export function chartAxis(values: number[], rank = false) {
   return { low, high, step, ticks };
 }
 
-export function seriesPath(points: { stamp: number; value: number | null }[], x: (stamp: number) => number, y: (value: number) => number) {
-  // Keep actual observations intact and connect across missing observations.
-  return points.filter((p) => p.value != null && Number.isFinite(p.value))
-    .map((p, i) => `${i ? 'L' : 'M'}${x(p.stamp)},${y(p.value!)}`).join(' ');
+export function changedSeries(points: { stamp: number; value: number | null }[]) {
+  return points.filter((point, index) => index === 0 || point.value !== points[index - 1].value);
+}
+
+export function seriesValueAt(points: { stamp: number; value: number | null }[], stamp: number) {
+  for (let index = points.length - 1; index >= 0; index--) {
+    const point = points[index];
+    if (point.stamp <= stamp && point.value != null && Number.isFinite(point.value)) return point.value;
+  }
+  return null;
+}
+
+export function seriesPath(points: { stamp: number; value: number | null }[], x: (stamp: number) => number, y: (value: number) => number, to?: number) {
+  const observed = changedSeries(points).filter((p): p is { stamp: number; value: number } => p.value != null && Number.isFinite(p.value));
+  if (!observed.length) return '';
+  let path = `M${x(observed[0].stamp)},${y(observed[0].value)}`;
+  for (let index = 1; index < observed.length; index++) {
+    const previous = observed[index - 1], current = observed[index];
+    path += ` L${x(current.stamp)},${y(previous.value)} L${x(current.stamp)},${y(current.value)}`;
+  }
+  const last = observed.at(-1)!;
+  if (to != null && to > last.stamp) path += ` L${x(to)},${y(last.value)}`;
+  return path;
+}
+
+export function nearestSeriesName(series: { name: string; value: number | null }[], pointerY: number, y: (value: number) => number) {
+  let nearest: string | null = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const point of series) {
+    if (point.value == null || !Number.isFinite(point.value)) continue;
+    const distance = Math.abs(y(point.value) - pointerY);
+    if (distance < nearestDistance) {
+      nearest = point.name;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
 }
 
 export function snapshotDelay(capturedAt: number, now = Date.now()) {
@@ -36,4 +69,17 @@ export function snapshotDelay(capturedAt: number, now = Date.now()) {
   if (age <= 3600) return null;
   const minutes = Math.floor(age / 60), hours = Math.floor(minutes / 60);
   return hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h ago` : `${hours}h ${minutes % 60}m ago`;
+}
+
+export function historyTimeAgo(capturedAt: number, now = Date.now()) {
+  const seconds = Math.max(0, Math.floor(now / 1000 - capturedAt));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
 }

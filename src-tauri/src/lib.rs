@@ -26,8 +26,11 @@ use tauri::{
 use std::os::windows::process::CommandExt;
 
 mod recorder_update;
+mod installed_maps;
+mod maps;
 
 use recorder_update::RecorderInstallControl;
+use installed_maps::InstalledMaps;
 
 const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
 const FPS: f64 = 30.0;
@@ -44,7 +47,7 @@ const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
 const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
-const REPLAY_INDEX_VERSION: u32 = 3;
+const REPLAY_INDEX_VERSION: u32 = 4;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -180,6 +183,10 @@ struct ReplaySummary {
     score_delta: Option<i64>,
     #[serde(default)]
     event_label: Option<String>,
+    #[serde(default)]
+    map_key: Option<String>,
+    #[serde(default)]
+    map_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -188,6 +195,8 @@ struct ParsedReplay {
     result: Option<Value>,
     map_id: Option<String>,
     custom_map_surface: Option<String>,
+    #[serde(default)]
+    has_map: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +212,9 @@ struct GameMapRecord {
     width: u32,
     height: u32,
     team_count: usize,
+    status: String,
+    issue: Option<String>,
+    game_file_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -838,13 +850,6 @@ fn discover_map_editor_dirs() -> Vec<PathBuf> {
     map_dirs
 }
 
-fn primary_map_editor_dir() -> Result<PathBuf, String> {
-    discover_map_editor_dirs()
-        .into_iter()
-        .next()
-        .ok_or_else(|| "War of Dots map_editor folder was not found.".to_string())
-}
-
 fn safe_map_file_name(file_name: &str) -> Result<String, String> {
     let name = file_name.trim();
     if name.is_empty()
@@ -880,12 +885,7 @@ fn write_gzip_json_file(path: &Path, value: &Value) -> Result<(), String> {
     let bytes = encoder
         .finish()
         .map_err(|error| format!("Could not finish map gzip stream: {error}"))?;
-    fs::write(path, bytes).map_err(|error| format!("Could not write {}: {error}", path.display()))
-}
-
-fn map_file_path(file_name: &str) -> Result<PathBuf, String> {
-    let file_name = safe_map_file_name(file_name)?;
-    Ok(primary_map_editor_dir()?.join(file_name))
+    maps::atomic_write(path, &bytes)
 }
 
 fn png_dimensions_from_base64(base64_png: &str) -> Option<(u32, u32)> {
@@ -1016,40 +1016,6 @@ fn validate_game_map_value(value: &Value) -> Result<(), String> {
         return Err("Map surface must be a base64 PNG image.".to_string());
     }
     Ok(())
-}
-
-fn map_record_from_path(path: &Path) -> Result<GameMapRecord, String> {
-    let file_name = candidate_file_name(path);
-    let data = read_gzip_json_file(path)?;
-    if validate_game_map_value(&data).is_err() {
-        return Err(format!("{} is not a War of Dots map file.", path.display()));
-    }
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("Could not stat {}: {error}", path.display()))?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(system_time_to_secs)
-        .unwrap_or(0);
-    let created = metadata
-        .created()
-        .ok()
-        .and_then(system_time_to_secs)
-        .unwrap_or(modified);
-    let (width, height) = map_dimensions(&data);
-    let team_count = map_team_count(&data);
-    Ok(GameMapRecord {
-        id: file_name.clone(),
-        file_name: file_name.clone(),
-        file_path: path.to_string_lossy().to_string(),
-        name: display_name_for_map_file(&file_name),
-        data,
-        created_at: created.saturating_mul(1000),
-        updated_at: modified.saturating_mul(1000),
-        width,
-        height,
-        team_count,
-    })
 }
 
 fn discover_steamapps_dirs() -> Vec<PathBuf> {
@@ -1372,33 +1338,39 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
             thumbnail_key: None,
             modified,
             score_delta: None,
-            event_label: replay_event_label(&raw),
+            event_label: None,
+            map_key: None,
+            map_label: None,
         },
         result,
         map_id: replay_map_id(&raw),
         custom_map_surface: custom_map_surface(&raw),
+        has_map: raw.get("map").is_some(),
     })
 }
 
-// Official image paths and embedded PNGs from the shipped vanilla map collection.
-fn vanilla_map_catalog() -> &'static Value {
-    static CATALOG: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    CATALOG.get_or_init(|| serde_json::from_str(include_str!("vanilla-maps.json")).expect("vanilla catalog"))
+fn installed_map_catalog() -> InstalledMaps {
+    let mut roots = discover_steamapps_dirs().into_iter()
+        .map(|steamapps| steamapps.join("common").join(GAME_DIR_NAME))
+        .collect::<Vec<_>>();
+    push_unique_path(&mut roots, steam_game_dir());
+    InstalledMaps::read(roots)
 }
 
+fn refresh_replay_map_label(replay: &mut ParsedReplay, maps: &InstalledMaps) {
+    replay.summary.event_label = maps.event_label(
+        replay.map_id.as_deref(), replay.custom_map_surface.as_deref(), replay.has_map,
+    );
+    let identity = maps.identity(replay.map_id.as_deref(), replay.custom_map_surface.as_deref());
+    replay.summary.map_key = identity.as_ref().map(|(key, _)| key.clone());
+    replay.summary.map_label = identity.map(|(_, label)| label);
+}
+
+#[cfg(test)]
 fn replay_event_label(raw: &Value) -> Option<String> {
-    let vanilla = if let Some(surface) = custom_map_surface(raw) {
-        let payload = surface.strip_prefix("data:image/png;base64,").unwrap_or(&surface);
-        BASE64.decode(payload).ok().is_some_and(|bytes| {
-            let hash = format!("{:x}", Sha256::digest(bytes));
-            vanilla_map_catalog()["pngHashes"].as_array()
-                .is_some_and(|hashes| hashes.iter().any(|entry| entry.as_str() == Some(&hash)))
-        })
-    } else if let Some(id) = replay_map_id(raw) {
-        id.chars().all(|c| c.is_ascii_digit()) || vanilla_map_catalog()["paths"]
-            .as_array().is_some_and(|paths| paths.iter().any(|path| path.as_str() == Some(&id)))
-    } else { false };
-    (!vanilla && raw.get("map").is_some()).then(|| "Custom".to_string())
+    InstalledMaps::default().event_label(
+        replay_map_id(raw).as_deref(), custom_map_surface(raw).as_deref(), raw.get("map").is_some(),
+    )
 }
 
 fn replay_player_names(raw: &Value) -> Vec<String> {
@@ -1594,6 +1566,7 @@ fn replay_map_id(raw: &Value) -> Option<String> {
 
 fn custom_map_surface(raw: &Value) -> Option<String> {
     raw.get("custom_map")
+        .filter(|map| map.is_object())
         .or_else(|| raw.get("map").filter(|map| map.is_object()))
         .and_then(|custom_map| custom_map.get("map_surface"))
         .and_then(Value::as_str)
@@ -1927,6 +1900,7 @@ fn list_replays_impl(
     }
 
     let backup_dir = replay_backup_dir(app)?;
+    let installed_maps = installed_map_catalog();
     let mut thumbnail_sources = HashMap::new();
     let mut parsed_replays = Vec::new();
     let mut index_changed = false;
@@ -1961,6 +1935,7 @@ fn list_replays_impl(
             },
         };
 
+        refresh_replay_map_label(&mut parsed, &installed_maps);
         parsed.summary.score_delta = None;
         parsed.summary.thumbnail_data_url = None;
         parsed.summary.thumbnail_key = None;
@@ -3189,113 +3164,34 @@ async fn replay_thumbnail_paths(
         .map_err(|error| format!("Replay thumbnail task failed: {error}"))?
 }
 
-fn list_maps_impl() -> Result<Vec<GameMapRecord>, String> {
-    let mut maps = Vec::new();
-    for map_dir in discover_map_editor_dirs() {
-        let entries = fs::read_dir(&map_dir)
-            .map_err(|error| format!("Could not read map folder {}: {error}", map_dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file()
-                || path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map_or(true, |extension| !extension.eq_ignore_ascii_case("txt"))
-            {
-                continue;
-            }
-            match map_record_from_path(&path) {
-                Ok(map) => maps.push(map),
-                Err(error) => eprintln!("Skipping map {}: {error}", path.display()),
-            }
-        }
-    }
-    maps.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.file_name.cmp(&right.file_name))
-    });
-    Ok(maps)
+fn map_store(app: &AppHandle) -> Result<maps::MapStore, String> {
+    maps::MapStore::new(app_runtime_dir(app)?.join("map-drafts"), discover_map_editor_dirs())
 }
 
 #[tauri::command]
-async fn list_maps() -> Result<Vec<GameMapRecord>, String> {
-    tauri::async_runtime::spawn_blocking(list_maps_impl)
-        .await
-        .map_err(|error| format!("Map loading task failed: {error}"))?
+async fn list_maps(app: AppHandle) -> Result<Vec<GameMapRecord>, String> {
+    tauri::async_runtime::spawn_blocking(move || map_store(&app)?.list())
+        .await.map_err(|error| format!("Map loading task failed: {error}"))?
 }
 
 #[tauri::command]
-fn read_map(file_name: String) -> Result<GameMapRecord, String> {
-    let path = map_file_path(&file_name)?;
-    if !path.is_file() {
-        return Err(format!("Map file does not exist: {}", path.display()));
-    }
-    map_record_from_path(&path)
+fn read_map(app: AppHandle, file_name: String) -> Result<GameMapRecord, String> {
+    map_store(&app)?.read(&file_name)
 }
 
 #[tauri::command]
-fn save_map(file_name: String, data: Value) -> Result<GameMapRecord, String> {
-    validate_game_map_value(&data)?;
-    let path = map_file_path(&file_name)?;
-    let mut next = if path.exists() {
-        match read_gzip_json_file(&path) {
-            Ok(Value::Object(existing)) => Value::Object(existing),
-            _ => json!({}),
-        }
-    } else {
-        json!({})
-    };
-    if let (Some(existing), Some(incoming)) = (next.as_object_mut(), data.as_object()) {
-        for (key, value) in incoming {
-            existing.insert(key.clone(), value.clone());
-        }
-    } else {
-        next = data;
-    }
-    validate_game_map_value(&next)?;
-    write_gzip_json_file(&path, &next)?;
-    map_record_from_path(&path)
+fn save_map(app: AppHandle, file_name: String, data: Value, publish: Option<bool>) -> Result<GameMapRecord, String> {
+    map_store(&app)?.save(&file_name, data, publish.unwrap_or(false))
 }
 
 #[tauri::command]
-fn create_map(name: String, mode: String) -> Result<GameMapRecord, String> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_nanos();
-    let slug = safe_map_name_slug(&name);
-    let file_name = if slug.is_empty() {
-        format!("map_{timestamp}.txt")
-    } else {
-        format!("map_{slug}_{timestamp}.txt")
-    };
-    let path = map_file_path(&file_name)?;
-    let data = default_game_map_value(&mode)?;
-    write_gzip_json_file(&path, &data)?;
-    map_record_from_path(&path)
+fn create_map(app: AppHandle, name: String, mode: String) -> Result<GameMapRecord, String> {
+    map_store(&app)?.create(&name, &mode)
 }
 
 #[tauri::command]
-fn delete_maps(file_names: Vec<String>) -> Result<Vec<String>, String> {
-    let mut targets = Vec::new();
-    for file_name in &file_names {
-        let safe_file_name = safe_map_file_name(&file_name)?;
-        let path = map_file_path(&safe_file_name)?;
-        if !path.is_file() {
-            return Err(format!("Map file does not exist: {}", path.display()));
-        }
-        targets.push((safe_file_name, path));
-    }
-
-    let mut deleted = Vec::new();
-    for (safe_file_name, path) in targets {
-        fs::remove_file(&path)
-            .map_err(|error| format!("Could not delete {}: {error}", path.display()))?;
-        deleted.push(safe_file_name);
-    }
-    Ok(deleted)
+fn delete_maps(app: AppHandle, file_names: Vec<String>) -> Result<Vec<String>, String> {
+    map_store(&app)?.delete(&file_names)
 }
 
 #[tauri::command]
@@ -3887,6 +3783,7 @@ mod tests {
     #[test]
     fn custom_map_surface_reads_new_map_location() {
         let raw = json!({
+            "custom_map": null,
             "map": {
                 "version": null,
                 "map_surface": "iVBORw0KGgo="
@@ -3914,10 +3811,13 @@ mod tests {
                 modified: 123,
                 score_delta: None,
                 event_label: None,
+                map_key: None,
+                map_label: None,
             },
             result: None,
             map_id: None,
             custom_map_surface: Some("YWJj".to_string()),
+            has_map: true,
         };
 
         let (thumbnail_key, source) =
@@ -3970,11 +3870,37 @@ mod tests {
     }
 
     #[test]
+    fn cached_replay_map_label_refreshes_from_installed_maps() {
+        let root = tempfile::tempdir().unwrap();
+        let replay_path = root.path().join("match.rep");
+        fs::write(&replay_path, serde_json::to_vec(&json!({
+            "version": "1.4.1", "map": { "path": "assets/zolamare_maps/map55.png" }
+        })).unwrap()).unwrap();
+        let mut replay = parse_replay(&replay_path).unwrap();
+        refresh_replay_map_label(&mut replay, &InstalledMaps::read([root.path().to_path_buf()]));
+        assert_eq!(replay.summary.event_label.as_deref(), Some("Custom"));
+        let cached = serde_json::to_vec(&replay).unwrap();
+        let map_path = root.path().join("assets/zolamare_maps/map55.png");
+        fs::create_dir_all(map_path.parent().unwrap()).unwrap();
+        fs::write(map_path, b"official image").unwrap();
+        let mut replay: ParsedReplay = serde_json::from_slice(&cached).unwrap();
+        refresh_replay_map_label(&mut replay, &InstalledMaps::read([root.path().to_path_buf()]));
+        assert_eq!(replay.summary.event_label, None);
+    }
+
+    #[test]
     fn new_vanilla_paths_are_not_custom() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["assets/fahero_maps/map50.png", "assets/eronion_maps/azure_rivers.png", "assets/zolamare_maps/map45.png"] {
+            let path = root.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"map image").unwrap();
+        }
+        let maps = InstalledMaps::read([root.path().to_path_buf()]);
         for path in ["assets/fahero_maps/map50.png", "assets/eronion_maps/azure_rivers.png", "assets\\zolamare_maps\\map45.png"] {
             let raw = json!({ "mode": "experiment", "map": { "path": path, "motorised": [[], []] } });
             assert_eq!(replay_map_id(&raw), Some(path.replace('\\', "/")));
-            assert_eq!(replay_event_label(&raw), None);
+            assert_eq!(maps.event_label(replay_map_id(&raw).as_deref(), None, true), None);
         }
         assert_eq!(replay_event_label(&json!({"map": {"path": "assets/custom_maps/my_map.png"}})).as_deref(), Some("Custom"));
         assert_eq!(replay_event_label(&json!({"map": "custom", "custom_map": {"map_surface": "custom-png"}})).as_deref(), Some("Custom"));
@@ -4075,10 +4001,13 @@ mod tests {
                 modified: 123,
                 score_delta: None,
                 event_label: None,
+                map_key: None,
+                map_label: None,
             },
             result: None,
             map_id: None,
             custom_map_surface: None,
+            has_map: false,
         };
         let entry = ReplayIndexEntry {
             path_key: path_key(&path),

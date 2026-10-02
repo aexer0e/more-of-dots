@@ -3,6 +3,7 @@ import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { readInstalledMaps } from './installed-maps.mjs';
 
 export const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const dataDir = path.join(project, 'build', 'dev-data');
@@ -69,7 +70,7 @@ export async function seedExamples() {
   await fs.mkdir(path.join(dataDir, 'images'), { recursive: true });
   let previous;
   try { previous = JSON.parse(await fs.readFile(path.join(dataDir, 'data.json'), 'utf8')); } catch { /* First run. */ }
-  const catalog = JSON.parse(await fs.readFile(path.join(project, 'src-tauri/src/vanilla-maps.json'), 'utf8'));
+  const catalog = await readInstalledMaps(game);
   let identity = '';
   // Read only the username. Never copy the game configuration or credentials.
   try { identity = decodeJson(await fs.readFile(path.join(game, 'config.txt'))).login?.username ?? ''; } catch { /* Manual selection remains available. */ }
@@ -108,9 +109,9 @@ export async function seedExamples() {
       const winner = raw.result === 0.5 ? -1 : typeof raw.result === 'string' && names.includes(raw.result) ? names.indexOf(raw.result) : perspective >= 0 && names.length === 2 && [0, 1, false, true].includes(raw.result) ? (raw.result ? perspective : 1 - perspective) : -1;
       const seconds = Math.floor(Number(raw.end ?? Math.max(0, ...Object.keys(raw).filter((k) => /^\d+$/.test(k)).map(Number))) / 30);
       const png = await mapImage(raw);
-      const hasEmbeddedMap = Boolean((raw.custom_map ?? raw.map)?.map_surface);
-      const vanilla = hasEmbeddedMap ? png && catalog.pngHashes.includes(hash(png)) : /^\d+$/.test(String(raw.map)) || catalog.paths.includes(raw.map?.path?.replaceAll('\\', '/'));
-      replays.push({ fileName: file.name, filePath: '/__examples/replays/' + file.name, version: raw.version, players: names.map((name, teamIndex) => ({ name, teamIndex, winner: winner === teamIndex })).sort((a, b) => Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
+      const vanilla = await catalog.isVanilla(raw);
+      const mapIdentity = await catalog.identity(raw);
+      replays.push({ ...mapIdentity, fileName: file.name, filePath: '/__examples/replays/' + file.name, version: raw.version, players: names.map((name, teamIndex) => ({ name, teamIndex, winner: winner === teamIndex })).sort((a, b) => Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
       // Recent replay layouts include the new maps and Shock units for editor testing.
       if (png && typeof raw.map === 'object' && maps.length < 12) {
         const data = { ...raw.map, map_surface: png.toString('base64'), mode: raw.map.mode ?? (names.length === 4 ? 'v4' : names.length === 3 ? 'v3' : '1v1'), motorised: raw.map.motorised ?? names.map(() => []) };

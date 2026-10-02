@@ -9,8 +9,11 @@ import { check } from "@tauri-apps/plugin-updater";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { LeaderboardApp } from "./leaderboard/App";
+import { cached, leaderboardRankIndex, retrieve, type Snapshot } from "./leaderboard/client";
 import MapEditorApp from "./map-editor/App";
 import "./styles.css";
+import "./replays/styles.css";
+import { MATCH_TYPES, matchesReplay, replaySuggestions, toggleMatchType, type MapSource, type PlayerSuggestion, type ReplayFilterRecord, type ReplayFilters, type ReplaySuggestion } from "./replays/filters";
 
 declare global {
   interface Window {
@@ -266,6 +269,8 @@ type ReplayBrowserItem = {
   modified: number;
   scoreDelta?: number | null;
   eventLabel?: string | null;
+  mapKey?: string | null;
+  mapLabel?: string | null;
 };
 
 type ReplayThumbnailPath = {
@@ -356,32 +361,9 @@ type RecorderInstallProgressEvent = {
   error?: string;
 };
 
-type BrowserSuggestion = {
-  name: string;
-  normalizedName: string;
-  replayCount: number;
-  winCount: number;
-  lossCount: number;
-  drawCount: number;
-  opponents: string[];
-};
-type BrowserFilterState = {
-  query: string;
-  enabledTypes: Set<string>;
-  durationRange: { min: number; max: number };
-  customMapsOnly: boolean;
-};
-type BrowserRenderedCard = {
+type BrowserFilterState = ReplayFilters;
+type BrowserRenderedCard = ReplayFilterRecord & {
   element: HTMLElement;
-  searchText: string;
-  matchType: string;
-  durationSeconds: number;
-  isCustomMap: boolean;
-  modified: number;
-  names: string[];
-  normalizedNames: string[];
-  winnerIndex: number;
-  isDraw: boolean;
   winnerName: string;
   nameElements: HTMLElement[];
   winnerNameElement: HTMLElement | null;
@@ -563,13 +545,16 @@ let recorderInstallError = "";
 let browserError = "";
 let browserSearch = "";
 let browserHideUnmatched = true;
-let browserCustomMapsOnly = false;
-let browserSelectedTypes = new Set(["1v1", "3P FFA", "4P FFA"]);
+let browserMapSources = new Set<MapSource>(["vanilla", "custom"]);
+let browserSelectedMap: { key: string; label: string } | null = null;
+let browserSelectedPlayer: string | null = null;
+let browserSelectedTypes = new Set(MATCH_TYPES);
 let browserDurationBounds = { min: 0, max: 0 };
 let browserDurationRange = { min: 0, max: 0 };
 let browserSuggestionOpen = false;
 let browserSelectedSuggestion = -1;
-let browserSuggestionItems: BrowserSuggestion[] = [];
+let browserSuggestionItems: ReplaySuggestion[] = [];
+let browserFilterRecords: ReplayFilterRecord[] = [];
 let browserRenderedCards: BrowserRenderedCard[] = [];
 let pendingBrowserSearchFrame = 0;
 let browserRenderGeneration = 0;
@@ -582,6 +567,9 @@ let browserOpeningPaths = new Set<string>();
 let browserGridCapped = loadBrowserGridCapped();
 let browserGridCardSize = loadBrowserGridCardSize();
 let browserReplaySignature = "";
+const LATEST_LEADERBOARD_PATH = "/v1/leaderboard";
+let browserLeaderboardRanks = leaderboardRankIndex(cached<Snapshot>(LATEST_LEADERBOARD_PATH)?.data);
+let browserLeaderboardRankSignature = [...browserLeaderboardRanks].map(([name, rank]) => `${name}:${rank}`).join("|");
 let browserRelativeTimeTimer = 0;
 let browserDocumentEventsBound = false;
 let currentLaunchSignature = "";
@@ -1070,94 +1058,26 @@ function currentBrowserFilterState(): BrowserFilterState {
     query: normalizeSearchText(browserSearchValue()),
     enabledTypes: selectedBrowserMatchTypes(),
     durationRange: currentBrowserDurationRange(),
-    customMapsOnly: document.querySelector<HTMLInputElement>("#customMapsToggle")?.checked ?? browserCustomMapsOnly,
+    sources: new Set(browserMapSources),
+    mapKey: browserSelectedMap?.key ?? null,
+    player: browserSelectedPlayer ? normalizeSearchText(browserSelectedPlayer) : null,
   };
-}
-
-function cardMatchesNonSearchFilters(card: BrowserRenderedCard, filterState: BrowserFilterState): boolean {
-  return (
-    filterState.enabledTypes.has(card.matchType) &&
-    (!filterState.customMapsOnly || card.isCustomMap) &&
-    card.durationSeconds >= filterState.durationRange.min &&
-    card.durationSeconds <= filterState.durationRange.max
-  );
-}
-
-function cardMatchesFilters(card: BrowserRenderedCard, filterState: BrowserFilterState): boolean {
-  return (!filterState.query || card.searchText.includes(filterState.query)) && cardMatchesNonSearchFilters(card, filterState);
 }
 
 function pluralize(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? "" : "s"}`;
 }
 
-function suggestionMatchRank(name: string, query: string): number {
-  if (!query) return 0;
-  if (name === query) return 0;
-  if (name.startsWith(query)) return 1;
-  if (name.split(/\s+/).some((part) => part.startsWith(query))) return 2;
-  return name.includes(query) ? 3 : Number.POSITIVE_INFINITY;
-}
-
-function sortedOpponentNames(opponents: Map<string, number>): string[] {
-  return [...opponents.entries()]
-    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], undefined, { sensitivity: "base" }))
-    .map(([name]) => name);
-}
-
-function buildBrowserSuggestionItems(filterState: BrowserFilterState): BrowserSuggestion[] {
-  const stats = new Map<string, BrowserSuggestion & { latestModified: number; rank: number; opponentCounts: Map<string, number> }>();
-
-  for (const card of browserRenderedCards) {
-    if (!cardMatchesNonSearchFilters(card, filterState)) continue;
-
-    card.names.forEach((name, index) => {
-      const key = card.normalizedNames[index];
-      const rank = suggestionMatchRank(key, filterState.query);
-      if (!Number.isFinite(rank)) return;
-
-      const existing =
-        stats.get(key) ??
-        {
-          name,
-          normalizedName: key,
-          replayCount: 0,
-          winCount: 0,
-          lossCount: 0,
-          drawCount: 0,
-          opponents: [],
-          latestModified: 0,
-          rank,
-          opponentCounts: new Map<string, number>(),
-        };
-
-      existing.rank = Math.min(existing.rank, rank);
-      existing.replayCount += 1;
-      existing.winCount += card.winnerIndex === index ? 1 : 0;
-      existing.lossCount += card.winnerIndex >= 0 && card.winnerIndex !== index ? 1 : 0;
-      existing.drawCount += card.isDraw ? 1 : 0;
-      existing.latestModified = Math.max(existing.latestModified, card.modified);
-      card.names.forEach((opponentName, opponentIndex) => {
-        if (opponentIndex === index) return;
-        existing.opponentCounts.set(opponentName, (existing.opponentCounts.get(opponentName) ?? 0) + 1);
-      });
-      stats.set(key, existing);
-    });
-  }
-
-  return [...stats.values()]
-    .map((item) => ({
-      ...item,
-      opponents: sortedOpponentNames(item.opponentCounts),
-    }))
-    .sort(
-      (left, right) =>
-        left.rank - right.rank ||
-        right.replayCount - left.replayCount ||
-        right.latestModified - left.latestModified ||
-        left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
-    )
-    .slice(0, SUGGESTION_LIMIT);
+function replayFilterRecord(replay: ReplayBrowserItem): ReplayFilterRecord {
+  return {
+    names: replay.players.map(player => player.name),
+    normalizedNames: replay.players.map(player => normalizeSearchText(player.name)),
+    matchType: replayMatchType(replay), durationSeconds: Number(replay.durationSeconds) || 0,
+    modified: Number(replay.modified) || 0, winnerIndex: replay.players.findIndex(player => player.winner),
+    isDraw: replay.draw, mapKey: replay.mapKey ?? null, mapLabel: replay.mapLabel ?? "Unknown map",
+    mapSource: replay.eventLabel === "Custom" ? "custom" : "vanilla",
+    thumbnailKey: replay.thumbnailKey, thumbnailDataUrl: replay.thumbnailDataUrl,
+  };
 }
 
 function setupBrowserDuration(replays: ReplayBrowserItem[], preserveRange: boolean) {
@@ -1190,9 +1110,13 @@ function setBrowserSuggestionsOpen(open: boolean) {
   const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
   const searchBox = document.querySelector<HTMLElement>("#playerSearchBox");
   const suggestionPanel = document.querySelector<HTMLElement>("#playerSuggestionPanel");
-  const shouldOpen = open && !searchInput?.disabled && browserSuggestionItems.length > 0;
+  const shouldOpen = open && !!searchInput && !searchInput.disabled;
 
   browserSuggestionOpen = shouldOpen;
+  if (shouldOpen) {
+    const overflow = document.querySelector<HTMLDetailsElement>("#replayFilterOverflow");
+    if (overflow) overflow.open = false;
+  }
   if (suggestionPanel) suggestionPanel.hidden = !shouldOpen;
   if (searchBox) searchBox.setAttribute("aria-expanded", String(shouldOpen));
   if (!shouldOpen) {
@@ -1206,7 +1130,7 @@ function closeBrowserSuggestions() {
   setBrowserSuggestionsOpen(false);
 }
 
-function suggestionDetailText(item: BrowserSuggestion): string {
+function suggestionDetailText(item: PlayerSuggestion): string {
   if (!item.opponents.length) return "No opponents yet";
   const opponents = item.opponents.slice(0, 3);
   const remaining = item.opponents.length - opponents.length;
@@ -1214,44 +1138,91 @@ function suggestionDetailText(item: BrowserSuggestion): string {
 }
 
 function renderBrowserSuggestions(query: string) {
-  const suggestionList = document.querySelector<HTMLElement>("#playerSuggestionList");
-  if (!suggestionList) return;
-
+  const list = document.querySelector<HTMLElement>("#playerSuggestionList");
+  if (!list) return;
   const fragment = document.createDocumentFragment();
-  browserSuggestionItems.forEach((item, index) => {
-    const option = document.createElement("button");
-    const primary = document.createElement("span");
-    const name = document.createElement("span");
-    const meta = document.createElement("span");
-    const detail = document.createElement("span");
-
-    option.id = `player-suggestion-${index}`;
-    option.type = "button";
-    option.className = "player-suggestion";
-    option.dataset.index = String(index);
-    option.setAttribute("role", "option");
-
-    primary.className = "suggestion-primary";
-    name.className = "suggestion-name";
-    meta.className = "suggestion-meta";
-    detail.className = "suggestion-detail";
-
-    renderHighlightedText(name, item.name, query);
-    meta.textContent = `${pluralize(item.replayCount, "replay")} - ${pluralize(item.winCount, "win")} - ${pluralize(item.lossCount, "loss")} - ${pluralize(item.drawCount, "draw")}`;
-    detail.textContent = suggestionDetailText(item);
-
-    primary.append(name, meta);
-    option.append(primary, detail);
-    fragment.append(option);
-  });
-
-  suggestionList.replaceChildren(fragment);
+  for (const kind of ["player", "map"] as const) {
+    const items = browserSuggestionItems.map((item, index) => ({ item, index })).filter(({ item }) => item.kind === kind);
+    if (!items.length) continue;
+    const group = document.createElement("div");
+    group.className = "suggestion-group";
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", kind === "player" ? "Players" : "Maps");
+    const heading = document.createElement("div");
+    heading.className = "suggestion-heading";
+    heading.setAttribute("aria-hidden", "true");
+    heading.textContent = `${kind === "player" ? "Players" : "Maps"} (${items.length})`;
+    group.append(heading);
+    for (const { item, index } of items) {
+      const active = item.kind === "map" ? browserSelectedMap?.key === item.key
+        : normalizeSearchText(browserSelectedPlayer ?? "") === item.key;
+      const option = document.createElement("button");
+      option.id = `player-suggestion-${index}`;
+      option.type = "button";
+      option.tabIndex = -1;
+      option.className = `player-suggestion ${item.kind}-suggestion`;
+      option.dataset.index = String(index);
+      option.setAttribute("role", "option");
+      option.title = `${active ? "Clear" : "Filter by"} ${item.kind}: ${item.name}`;
+      const icon = document.createElement("span");
+      icon.className = "suggestion-icon";
+      icon.setAttribute("aria-hidden", "true");
+      if (item.kind === "map") {
+        const thumbnail = document.createElement("img");
+        thumbnail.alt = "";
+        thumbnail.src = (item.thumbnailKey && browserThumbnailUrls.get(item.thumbnailKey)) || item.thumbnailDataUrl || FALLBACK_THUMBNAIL;
+        if (item.thumbnailKey) {
+          thumbnail.dataset.thumbnailKey = item.thumbnailKey;
+          queueReplayThumbnail(item.thumbnailKey);
+        }
+        icon.append(thumbnail);
+      } else {
+        icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="7" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>';
+      }
+      const body = document.createElement("span");
+      body.className = "suggestion-body";
+      const primary = document.createElement("span");
+      primary.className = "suggestion-primary";
+      const name = document.createElement("span");
+      name.className = "suggestion-name";
+      renderHighlightedText(name, item.name, query);
+      const meta = document.createElement("span");
+      meta.className = "suggestion-meta";
+      meta.textContent = item.kind === "player"
+        ? `${pluralize(item.replayCount, "replay")} · ${item.winCount}W · ${item.lossCount}L · ${item.drawCount}D`
+        : pluralize(item.replayCount, "replay");
+      if (item.kind === "player") meta.setAttribute("aria-label", `${item.replayCount} replays, ${item.winCount} wins, ${item.lossCount} losses, ${item.drawCount} draws`);
+      const detail = document.createElement("span");
+      detail.className = "suggestion-detail";
+      detail.textContent = item.kind === "player" ? suggestionDetailText(item) : item.source === "custom" ? "Custom" : "Vanilla";
+      detail.title = detail.textContent;
+      primary.append(name, meta);
+      body.append(primary, detail);
+      option.append(icon, body);
+      if (active) {
+        const clear = document.createElement("span");
+        clear.className = "suggestion-clear";
+        clear.textContent = "✓ Clear";
+        option.append(clear);
+      }
+      group.append(option);
+    }
+    fragment.append(group);
+  }
+  if (!browserSuggestionItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "suggestion-empty";
+    empty.setAttribute("role", "status");
+    empty.textContent = "No players or maps match these filters.";
+    fragment.append(empty);
+  }
+  list.replaceChildren(fragment);
   updateActiveBrowserSuggestion();
 }
 
 function refreshBrowserSuggestions(open = document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch")) {
   const filterState = currentBrowserFilterState();
-  browserSuggestionItems = buildBrowserSuggestionItems(filterState);
+  browserSuggestionItems = replaySuggestions(browserFilterRecords, filterState, SUGGESTION_LIMIT);
   if (browserSelectedSuggestion >= browserSuggestionItems.length) {
     browserSelectedSuggestion = browserSuggestionItems.length - 1;
   }
@@ -1264,7 +1235,8 @@ function updateActiveBrowserSuggestion() {
   const suggestionList = document.querySelector<HTMLElement>("#playerSuggestionList");
   if (!searchInput || !suggestionList) return;
 
-  Array.from(suggestionList.children).forEach((option, index) => {
+  const options = suggestionList.querySelectorAll<HTMLElement>("[role=option]");
+  Array.from(options).forEach((option, index) => {
     if (!(option instanceof HTMLElement)) return;
     const selected = index === browserSelectedSuggestion;
     option.classList.toggle("is-active", selected);
@@ -1276,7 +1248,7 @@ function updateActiveBrowserSuggestion() {
     return;
   }
 
-  const activeOption = suggestionList.children[browserSelectedSuggestion];
+  const activeOption = options[browserSelectedSuggestion];
   if (!(activeOption instanceof HTMLElement)) {
     searchInput.removeAttribute("aria-activedescendant");
     return;
@@ -1303,13 +1275,10 @@ function selectBrowserSuggestion(index: number) {
   const searchInput = document.querySelector<HTMLInputElement>("#playerSearch");
   if (!item || !searchInput) return;
 
-  browserSearch = item.name;
-  searchInput.value = item.name;
-  browserSelectedSuggestion = -1;
-  updateBrowserClearButton();
-  closeBrowserSuggestions();
-  scheduleBrowserSearch();
+  if (item.kind === "map") toggleBrowserMap(item.key, item.name);
+  else toggleBrowserPlayer(item.name);
   searchInput.focus();
+  closeBrowserSuggestions();
 }
 
 function clearBrowserSearch() {
@@ -1331,6 +1300,71 @@ function renderReplayPlayButton(replay: ReplayBrowserItem, label: string, replay
       <span class="play-glyph"></span>
     </button>
   `;
+}
+
+
+function commitBrowserFilters() {
+  browserSearch = "";
+  const input = document.querySelector<HTMLInputElement>("#playerSearch");
+  if (input) input.value = "";
+  browserSelectedSuggestion = -1;
+  updateBrowserClearButton();
+  updateBrowserFilterUi();
+  refreshBrowserSuggestions(false);
+  scheduleBrowserSearch();
+}
+
+function toggleBrowserMap(key: string, label: string) {
+  browserSelectedMap = browserSelectedMap?.key === key ? null : { key, label };
+  if (browserSelectedMap) {
+    const record = browserFilterRecords.find(record => record.mapKey === key);
+    if (record) browserMapSources.add(record.mapSource);
+  }
+  commitBrowserFilters();
+}
+
+function toggleBrowserPlayer(name: string) {
+  browserSelectedPlayer = normalizeSearchText(browserSelectedPlayer ?? "") === normalizeSearchText(name) ? null : name;
+  commitBrowserFilters();
+}
+
+function updateBrowserFilterUi() {
+  const chipRow = document.querySelector<HTMLElement>("#activeReplayFilters");
+  const chips: string[] = [];
+  const chip = (kind: string, label: string) => `<button type="button" class="active-filter-chip" data-clear-filter="${kind}" title="${escapeHtml(label)}" aria-label="Clear ${escapeHtml(label)} filter"><span class="active-filter-name">${escapeHtml(label)}</span><span aria-hidden="true">×</span></button>`;
+  if (browserSelectedMap) chips.push(chip("map", `Map: ${browserSelectedMap.label}`));
+  if (browserSelectedPlayer) chips.push(chip("player", `Player: ${browserSelectedPlayer}`));
+  if (chipRow) {
+    const markup = chips.length ? `<div class="replay-filter-inline">${chips.join("")}</div><details id="replayFilterOverflow" class="replay-filter-overflow"><summary aria-label="Show ${chips.length} active map and player ${chips.length === 1 ? "filter" : "filters"}">${chips.length} ${chips.length === 1 ? "filter" : "filters"}<span aria-hidden="true">▾</span></summary><div class="replay-filter-popover">${chips.join("")}</div></details>` : "";
+    if (chipRow.innerHTML !== markup) chipRow.innerHTML = markup;
+    chipRow.hidden = !chips.length;
+  }
+  document.querySelectorAll<HTMLInputElement>(".type-filter").forEach(input => { input.checked = browserSelectedTypes.has(input.value); });
+  document.querySelectorAll<HTMLInputElement>(".source-filter").forEach(input => { input.checked = browserMapSources.has(input.value as MapSource); });
+  document.querySelectorAll<HTMLButtonElement>("#replayGrid [data-filter-kind]").forEach(button => {
+    const kind = button.dataset.filterKind;
+    const value = button.dataset.filterValue ?? "";
+    const active = kind === "map" ? browserSelectedMap?.key === value
+      : kind === "mode" ? browserSelectedTypes.size === 1 && browserSelectedTypes.has(value)
+      : normalizeSearchText(browserSelectedPlayer ?? "") === normalizeSearchText(value);
+    button.setAttribute("aria-pressed", String(active));
+    button.title = `${active ? "Clear" : "Filter by"} ${kind}: ${button.dataset.filterLabel ?? value}`;
+  });
+}
+
+function clearReplayFilter(kind: string) {
+  if (kind === "map" || kind === "all") browserSelectedMap = null;
+  if (kind === "player" || kind === "all") browserSelectedPlayer = null;
+  if (kind === "mode" || kind === "all") browserSelectedTypes = new Set(MATCH_TYPES);
+  if (kind === "source" || kind === "all") browserMapSources = new Set(["vanilla", "custom"]);
+  if (kind === "duration" || kind === "all") {
+    const min = document.querySelector<HTMLInputElement>("#durationMin");
+    const max = document.querySelector<HTMLInputElement>("#durationMax");
+    if (min) min.value = "0";
+    if (max) max.value = String(DURATION_SLIDER_STEPS);
+    min?.dispatchEvent(new Event("input"));
+  }
+  commitBrowserFilters();
 }
 
 function replayDownloadFileName(replay: ReplayBrowserItem): string {
@@ -1617,19 +1651,24 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
     scoreDelta === null
       ? ""
       : `<div class="replay-label elo-delta ${scoreDelta > 0 ? "is-gain" : "is-loss"}">${escapeHtml(formatScoreDelta(scoreDelta))}</div>`;
-  const eventLabel = replay.eventLabel
-    ? `<div class="replay-label event-label replay-event-label">${escapeHtml(replay.eventLabel)}</div>`
-    : "";
+  const mapLabel = replay.mapLabel ?? "Unknown map";
+  const mapButton = replay.mapKey
+    ? `<button type="button" class="replay-label replay-filter-label" data-filter-kind="map" data-filter-value="${escapeHtml(replay.mapKey)}" data-filter-label="${escapeHtml(mapLabel)}" aria-label="Filter by map ${escapeHtml(mapLabel)}" aria-pressed="${browserSelectedMap?.key === replay.mapKey}"><span>${escapeHtml(mapLabel)}</span></button>`
+    : `<span class="replay-label unknown-map">Unknown map</span>`;
   const names = replay.players
     .map((player, index) => {
       const separator = index > 0 ? `<span class="matchup-separator"> vs </span>` : "";
-      return `${separator}<span class="player-name ${playerColorClass(player, index)}" data-player-index="${index}">${escapeHtml(player.name)}</span>`;
+      const rank = browserLeaderboardRanks.get(player.name.trim().toLocaleLowerCase());
+      const rankBadge = rank == null
+        ? ""
+        : `<span class="player-rank-badge" aria-label="Elo rank ${rank}" title="Current Elo rank #${rank}">${rank}</span>`;
+      return `${separator}<span class="replay-player"><button type="button" class="player-name player-filter ${playerColorClass(player, index)}" data-player-index="${index}" data-filter-kind="player" data-filter-value="${escapeHtml(player.name)}" aria-label="Filter by player ${escapeHtml(player.name)}">${escapeHtml(player.name)}</button>${rankBadge}</span>`;
     })
     .join("");
   const winnerLine = replay.draw
     ? `<div class="winner-line">draw</div>`
     : winner
-    ? `<div class="winner-line">winner: <span class="winner-name ${playerColorClass(winner, winnerIndex)}" data-winner-name>${escapeHtml(winner.name)}</span></div>`
+    ? `<div class="winner-line">winner: <button type="button" class="winner-name player-filter ${playerColorClass(winner, winnerIndex)}" data-winner-name data-filter-kind="player" data-filter-value="${escapeHtml(winner.name)}" aria-label="Filter by player ${escapeHtml(winner.name)}">${escapeHtml(winner.name)}</button></div>`
     : "";
   const label = replay.players.map((player) => player.name).join(" versus ");
   const accessibleLabel = replay.eventLabel ? `${label}, ${replay.eventLabel}` : label;
@@ -1644,13 +1683,13 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
       <img class="replay-thumb" alt="" loading="lazy" decoding="async" src="${escapeHtml(thumbnailSource)}" ${thumbnailKey ? `data-thumbnail-key="${escapeHtml(thumbnailKey)}"` : ""}>
       <div class="replay-shade"></div>
       <div class="replay-labels">
+        ${mapButton}
         <div class="replay-label-group">
-          <div class="replay-label match-type">${escapeHtml(matchType)}</div>
-          ${scoreDeltaLabel}
+          <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
+          <button type="button" class="replay-label replay-filter-label match-type" data-filter-kind="mode" data-filter-value="${escapeHtml(matchType)}" aria-label="Filter by mode ${escapeHtml(matchType)}" aria-pressed="${browserSelectedTypes.size === 1 && browserSelectedTypes.has(matchType)}"><span>${escapeHtml(matchType.replace(" FFA", ""))}</span></button>
         </div>
-        <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
       </div>
-      ${eventLabel}
+      <div class="replay-score-label">${scoreDeltaLabel}</div>
       ${renderReplayPlayButton(replay, label, replayIndex)}
       ${renderReplaySelectButton(replay, label, replayIndex)}
       <time class="replay-age" data-replay-modified="${replay.modified}" datetime="${new Date(replay.modified * 1000).toISOString()}" aria-label="${escapeHtml(`${replayAge}, ${replayDate}`)}" title="${escapeHtml(`${replayAge} · ${replayDate}`)}" aria-live="off">
@@ -2083,7 +2122,10 @@ function renderBrowserNav(): string {
 
 
 function hydrateBrowserCards(cardElements: Iterable<HTMLElement>, reset = false) {
-  if (reset) browserRenderedCards = [];
+  if (reset) {
+    browserRenderedCards = [];
+    browserFilterRecords = browserReplays.map(replayFilterRecord);
+  }
   for (const element of cardElements) {
     const replayIndex = Number(element.dataset.cardIndex);
     const replay = browserReplays[replayIndex];
@@ -2091,16 +2133,8 @@ function hydrateBrowserCards(cardElements: Iterable<HTMLElement>, reset = false)
 
     const winnerIndex = replay.players.findIndex((player) => player.winner);
     browserRenderedCards.push({
+      ...browserFilterRecords[replayIndex],
       element,
-      searchText: normalizeSearchText(replay.players.map((player) => player.name).join(" ")),
-      matchType: replayMatchType(replay),
-      durationSeconds: Number(replay.durationSeconds) || 0,
-      isCustomMap: replay.eventLabel === "Custom",
-      modified: Number(replay.modified) || 0,
-      names: replay.players.map((player) => player.name),
-      normalizedNames: replay.players.map((player) => normalizeSearchText(player.name)),
-      winnerIndex,
-      isDraw: replay.draw,
       winnerName: winnerIndex >= 0 ? replay.players[winnerIndex]?.name ?? "" : "",
       nameElements: Array.from(element.querySelectorAll<HTMLElement>("[data-player-index]")),
       winnerNameElement: element.querySelector<HTMLElement>("[data-winner-name]"),
@@ -2225,7 +2259,7 @@ function applyBrowserSearch() {
   let visibleCount = 0;
 
   for (const card of browserRenderedCards) {
-    const visible = cardMatchesFilters(card, filterState);
+    const visible = matchesReplay(card, filterState);
     card.nameElements.forEach((element, index) => {
       renderHighlightedText(element, card.names[index] ?? "", filterState.query);
     });
@@ -2239,6 +2273,7 @@ function applyBrowserSearch() {
     if (visible) visibleCount += 1;
   }
 
+  updateBrowserFilterUi();
   const searchEmpty = document.querySelector<HTMLElement>("#searchEmpty");
   if (searchEmpty) searchEmpty.hidden = !browserHideUnmatched || visibleCount > 0;
 }
@@ -2311,12 +2346,14 @@ function renderReplayBrowser() {
             aria-haspopup="listbox"
             aria-owns="playerSuggestionList"
           >
+            <div class="replay-search-field">
+            <svg class="replay-search-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg>
             <input
               id="playerSearch"
               class="player-search"
               type="search"
-              placeholder="Search players"
-              aria-label="Search player usernames"
+              placeholder="Search players or maps"
+              aria-label="Search players or maps"
               aria-autocomplete="list"
               aria-controls="playerSuggestionList"
               autocomplete="off"
@@ -2325,28 +2362,24 @@ function renderReplayBrowser() {
               ${(browserLoading && !browserReplays.length) || browserError || !browserReplays.length ? "disabled" : ""}
             >
             <button id="clearPlayerSearch" class="search-clear" type="button" aria-label="Clear search" ${browserSearch ? "" : "hidden"}>x</button>
+            <div id="activeReplayFilters" class="active-replay-filters" role="group" aria-label="Active map and player filters" hidden></div>
+            </div>
             <div id="playerSuggestionPanel" class="player-suggestion-panel" hidden>
-              <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player suggestions"></div>
+              <div id="playerSuggestionList" class="player-suggestion-list" role="listbox" aria-label="Player and map suggestions"></div>
+              <div class="suggestion-footer" aria-hidden="true">↑↓ Navigate <span>Enter Select</span><span>Esc Close</span></div>
             </div>
           </div>
           <label class="match-mode-toggle" title="Dim non-matching replays">
             <input id="matchModeToggle" type="checkbox" aria-label="Dim non-matching replays" ${browserHideUnmatched ? "" : "checked"} ${browserReplays.length ? "" : "disabled"}>
             <span aria-hidden="true">&#128123;&#65039;</span>
           </label>
-          <label class="match-mode-toggle custom-map-toggle" title="Custom maps only">
-            <input id="customMapsToggle" type="checkbox" aria-label="Custom maps only" ${browserCustomMapsOnly ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>
-            <span>Custom</span>
-          </label>
         </div>
         <div class="filter-controls">
           <div class="type-filters" role="group" aria-label="Match type filters">
-            ${["1v1", "3P FFA", "4P FFA"]
-              .map(
-                (type) => `
-                  <label><input class="type-filter" type="checkbox" value="${escapeHtml(type)}" ${browserSelectedTypes.has(type) ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}>${escapeHtml(type.replace(" FFA", ""))}</label>
-                `,
-              )
-              .join("")}
+            ${MATCH_TYPES.map(type => `<label title="Toggle ${escapeHtml(type)}"><input class="type-filter" type="checkbox" value="${escapeHtml(type)}" ${browserSelectedTypes.has(type) ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}><span>${escapeHtml(type.replace(" FFA", ""))}</span></label>`).join("")}
+          </div>
+          <div class="type-filters source-filters" role="group" aria-label="Map source filters">
+            ${(["vanilla", "custom"] as const).map(source => `<label><input class="source-filter" type="checkbox" value="${source}" ${browserMapSources.has(source) ? "checked" : ""} ${browserReplays.length ? "" : "disabled"}><span>${source === "vanilla" ? "Vanilla" : "Custom"}</span></label>`).join("")}
           </div>
           <div class="duration-filter" aria-label="Duration filter">
             <span id="durationMinLabel" class="duration-label">${formatDurationSeconds(browserDurationRange.min)}</span>
@@ -2395,7 +2428,7 @@ function renderReplayBrowser() {
   }
 }
 
-function handleBrowserSuggestionPointerDown(event: PointerEvent) {
+function handleBrowserSuggestionClick(event: MouseEvent) {
   const target = event.target instanceof Element ? event.target : null;
   const option = target?.closest<HTMLButtonElement>(".player-suggestion");
   if (!option) return;
@@ -2405,6 +2438,8 @@ function handleBrowserSuggestionPointerDown(event: PointerEvent) {
 
 function handleBrowserOutsidePointerDown(event: PointerEvent) {
   if (event.target instanceof Node && document.querySelector("#playerSearchBox")?.contains(event.target)) return;
+  const overflow = document.querySelector<HTMLDetailsElement>("#replayFilterOverflow");
+  if (overflow) overflow.open = false;
   closeBrowserSuggestions();
 }
 
@@ -2418,6 +2453,7 @@ async function switchBrowserPage(nextPage: BrowserPage) {
   if (!(await confirmMapEditorLeave())) return;
   browserPage = nextPage;
   renderReplayBrowser();
+  if (nextPage === "replays") void loadBrowserLeaderboardRanks();
 }
 
 function refreshBrowserSelectionUi() {
@@ -2556,6 +2592,13 @@ function bindBrowserEvents() {
   document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("focus", () => {
     refreshBrowserSuggestions(true);
   });
+  document.querySelector<HTMLElement>("#playerSearchBox")?.addEventListener("focusout", event => {
+    if (!(event.relatedTarget instanceof Node) || !(event.currentTarget as HTMLElement).contains(event.relatedTarget)) {
+      closeBrowserSuggestions();
+      const overflow = document.querySelector<HTMLDetailsElement>("#replayFilterOverflow");
+      if (overflow) overflow.open = false;
+    }
+  });
   document.querySelector<HTMLInputElement>("#playerSearch")?.addEventListener("keydown", (event) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -2582,23 +2625,45 @@ function bindBrowserEvents() {
     event.preventDefault();
   });
   document.querySelector<HTMLButtonElement>("#clearPlayerSearch")?.addEventListener("click", clearBrowserSearch);
-  document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("pointerdown", handleBrowserSuggestionPointerDown);
+  document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("click", handleBrowserSuggestionClick);
+  document.querySelector<HTMLElement>("#playerSuggestionList")?.addEventListener("mousedown", event => event.preventDefault());
   document.querySelector<HTMLInputElement>("#matchModeToggle")?.addEventListener("change", (event) => {
     browserHideUnmatched = !(event.target as HTMLInputElement).checked;
     scheduleBrowserSearch();
   });
-  document.querySelector<HTMLInputElement>("#customMapsToggle")?.addEventListener("change", (event) => {
-    browserCustomMapsOnly = (event.target as HTMLInputElement).checked;
-    refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
-    scheduleBrowserSearch();
+  document.querySelectorAll<HTMLInputElement>(".source-filter").forEach(input => {
+    input.addEventListener("change", () => {
+      const source = input.value as MapSource;
+      if (input.checked) browserMapSources.add(source);
+      else browserMapSources.delete(source);
+      updateBrowserFilterUi();
+      refreshBrowserSuggestions(false);
+      scheduleBrowserSearch();
+    });
   });
-  document.querySelectorAll<HTMLInputElement>(".type-filter").forEach((input) => {
+  document.querySelectorAll<HTMLInputElement>(".type-filter").forEach(input => {
     input.addEventListener("change", () => {
       if (input.checked) browserSelectedTypes.add(input.value);
       else browserSelectedTypes.delete(input.value);
-      refreshBrowserSuggestions(document.activeElement === document.querySelector<HTMLInputElement>("#playerSearch"));
+      updateBrowserFilterUi();
+      refreshBrowserSuggestions(false);
       scheduleBrowserSearch();
     });
+  });
+  document.querySelector<HTMLElement>("#activeReplayFilters")?.addEventListener("click", event => {
+    const button = (event.target as Element).closest<HTMLElement>("[data-clear-filter]");
+    if (button) clearReplayFilter(button.dataset.clearFilter ?? "all");
+  });
+  document.querySelector<HTMLElement>("#activeReplayFilters")?.addEventListener("toggle", event => {
+    if (event.target instanceof HTMLDetailsElement && event.target.open) closeBrowserSuggestions();
+  }, true);
+  document.querySelector<HTMLElement>("#activeReplayFilters")?.addEventListener("keydown", event => {
+    if (event.key !== "Escape") return;
+    const overflow = document.querySelector<HTMLDetailsElement>("#replayFilterOverflow");
+    if (overflow?.open) {
+      overflow.open = false;
+      overflow.querySelector<HTMLElement>("summary")?.focus();
+    }
   });
   const durationMin = document.querySelector<HTMLInputElement>("#durationMin");
   const durationMax = document.querySelector<HTMLInputElement>("#durationMax");
@@ -2677,6 +2742,18 @@ function bindBrowserEvents() {
   document.querySelector<HTMLElement>("#replayGrid")?.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+
+    const filterButton = target.closest<HTMLButtonElement>("[data-filter-kind]");
+    if (filterButton) {
+      const value = filterButton.dataset.filterValue ?? "";
+      if (filterButton.dataset.filterKind === "map") toggleBrowserMap(value, filterButton.dataset.filterLabel ?? value);
+      else if (filterButton.dataset.filterKind === "player") toggleBrowserPlayer(value);
+      else {
+        browserSelectedTypes = toggleMatchType(browserSelectedTypes, value);
+        commitBrowserFilters();
+      }
+      return;
+    }
 
     const selectButton = target.closest<HTMLButtonElement>("[data-replay-select-index]");
     if (selectButton) {
@@ -3219,6 +3296,9 @@ function replayListSignature(replays: ReplayBrowserItem[]): string {
         replay.modified,
         replay.durationSeconds,
         replay.thumbnailKey ?? "",
+        replay.mapKey ?? "",
+        replay.mapLabel ?? "",
+        replay.eventLabel ?? "",
         replay.scoreDelta ?? "",
         replay.draw ? "draw" : "",
         replay.players.map((player) => `${player.name}:${player.winner ? "1" : "0"}`).join(","),
@@ -3260,6 +3340,20 @@ async function loadBrowserReplays(
   } finally {
     browserLoading = false;
     if (shouldRender && browserPage === "replays") renderReplayBrowser();
+  }
+}
+
+async function loadBrowserLeaderboardRanks() {
+  try {
+    const snapshot = await retrieve<Snapshot>(LATEST_LEADERBOARD_PATH);
+    const ranks = leaderboardRankIndex(snapshot);
+    const signature = [...ranks].map(([name, rank]) => `${name}:${rank}`).join("|");
+    if (signature === browserLeaderboardRankSignature) return;
+    browserLeaderboardRanks = ranks;
+    browserLeaderboardRankSignature = signature;
+    if (browserPage === "replays" && browserReplays.length) renderReplayBrowser();
+  } catch {
+    // Rank badges are optional. Keep replay browsing available while offline.
   }
 }
 
@@ -6055,6 +6149,7 @@ if (appMode === "browser") {
   refreshRecordingQueueUi();
   if (!exampleMode) void initializeAppUpdater();
   void loadBrowserReplays();
+  void loadBrowserLeaderboardRanks();
   startBrowserRelativeTimeUpdates();
   window.addEventListener("keydown", (event) => {
     const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";

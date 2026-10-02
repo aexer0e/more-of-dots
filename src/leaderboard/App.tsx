@@ -2,8 +2,9 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { invoke } from '../platform';
 import { cached, refreshLeaderboard, type Board, type History, type Player, type Snapshot } from './client';
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, Crosshair, Pencil, Plus, RefreshCw, Search, Trophy, X } from 'lucide-react';
-import { chartAxis, MAX_COMPARISONS, playerColors, seriesPath, snapshotDelay } from './chart';
+import { changedSeries, chartAxis, historyTimeAgo, MAX_COMPARISONS, nearestSeriesName, playerColors, seriesPath, seriesValueAt, snapshotDelay } from './chart';
 import { activityColor, activityLabel, sortPlayers, type TableSort } from './activity';
+import { eloWinGain } from './elo';
 import './styles.css';
 
 const LATEST = '/v1/leaderboard';
@@ -11,44 +12,64 @@ const LATEST = '/v1/leaderboard';
 const number = (value: number) => value.toLocaleString();
 const signed = (value: number) => `${value > 0 ? '+' : ''}${number(value)}`;
 const date = (stamp: number) => new Date(stamp * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const exactDateTime = (stamp: number) => new Date(stamp * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 function preference(key: string, fallback = '') { try { return localStorage.getItem('mod.lb.' + key) ?? fallback; } catch { return fallback; } }
 function remember(key: string, value: string) { try { localStorage.setItem('mod.lb.' + key, value); } catch { /* Optional preferences. */ } }
 
 function ProgressChart({ history, players, colors, metric, onInspect }: { history: History; players: string[]; colors: Map<string, string>; metric: 'value' | 'rank'; onInspect: (stamp: number | null) => void }) {
-  const [hover, setHover] = useState<number | null>(null);
+  const [hover, setHover] = useState<{ row: number; stamp: number; player: string | null } | null>(null);
   const gradientId = useId().replaceAll(':', '');
-  const active = hover == null ? null : history.rows[Math.min(hover, history.rows.length - 1)];
+  const active = hover == null ? null : history.rows[Math.min(hover.row, history.rows.length - 1)];
   useEffect(() => { onInspect(active?.capturedAt ?? null); return () => onInspect(null); }, [active?.capturedAt, onInspect]);
   const visiblePlayers = players.filter((name) => history.rows.some((row) => row.players.some((p) => p.nickname === name && p[metric] != null)));
   const values = history.rows.flatMap((row) => row.players.filter((p) => players.includes(p.nickname)).map((p) => p[metric])).filter((v): v is number => v != null && Number.isFinite(v));
   if (!values.length) return <div className="lb-empty">No history</div>;
   const axis = chartAxis(values, metric === 'rank');
-  const from = history.rows[0]?.capturedAt ?? history.from, to = history.rows.at(-1)?.capturedAt ?? history.to;
+  const from = Math.max(history.from, history.rows[0]?.capturedAt ?? history.from), to = history.to;
   const x = (stamp: number) => 44 + (stamp - from) / Math.max(1, to - from) * 296;
   const y = (v: number) => metric === 'rank' ? 14 + (v - axis.low) / (axis.high - axis.low) * 160 : 174 - (v - axis.low) / (axis.high - axis.low) * 160;
+  const series = new Map(visiblePlayers.map((name) => [name, history.rows.map((row) => ({ stamp: row.capturedAt, value: row.players.find((p) => p.nickname === name)?.[metric] ?? null }))]));
+  const highlightedValue = hover?.player ? seriesValueAt(series.get(hover.player) ?? [], hover.stamp) : null;
   return <div className="lb-chart-wrap">
     <svg className="lb-chart" viewBox="0 0 356 205" role="img" tabIndex={0} aria-label={`${metric === 'rank' ? 'Rank' : 'Score'} history`}
       onPointerLeave={() => setHover(null)} onBlur={() => setHover(null)}
-      onPointerMove={(event) => { const rect = event.currentTarget.getBoundingClientRect(); const scale = Math.min(rect.width / 356, rect.height / 205); const chartX = (event.clientX - rect.left - (rect.width - 356 * scale) / 2) / scale; const stamp = from + (chartX - 44) / 296 * (to - from); let best = 0; history.rows.forEach((row, i) => { if (Math.abs(row.capturedAt - stamp) < Math.abs(history.rows[best].capturedAt - stamp)) best = i; }); setHover(best); }}
-      onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); setHover(Math.max(0, Math.min(history.rows.length - 1, (hover ?? history.rows.length - 1) + (event.key === 'ArrowRight' ? 1 : -1)))); } }}>
+      onPointerMove={(event) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const scale = Math.min(rect.width / 356, rect.height / 205);
+        const chartX = (event.clientX - rect.left - (rect.width - 356 * scale) / 2) / scale;
+        const chartY = (event.clientY - rect.top - (rect.height - 205 * scale) / 2) / scale;
+        const stamp = Math.max(from, Math.min(to, from + (chartX - 44) / 296 * (to - from)));
+        let row = 0;
+        for (let index = 1; index < history.rows.length && history.rows[index].capturedAt <= stamp; index++) row = index;
+        const player = nearestSeriesName(visiblePlayers.map((name) => ({ name, value: seriesValueAt(series.get(name)!, stamp) })), chartY, y);
+        setHover({ row, stamp, player });
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+          event.preventDefault();
+          const row = Math.max(0, Math.min(history.rows.length - 1, (hover?.row ?? history.rows.length - 1) + (event.key === 'ArrowRight' ? 1 : -1)));
+          setHover({ row, stamp: history.rows[row].capturedAt, player: hover?.player ?? visiblePlayers[0] ?? null });
+        }
+      }}>
       <defs><linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={colors.get(visiblePlayers[0])} stopOpacity=".15"/><stop offset="100%" stopColor={colors.get(visiblePlayers[0])} stopOpacity="0"/></linearGradient></defs>
       {axis.ticks.map((v) => <g key={v}><line className="lb-gridline" x1="44" x2="340" y1={y(v)} y2={y(v)} /><text x="34" y={y(v) + 3} textAnchor="end">{number(v)}</text></g>)}
       {visiblePlayers.map((name) => {
-        const points = history.rows.map((row) => ({ stamp: row.capturedAt, value: row.players.find((p) => p.nickname === name)?.[metric] ?? null }));
-        const observed = points.filter((p): p is { stamp: number; value: number } => p.value != null);
+        const points = series.get(name)!;
+        const observed = changedSeries(points).filter((p): p is { stamp: number; value: number } => p.value != null);
         if (!observed.length) return null;
-        const path = seriesPath(points, x, y), last = observed.at(-1)!;
-        const selected = active ? observed.find((p) => p.stamp === active.capturedAt) : last;
+        const path = seriesPath(points, x, y, to), last = observed.at(-1)!;
+        const hoverValue = hover ? seriesValueAt(points, hover.stamp) : null;
+        const selected = hover ? hoverValue == null ? null : { stamp: hover.stamp, value: hoverValue } : last;
         return <g key={name}>
-          {visiblePlayers.length === 1 && <path d={`${path} L${x(last.stamp)},174 L${x(observed[0].stamp)},174 Z`} fill={`url(#${gradientId})`} />}
+          {visiblePlayers.length === 1 && <path d={`${path} L${x(to)},174 L${x(observed[0].stamp)},174 Z`} fill={`url(#${gradientId})`} />}
           <path className="lb-series" d={path} fill="none" stroke={colors.get(name)} strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round" />
-          {selected && <circle cx={x(selected.stamp)} cy={y(selected.value)} r={active ? 3.5 : 2.5} fill={colors.get(name)} stroke="#141b20" strokeWidth="1.5"/>}
+          {selected && <circle cx={x(selected.stamp)} cy={y(selected.value)} r={active && hover?.player === name ? 4.5 : active ? 3.5 : 2.5} fill={colors.get(name)} stroke="#141b20" strokeWidth="1.5"/>}
         </g>;
       })}
-      {active && <line x1={x(active.capturedAt)} x2={x(active.capturedAt)} y1="14" y2="174" className="lb-crosshair" />}
+      {active && <line x1={x(hover!.stamp)} x2={x(hover!.stamp)} y1="14" y2="174" className="lb-crosshair" />}
       {[0, .5, 1].map((fraction) => <text key={fraction} x={44 + 296 * fraction} y="200" textAnchor={fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'}>{date(from + (to - from) * fraction)}</text>)}
     </svg>
-    {active && <time className="lb-chart-date">{date(active.capturedAt)}</time>}
+    {active && <time className="lb-chart-date" dateTime={new Date(hover!.stamp * 1000).toISOString()}>{exactDateTime(hover!.stamp)} <span>· {historyTimeAgo(hover!.stamp)}</span>{highlightedValue != null && <b style={{ color: colors.get(hover?.player ?? '') }}>· {metric === 'rank' ? `#${number(highlightedValue)}` : number(highlightedValue)}</b>}</time>}
   </div>;
 }
 
@@ -152,7 +173,7 @@ export function LeaderboardApp() {
     {error && <p role="alert" className="lb-error">{error} {snapshot && 'Showing saved rankings.'}</p>}
     {snapshot && delay && <p className="lb-error">Snapshot delayed · Last snapshot {delay} · {new Date(snapshot.capturedAt * 1000).toLocaleString()}</p>}
     <section className="lb-self" aria-label="Your standing">
-      <div className="lb-self-name"><span className="lb-avatar">{(me || '?').slice(0, 1).toUpperCase()}</span><div><span className="lb-caption">Your player</span><strong>{me || 'Choose a player'}</strong></div><button className="lb-icon-button" aria-label="Change your player" onClick={() => setEditingMe(!editingMe)}><Pencil size={12}/></button>{me && <button className="lb-icon-button" aria-label={includeMe ? 'Remove me from graph' : 'Add me to graph'} aria-pressed={includeMe} onClick={() => { setIncludeMe(!includeMe); remember('includeMe', String(!includeMe)); }}>{includeMe ? <Check size={13}/> : <Plus size={13}/>}</button>}</div>
+      <div className="lb-self-name"><span className="lb-avatar">{(me || '?').slice(0, 1).toUpperCase()}</span><strong>{me || 'Choose a player'}</strong><button className="lb-icon-button" aria-label="Change your player" onClick={() => setEditingMe(!editingMe)}><Pencil size={12}/></button>{me && <button className="lb-icon-button" aria-label={includeMe ? 'Remove me from graph' : 'Add me to graph'} aria-pressed={includeMe} onClick={() => { setIncludeMe(!includeMe); remember('includeMe', String(!includeMe)); }}>{includeMe ? <Check size={13}/> : <Plus size={13}/>}</button>}</div>
       <div className="lb-self-stat"><span className="lb-caption">Rank</span><strong>{mine ? `#${mine.rank}` : snapshot ? 'Unranked' : '—'}</strong>{rankChange != null && <small className={rankChange > 0 ? 'lb-positive' : rankChange < 0 ? 'lb-negative' : 'lb-muted'}>{rankChange === 0 ? 'No change' : `${rankChange > 0 ? '↑' : '↓'} ${Math.abs(rankChange)} ${Math.abs(rankChange) === 1 ? 'place' : 'places'}`}</small>}</div>
       <div className="lb-self-stat"><span className="lb-caption">{scoreLabel}</span><strong>{mine ? number(mine.value) : '—'}</strong>{change != null && <small className={change > 0 ? 'lb-positive' : change < 0 ? 'lb-negative' : 'lb-muted'}>{signed(change)} since {date(previousPoint!.capturedAt)}</small>}</div>
       <div className="lb-next"><span className="lb-caption">{nextRank ? `To #${nextRank.rank}` : 'Next rank'}</span><strong>{nextRank && mine ? `${number(nextRank.value - mine.value)} ${board === 'elo' ? 'Elo' : 'wins'}` : mine ? 'Leading' : 'Top 100 required'}</strong>{nextRank && <small>{nextRank.nickname}</small>}</div>
@@ -162,12 +183,12 @@ export function LeaderboardApp() {
       <section className="lb-rankings" aria-label="Rankings">
         <div className="lb-list-toolbar"><label className="lb-search"><Search size={14}/><input type="search" aria-label="Search leaderboard" placeholder="Find a player…" value={search} onChange={(event) => { setSearch(event.target.value); setNearMe(false); }} /></label><button className="lb-icon-button" aria-label="Find me" disabled={!mine} onClick={findMe}><Crosshair size={16}/></button></div>
         <div className="lb-list-context"><div className="lb-list-tabs"><button aria-pressed={!nearMe} onClick={() => setNearMe(false)}>All players</button><button aria-pressed={nearMe} disabled={!mine} onClick={() => setNearMe(true)}>Near me</button></div><span>{visibleRows.length} players</span></div>
-        <div className="lb-ranking-scroll"><table><thead><tr><th className="lb-rank" aria-sort={sort.key === 'rank' ? sort.descending ? 'descending' : 'ascending' : 'none'}>{sortHeader('rank', 'Rank')}</th><th>Player</th><th className="lb-numeric">{scoreLabel}</th><th className="lb-numeric lb-gap">Gap</th><th className="lb-activity" aria-sort={sort.key === 'activity' ? sort.descending ? 'descending' : 'ascending' : 'none'}>{sortHeader('activity', 'Last activity')}</th><th className="lb-compare-col"><span className="lb-sr-only">Compare</span></th></tr></thead><tbody>{visibleRows.map((p) => { const isMe = p.nickname === me, selected = isMe ? includeMe : rivals.includes(p.nickname); return <tr key={p.nickname} ref={isMe ? mineRef : undefined} className={isMe ? 'lb-you' : selected ? 'lb-comparing' : ''}><td className={`lb-rank ${p.rank <= 3 ? 'lb-podium' : ''}`}>{p.rank}</td><td className="lb-player-name"><span className={`lb-faction lb-faction-${p.faction}`} style={colors.has(p.nickname) ? { background: colors.get(p.nickname) } : undefined} /><span title={p.nickname}>{p.nickname}</span>{isMe && <span className="lb-you-tag">You</span>}</td><td className="lb-numeric lb-score">{number(p.value)}</td><td className="lb-numeric lb-muted lb-gap">{mine && !isMe ? signed(p.value - mine.value) : '—'}</td><td className="lb-activity" style={{ color: activityColor(activity.get(p.nickname), now) }} title={activity.has(p.nickname) ? `Score change observed ${new Date(activity.get(p.nickname)! * 1000).toLocaleString()}.` : activityStatus === 'loading' ? 'Loading activity history' : activityStatus === 'error' ? 'Activity history unavailable. Use Check for updates to retry.' : 'No score change observed in the past 30 days of available history.'}>{activity.has(p.nickname) ? <time dateTime={new Date(activity.get(p.nickname)! * 1000).toISOString()}>{activityLabel(activity.get(p.nickname)!, now)}</time> : activityStatus === 'loading' ? '…' : activityStatus === 'error' ? '—' : '>30d ago'}</td><td className="lb-compare-col"><button className={`lb-compare ${selected ? 'is-selected' : ''}`} aria-label={`${selected ? 'Remove' : 'Compare'} ${p.nickname}`} aria-pressed={selected} style={colors.has(p.nickname) ? { color: colors.get(p.nickname), borderColor: colors.get(p.nickname) } : undefined} disabled={!isMe && !selected && rivals.length >= MAX_COMPARISONS} onClick={() => togglePlayer(p)}>{selected ? <Check size={13}/> : <Plus size={13}/>}</button></td></tr>; })}</tbody></table>
+        <div className="lb-ranking-scroll"><table><thead><tr><th className="lb-rank" aria-sort={sort.key === 'rank' ? sort.descending ? 'descending' : 'ascending' : 'none'}>{sortHeader('rank', 'Rank')}</th><th>Player</th><th className="lb-numeric">{scoreLabel}</th><th className="lb-numeric lb-gap">Gap</th>{board === 'elo' && <th className="lb-numeric lb-win-gain" title="Estimated Elo gained if you beat this player">Win +</th>}<th className="lb-activity" aria-sort={sort.key === 'activity' ? sort.descending ? 'descending' : 'ascending' : 'none'}>{sortHeader('activity', 'Last activity')}</th><th className="lb-compare-col"><span className="lb-sr-only">Compare</span></th></tr></thead><tbody>{visibleRows.map((p) => { const isMe = p.nickname === me, selected = isMe ? includeMe : rivals.includes(p.nickname); const winGain = board === 'elo' && mine && !isMe ? eloWinGain(mine.value, p.value) : null; return <tr key={p.nickname} ref={isMe ? mineRef : undefined} className={isMe ? 'lb-you' : selected ? 'lb-comparing' : ''}><td className={`lb-rank ${p.rank <= 3 ? 'lb-podium' : ''}`}>{p.rank}</td><td className="lb-player-name"><span className={`lb-faction lb-faction-${p.faction}`} style={colors.has(p.nickname) ? { background: colors.get(p.nickname) } : undefined} /><span title={p.nickname}>{p.nickname}</span>{isMe && <span className="lb-you-tag">You</span>}</td><td className="lb-numeric lb-score">{number(p.value)}</td><td className="lb-numeric lb-muted lb-gap">{mine && !isMe ? signed(p.value - mine.value) : '—'}</td>{board === 'elo' && <td className="lb-numeric lb-win-gain" title={winGain == null ? undefined : `${me} would gain about ${winGain} Elo for beating ${p.nickname}`} >{winGain == null ? '—' : `+${winGain}`}</td>}<td className="lb-activity" style={{ color: activityColor(activity.get(p.nickname), now) }} title={activity.has(p.nickname) ? `Score change observed ${new Date(activity.get(p.nickname)! * 1000).toLocaleString()}.` : activityStatus === 'loading' ? 'Loading activity history' : activityStatus === 'error' ? 'Activity history unavailable. Use Check for updates to retry.' : 'No score change observed in the past 30 days of available history.'}>{activity.has(p.nickname) ? <time dateTime={new Date(activity.get(p.nickname)! * 1000).toISOString()}>{activityLabel(activity.get(p.nickname)!, now)}</time> : activityStatus === 'loading' ? '…' : activityStatus === 'error' ? '—' : '>30d ago'}</td><td className="lb-compare-col"><button className={`lb-compare ${selected ? 'is-selected' : ''}`} aria-label={`${selected ? 'Remove' : 'Compare'} ${p.nickname}`} aria-pressed={selected} style={colors.has(p.nickname) ? { color: colors.get(p.nickname), borderColor: colors.get(p.nickname) } : undefined} disabled={!isMe && !selected && rivals.length >= MAX_COMPARISONS} onClick={() => togglePlayer(p)}>{selected ? <Check size={13}/> : <Plus size={13}/>}</button></td></tr>; })}</tbody></table>
         {!visibleRows.length && <div className="lb-empty">{loading && !snapshot ? 'Loading rankings…' : search ? 'No players found.' : 'No rankings available.'}{search && <button className="lb-text-button" onClick={() => setSearch('')}>Clear search</button>}</div>}</div>
         <footer className="lb-list-footer"><span className="lb-activity-note">{activityStatus === 'error' ? 'Activity unavailable · refresh to retry' : 'Activity based on observed score changes'}</span><span>{rivals.length}/{MAX_COMPARISONS}</span></footer>
       </section>
       <aside className="lb-progress" aria-label="Player progress">
-        <div className="lb-panel-heading"><h2>Progress</h2><div className="lb-period" aria-label="History period">{[7, 30, 90, 0].map((period) => <button key={period} aria-pressed={days === period} onClick={() => setDays(period)}>{period === 0 ? 'All' : `${period}d`}</button>)}</div></div>
+        <div className="lb-panel-heading"><h2>Progress</h2><div className="lb-period" aria-label="History period">{[{ days: 1, label: '24h' }, { days: 7, label: '7d' }, { days: 30, label: '30d' }, { days: 0, label: 'All' }].map((period) => <button key={period.days} aria-pressed={days === period.days} onClick={() => setDays(period.days)}>{period.label}</button>)}</div></div>
         <div className="lb-chart-controls"><div className="lb-list-tabs" aria-label="Chart metric"><button aria-pressed={metric === 'value'} onClick={() => setMetric('value')}>{scoreLabel}</button><button aria-pressed={metric === 'rank'} onClick={() => setMetric('rank')}>Rank</button></div>{historyLoading && <span className="lb-muted">Updating…</span>}</div>
         {historyError && <p role="alert" className="lb-error">{historyError}</p>}
         {history ? <ProgressChart key={`${board}-${days}`} history={history} players={names} colors={colors} metric={metric} onInspect={setInspectedAt} /> : <div className="lb-empty lb-chart-empty">{historyLoading ? 'Loading history…' : 'Select a player'}</div>}

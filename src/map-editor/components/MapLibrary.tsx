@@ -8,6 +8,7 @@ interface MapLibraryProps {
   maps: StoredMap[];
   loading: boolean;
   onCreate: () => void;
+  onRefresh: () => void;
   onDeleteSelected: (fileNames: string[]) => void;
   onEdit: (mapId: string) => void;
 }
@@ -44,10 +45,14 @@ function thumbnailIconSize(map: StoredMap, size: number) {
 function MapThumbnail({ map }: { map: StoredMap }) {
   const terrainSource = map.data.map_surface ? `data:image/png;base64,${map.data.map_surface}` : uiAssets.logo;
   const capitalIndexes = new Set(map.data.capitals);
+  const aspectRatio = (map.width || CANVAS_WIDTH) / (map.height || CANVAS_HEIGHT);
 
   return (
     <span className="map-thumb-frame">
-      <span className="map-thumb-stage">
+      <span className="map-thumb-stage" style={{
+        width: `${Math.min(1, aspectRatio / (16 / 9)) * 100}%`,
+        height: `${Math.min(1, (16 / 9) / aspectRatio) * 100}%`,
+      }}>
         <img alt={`${map.name} preview`} className="map-thumb-terrain" draggable={false} src={terrainSource} />
         <span aria-hidden="true" className="map-thumb-shade" />
         <span aria-hidden="true" className="map-thumb-overlay">
@@ -147,6 +152,7 @@ export function MapLibrary({
   maps,
   loading,
   onCreate,
+  onRefresh,
   onDeleteSelected,
   onEdit,
 }: MapLibraryProps) {
@@ -182,27 +188,34 @@ export function MapLibrary({
   function deleteSelectedMaps() {
     if (!selectedCount) return;
     const label = selectedCount === 1 ? selectedMaps[0]?.fileName : `${selectedCount} maps`;
-    if (!window.confirm(`Delete ${label} from War of Dots? This cannot be undone.`)) return;
-    onDeleteSelected(selectedMaps.map((map) => map.fileName || map.id));
+    if (!window.confirm(`Delete ${label}? Published maps will be removed from the game. Deleting a draft keeps any published copy. No backup will be kept. This cannot be undone.`)) return;
+    onDeleteSelected(selectedMaps.map((map) => map.id));
     setSelectedMapIds(new Set());
     setSelecting(false);
   }
 
   return (
     <section className="library-shell">
-      <div className="library-toolbar">
-        <div className="library-toolbar-copy">
-          <h2>Game Maps</h2>
+      <header className="library-toolbar">
+        <div className="brand-block">
+          <img alt="" src={uiAssets.appIcon} />
+          <div className="library-toolbar-copy">
+            <h1>Map Editor</h1>
+            <p>Maps and drafts</p>
+          </div>
         </div>
         <div className="library-toolbar-actions">
-          <button className="primary-button" type="button" onClick={onCreate}>
-            New Map
+          <button className="secondary-button compact" disabled={loading} type="button" onClick={onRefresh}>
+            Refresh
           </button>
-          <button className="secondary-button" type="button" onClick={toggleSelecting}>
+          <button className="secondary-button compact" aria-pressed={selecting} type="button" onClick={toggleSelecting}>
             {selecting ? 'Cancel Select' : 'Select'}
           </button>
+          <button className="primary-button compact" type="button" onClick={onCreate}>
+            New Map
+          </button>
         </div>
-      </div>
+      </header>
 
       {selecting ? (
         <div className="library-selection-bar">
@@ -244,30 +257,48 @@ export function MapLibrary({
                     <span>{selected ? 'Selected' : 'Select map'}</span>
                   </label>
                 ) : null}
-                <button className="map-thumb" type="button" onClick={() => (selecting ? toggleMapSelection(map.id) : onEdit(map.id))}>
+                <button className="map-thumb" type="button" disabled={!selecting && map.status === 'invalid'} onClick={() => (selecting ? toggleMapSelection(map.id) : onEdit(map.id))}>
                   <MapThumbnail map={map} />
-                  <span className="map-mode-pill">{modeLabel(map.data.mode)} / {map.teamCount} teams</span>
+                  <span className="map-preview-badges">
+                    <span className="map-status-pill" data-status={map.status ?? 'published'}>
+                      <span aria-hidden="true" className="map-status-dot" />
+                      {map.status === 'draft' ? 'Draft' : map.status === 'invalid' ? 'Unreadable map' : 'In game'}
+                    </span>
+                    <span className="map-mode-pill" title={`${modeLabel(map.data.mode)} / ${map.teamCount} teams`}>
+                      {map.data.mode === 'v3' ? '3P' : map.data.mode === 'v4' ? '4P' : '1v1'}
+                    </span>
+                  </span>
                 </button>
                 <div className="map-card-body">
                   <div className="map-card-head">
-                    <div className="map-title-slot">
-                      <h4>{map.name}</h4>
+                    <h4 title={map.name}>{map.name}</h4>
+                    <div className="map-card-actions">
+                      {selecting ? (
+                        <button className="secondary-button compact" type="button" aria-pressed={selected} onClick={() => toggleMapSelection(map.id)}>
+                          {selected ? 'Selected' : 'Select'}
+                        </button>
+                      ) : (
+                        <>
+                          <button className="secondary-button compact" disabled={map.status === 'invalid'} aria-label={`Edit ${map.name}`} type="button" onClick={() => onEdit(map.id)}>
+                            <ActionIcon />Edit
+                          </button>
+                          <button className="danger-button compact" aria-label={`Delete ${map.name}`} type="button" onClick={() => {
+                            const detail = map.status === 'draft' ? ' Any published copy stays in the game.' : map.gameFilePath ? ' Its game file and thumbnail will be deleted.' : '';
+                            if (window.confirm(`Delete ${map.fileName}?${detail} No backup will be kept. This cannot be undone.`)) onDeleteSelected([map.id]);
+                          }}>
+                            <svg aria-hidden="true" className="library-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7" />
+                            </svg>Delete
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
-                  <p className="map-card-updated">
-                    {map.fileName} · {map.width}x{map.height} · Updated {formatUpdatedAt(map.updatedAt)}
-                  </p>
-                  <div className="map-card-actions">
-                    {selecting ? (
-                      <button className="card-icon-button" type="button" onClick={() => toggleMapSelection(map.id)}>
-                        {selected ? 'Selected' : 'Select'}
-                      </button>
-                    ) : (
-                      <button className="card-icon-button" title="Edit map" type="button" onClick={() => onEdit(map.id)}>
-                        <ActionIcon />
-                      </button>
-                    )}
+                  <div className="map-card-meta">
+                    <p className="map-card-filename" title={map.fileName}>{map.fileName}</p>
+                    <p className="map-card-updated">{map.width}×{map.height} · Updated {formatUpdatedAt(map.updatedAt)}</p>
                   </div>
+                  {map.issue && <p className="dialog-error">{map.issue}</p>}
                 </div>
               </article>
             );

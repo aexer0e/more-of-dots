@@ -50,7 +50,7 @@ import type { MapData, Point, StoredMap, ToolId } from '../lib/types';
 
 interface EditorScreenProps {
   initialMap: StoredMap;
-  saveMap: (map: StoredMap) => Promise<StoredMap>;
+  saveMap: (map: StoredMap, publish?: boolean) => Promise<StoredMap>;
   onClose: (map?: StoredMap) => void;
   registerLeaveGuard?: (handler: (() => Promise<boolean>) | null) => void;
 }
@@ -670,6 +670,9 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   const [expandedPanels, setExpandedPanels] = useState<Record<PanelKey, boolean>>({ map: true, terrain: true, units: true });
   const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'dirty'>('saved');
+  const [saveError, setSaveError] = useState('');
+  const savingRef = useRef(false);
+  const editRevisionRef = useRef(0);
   const [ready, setReady] = useState(false);
   const [leavePromptOpen, setLeavePromptOpen] = useState(false);
   const [leavePromptError, setLeavePromptError] = useState('');
@@ -1581,6 +1584,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
   // Save state
   // ────────────────────────────────────────────────────────────
   function markDirty() {
+    editRevisionRef.current += 1;
     dirtyRef.current = true;
     setSaveState('dirty');
   }
@@ -1592,17 +1596,38 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
     return next;
   }
 
-  async function persistNow() {
-    if (!dirtyRef.current) return draftRef.current;
+  async function persistNow(publish = false) {
+    if (!publish && !dirtyRef.current) return draftRef.current;
     if (!mountedRef.current) return draftRef.current;
+    if (savingRef.current) throw new Error('A map save is already in progress.');
+    savingRef.current = true;
+    setSaveError('');
     setSaveState('saving');
-    const saved = await saveMap(buildSyncedMap());
-    dirtyRef.current = false;
-    if (!mountedRef.current) return saved;
-    draftRef.current = { ...saved };
-    setDraft(saved);
-    setSaveState('saved');
-    return saved;
+    const revision = editRevisionRef.current;
+    try {
+      const saved = await saveMap(buildSyncedMap(), publish);
+      if (editRevisionRef.current !== revision) {
+        // Keep edits made while the disk write was in flight, but use the new
+        // draft identity for the next save.
+        const current = { ...saved, data: draftRef.current.data, width: draftRef.current.width,
+          height: draftRef.current.height, teamCount: draftRef.current.teamCount };
+        draftRef.current = current;
+        if (mountedRef.current) { setDraft(current); setSaveState('dirty'); }
+        return current;
+      }
+      dirtyRef.current = false;
+      if (!mountedRef.current) return saved;
+      draftRef.current = { ...saved };
+      setDraft(saved);
+      setSaveState('saved');
+      return saved;
+    } catch (error) {
+      setSaveState(dirtyRef.current ? 'dirty' : 'saved');
+      setSaveError(String(error));
+      throw error;
+    } finally {
+      savingRef.current = false;
+    }
   }
 
   function resolveLeavePrompt(result: LeaveResult) {
@@ -1636,7 +1661,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
       resolveLeavePrompt(saved);
     } catch (error) {
       setSaveState('dirty');
-      setLeavePromptError(error instanceof Error ? error.message : 'Unable to save map.');
+      setLeavePromptError(String(error));
     }
   }
 
@@ -2979,7 +3004,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
           </button>
           <div className={`save-badge ${saveState}`}>
             <span className="dot" />
-            <span>{saveState === 'saving' ? 'Saving…' : saveState === 'dirty' ? 'Unsaved' : 'Saved'}</span>
+            <span>{saveState === 'saving' ? 'Saving…' : saveState === 'dirty' ? 'Unsaved' : draft.status === 'draft' ? 'Draft saved' : 'Saved to game'}</span>
           </div>
         </div>
 
@@ -3005,7 +3030,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
             >
               <span className="panel-toggle-copy">
                 <span className="panel-toggle-title">Map</span>
-                <span className="panel-toggle-subtitle">Mode, background, and direct save</span>
+                <span className="panel-toggle-subtitle">Mode, background, and saving</span>
               </span>
               <span className={`panel-toggle-chevron ${expandedPanels.map ? 'expanded' : ''}`}>▾</span>
             </button>
@@ -3041,10 +3066,15 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
                   />
                 </label>
                 <button className="secondary-button" type="button" onClick={resetTerrainToPlains}>Reset terrain</button>
-                <button className="primary-button" type="button" disabled={saveState === 'saving' || saveState === 'saved'} onClick={() => { void persistNow(); }}>
+                <button className="secondary-button" type="button" disabled={!ready || saveState !== 'dirty'} onClick={() => { void persistNow().catch(() => {}); }}>
+                  Save draft
+                </button>
+                <button className="primary-button" type="button" disabled={!ready || saveState === 'saving' || (saveState === 'saved' && draft.status === 'published')} onClick={() => { void persistNow(true).catch(() => {}); }}>
                   {saveState === 'saving' ? 'Saving...' : exampleMode ? 'Save example' : 'Save to game'}
                 </button>
               </div>
+              <p>Drafts stay in More of Dots. Save to game publishes a playable map.</p>
+              {saveError && <p className="dialog-error" role="alert">{saveError}</p>}
               </div>
             )}
           </section>
@@ -3259,7 +3289,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
         <div aria-modal="true" className="dialog-card" role="dialog">
           <p className="eyebrow">Unsaved changes</p>
           <h3>Save this map before leaving?</h3>
-          <p>Saving overwrites the War of Dots map file. Discard leaves the file unchanged.</p>
+          <p>Save draft keeps your work in More of Dots. Discard drops changes since your last save. Your published game map stays unchanged.</p>
           {leavePromptError ? <div className="dialog-error">{leavePromptError}</div> : null}
           <div className="dialog-actions split">
             <button className="secondary-button" type="button" disabled={saveState === 'saving'} onClick={cancelLeave}>
@@ -3270,7 +3300,7 @@ export function EditorScreen({ initialMap, saveMap, onClose, registerLeaveGuard 
               Discard
             </button>
             <button className="primary-button" type="button" disabled={saveState === 'saving'} onClick={() => void saveAndLeave()}>
-              {saveState === 'saving' ? 'Saving...' : 'Save'}
+              {saveState === 'saving' ? 'Saving...' : 'Save draft'}
             </button>
           </div>
         </div>

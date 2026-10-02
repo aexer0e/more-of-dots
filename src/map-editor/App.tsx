@@ -6,6 +6,7 @@ import { setCanvasSize } from './lib/constants';
 import { mapStore } from './lib/storage';
 import type { StoredMap } from './lib/types';
 import './styles.css';
+import './library.css';
 
 declare global {
   interface Window {
@@ -41,7 +42,7 @@ function PromptDialog({ open, onCancel, onConfirm }: PromptDialogProps) {
       <div aria-modal="true" className="dialog-card" role="dialog">
         <p className="eyebrow">Map details</p>
         <h3>Create a new map</h3>
-        <p>The file will be written directly into War of Dots&apos; map_editor folder.</p>
+        <p>New maps are saved as drafts in More of Dots. Use Save to game when your map is ready to play.</p>
         <input
           autoFocus
           type="text"
@@ -125,10 +126,11 @@ export default function MapEditorApp() {
     try {
       const deleted = await mapStore.deleteMany(fileNames);
       const deletedSet = new Set(deleted);
-      setMaps((current) => current.filter((map) => !deletedSet.has(map.fileName || map.id)));
-    } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : 'Unable to delete selected maps.');
+      setMaps((current) => current.filter((map) => !deletedSet.has(map.id)));
       await loadMaps();
+    } catch (nextError) {
+      await loadMaps();
+      setError(String(nextError));
     }
   }
 
@@ -138,20 +140,6 @@ export default function MapEditorApp() {
   return (
     <div className="map-editor-scope" data-screen={screen.kind}>
       <div className="app-shell">
-        {screen.kind !== 'editor' && (
-          <header className="app-header">
-            <div className="brand-block">
-              <img alt="WoD Map Editor icon" src={uiAssets.appIcon} />
-              <div>
-                <h1>Map Editor</h1>
-              </div>
-            </div>
-            <button className="secondary-button compact" type="button" onClick={() => void loadMaps()}>
-              Refresh
-            </button>
-          </header>
-        )}
-
         <main className="app-main">
           {screen.kind === 'library' && (
             <>
@@ -160,6 +148,7 @@ export default function MapEditorApp() {
                 loading={loading}
                 maps={maps}
                 onCreate={() => setCreateOpen(true)}
+                onRefresh={() => void loadMaps()}
                 onDeleteSelected={(fileNames) => void handleDeleteMaps(fileNames)}
                 onEdit={(mapId) => setScreen({ kind: 'editor', mapId })}
               />
@@ -173,6 +162,7 @@ export default function MapEditorApp() {
               onClose={(savedMap) => {
                 if (savedMap) setMaps((current) => upsertMap(current, savedMap));
                 setScreen({ kind: 'library' });
+                void loadMaps();
               }}
               registerLeaveGuard={(handler) => {
                 leaveGuardRef.current = handler;

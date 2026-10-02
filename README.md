@@ -7,6 +7,12 @@
 - Follow global leaderboards, track your progress, and compare players
 - Create and edit custom maps, including motorised infantry
 
+## Custom maps
+
+New maps and **Save draft** stay in More of Dots under `%APPDATA%\local.more-of-dots\map-drafts`. **Save to game** checks the map before publishing it to War of Dots. Each team needs at least one unit. Saving unfinished edits as a draft leaves the last published copy intact.
+
+If an older custom map is blocking lobbies, use **Delete** beside Edit in the map library. This permanently deletes the installed map and its companion PNG without keeping a backup. Deleting a draft keeps any published copy. Unreadable maps appear with an error and can also be deleted.
+
 ## Replay video recorder
 
 Replay video export is provided by the optional **More of Dots Recorder** package. The main app no longer bundles the PowerShell runner, process-injection DLL, Python worker, or FFmpeg, so a recorder quarantine does not remove the replay browser.
@@ -104,18 +110,18 @@ More of Dots remembers the last video destination and uses the Windows Videos fo
 
 The Leaderboard tab replaces Region because servers are now mixed. It reads public Elo and World top-100 snapshots from `wod-nations-map.moreofdots.workers.dev`. The app reads only the username from the local game's compressed settings and highlights that player. If no saved login is available, enter an exact username once. The password is never returned to the UI or sent to the worker.
 
-Search runs locally. Compare up to ten players alongside your own rank and score over 7, 30, 90 days, or all available history. Each player keeps a distinct color. The worker samples six-hour intervals for the week view and daily intervals for longer views. Charts connect missing observations with straight lines; the recorded values table retains missing values. Axis ticks use uniform round intervals.
+Search runs locally. Compare up to ten players alongside your own rank and score over 24 hours, 7, 30, 90 days, or all available history. Each player keeps a distinct color. The worker returns every two-minute observation where a selected player's rank or score changed and omits consecutive unchanged observations. Charts draw discrete steps at each change and extend the latest value to the end of the selected range. Axis ticks use uniform round intervals.
 
 The app persists the latest snapshot and up to 12 history queries. It combines concurrent requests, uses the server's published refresh interval to wait for the next expected snapshot, and revalidates expired entries with ETags. Hidden tabs do not poll the network. Saved snapshots remain visible if a refresh fails. Only player histories requested by the current comparison are downloaded.
 
 ## Development examples
 
-Run `npm run dev` to prepare local examples and start the web UI at `http://127.0.0.1:5173`. Startup copies the newest 100 replays at most, filling any remaining slots from the app's replay backups and skipping duplicate content. It also copies recent editor maps, and map layouts from recent replays into ignored `build/dev-data`. It also saves fresh public Elo and World rankings with all available sampled history. All three tabs are populated before Vite starts. Subsequent offline starts can reuse the last saved leaderboard snapshot.
+Run `npm run dev` to prepare local examples and start the web UI at `http://127.0.0.1:5173`. Startup copies the newest 100 replays at most, filling any remaining slots from the app's replay backups and skipping duplicate content. It also copies recent editor maps, and map layouts from recent replays into ignored `build/dev-data`. It also saves fresh public Elo and World rankings with available change-only history. All three tabs are populated before Vite starts. Subsequent offline starts can reuse the last saved leaderboard snapshot.
 
 Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to `%APPDATA%\local.more-of-dots\replay-backups`; set `WOD_REPLAY_BACKUP_DIR` to use another backup folder. Only the username is read from game settings; credentials are never copied. Example edits and deletions last for the browser session and do not touch Steam files. Restarting creates fresh copies. Recorder and game-launch actions are unavailable in example mode.
 
 `npm run dev:web` runs the same example workspace. `npm run dev:desktop` opens the native development app with that example UI. Release builds use the real backend.
 
-Replay previews support embedded PNGs, old numeric map IDs, and the new relative PNG paths, including Eronion maps. Only non-vanilla maps receive the Custom badge. Shock units use the game's `motorised` storage key and infantry artwork with an upward chevron.
+Replay previews support embedded PNGs, old numeric map IDs, and the new relative PNG paths, including Eronion maps. The Custom badge checks the official `assets/fahero_maps`, `assets/zolamare_maps`, and `assets/eronion_maps` folders in discovered Steam installations. Embedded PNGs are compared with the installed images; legacy numeric map IDs remain vanilla. No map list or image hashes are bundled. Each replay listing refreshes the check, including cached replays, so new Steam maps are recognized automatically. Maps absent from the local installation cannot be recognized by path or image. Shock units use the game's `motorised` storage key and infantry artwork with an upward chevron.
 
-The leaderboard uses `/v1/leaderboard/refresh` to retrieve current rankings, exact last observed score changes, and selected player history in one request. Subsequent refreshes replace only the unfinished sampling interval and append new points. Selection caches persist separately; changing players or range loads that selection once. The server publishes the refresh interval, currently two minutes. Older public endpoints remain supported by the API for previous app releases.
+The leaderboard uses `/v1/leaderboard/refresh` to retrieve current rankings, exact last observed score changes, and selected player history in one request. Subsequent refreshes replace the overlap at the previous capture and append only changed points. Selection caches persist separately; changing players or range loads that selection once. The server publishes the refresh interval, currently two minutes. Older public endpoints remain supported by the API for previous app releases.

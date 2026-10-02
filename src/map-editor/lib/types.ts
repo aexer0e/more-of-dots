@@ -27,6 +27,9 @@ export interface StoredMap {
   width: number;
   height: number;
   teamCount: number;
+  status?: 'draft' | 'published' | 'invalid';
+  issue?: string | null;
+  gameFilePath?: string | null;
 }
 
 export interface EditorSnapshot {

@@ -12,15 +12,18 @@
     "check:version": "node --test scripts/version.test.mjs",
     "check:web": "tsc --noEmit",
     "check:replays": "node --test scripts/replay-filters.test.mjs",
-    "check": "npm run check:version && npm run check:leaderboard && npm run check:map && npm run check:examples && npm run check:replays && npm run check:web",
+    "check": "npm run check:version && npm run check:leaderboard && npm run check:map && npm run check:examples && npm run check:replays && npm run check:player && npm run check:web",
     "build:web": "tsc && vite build",
-    "build:recorder": "powershell.exe -NoProfile -File scripts/build-recorder.ps1",
     "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
     "build": "node scripts/version.mjs tauri build && npm run size:audit",
     "check:leaderboard": "node --test scripts/leaderboard.test.mjs scripts/leaderboard-chart.test.mjs scripts/leaderboard-activity.test.mjs",
     "check:map": "node --test scripts/map-codec.test.mjs",
     "dev:desktop": "node scripts/version.mjs tauri dev",
-    "check:examples": "node --test scripts/dev-data.test.mjs"
+    "check:examples": "node --test scripts/dev-data.test.mjs",
+    "prepare:player": "powershell.exe -NoProfile -File scripts/prepare-player.ps1",
+    "check:native": "powershell.exe -NoProfile -File scripts/check-native.ps1",
+    "check:player": "node --test scripts/player-scheduling.test.mjs scripts/player-sound.test.mjs scripts/player-view.test.mjs",
+    "check:engine": "dotnet run --project engine/tests/ReplaySim.Tests.csproj -c Release"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

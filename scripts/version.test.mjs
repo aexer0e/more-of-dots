@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { compareVersions, createTauriVersionConfig, parseVersion, validateVersionProgression } from "./version.mjs";
+import { compareVersions, createTauriVersionConfig, parseVersion, validateVersionProgression, tauriTargetArguments } from "./version.mjs";
+
+test("configured Cargo targets also select the Tauri bundle directory", () => {
+  assert.deepEqual(tauriTargetArguments(["build"], "x86_64-pc-windows-gnu"), ["build", "--target", "x86_64-pc-windows-gnu"]);
+  assert.deepEqual(tauriTargetArguments(["build"], undefined), ["build"]);
+});
+
+test("an explicit Tauri target overrides the Cargo environment", () => {
+  for (const args of [["build", "--target", "explicit"], ["build", "--target=explicit"], ["dev", "-t", "explicit"], ["build", "-texplicit"]]) {
+    assert.deepEqual(tauriTargetArguments(args, "environment"), args);
+  }
+});
 
 test("accepts stable semantic versions", () => {
   assert.deepEqual(parseVersion("1.0.0\n"), { value: "1.0.0", parts: [1, 0, 0] });

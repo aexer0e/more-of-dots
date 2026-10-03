@@ -5,6 +5,7 @@ import path from 'node:path';
 
 export default defineConfig({
   clearScreen: false,
+  build: { rollupOptions: { input: { main: 'index.html', player: 'player.html' } } },
   plugins: [react(), {
     name: 'local-examples',
     configureServer(server) {
@@ -22,6 +23,7 @@ export default defineConfig({
     },
   }],
   server: {
+    watch: { ignored: ['**/engine/**', '**/src-tauri/**', '**/build/**'] },
     strictPort: true,
     port: 5173,
   },

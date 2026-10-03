@@ -56,7 +56,6 @@
 .suggestion-empty { padding: 15px 10px; color: var(--muted); font-size: 12px; }
 
 .replay-labels { gap: calc(6px * var(--card-scale)); }
-.replay-label-group { flex: 0 0 auto; gap: calc(5px * var(--card-scale)); }
 .replay-labels .replay-label { font-size: clamp(9px, calc(12px * var(--card-scale)), 16px); border-radius: 5px; padding: calc(5px * var(--card-scale)) calc(7px * var(--card-scale)); }
 .replay-labels .length { border-color: transparent; }
 .replay-labels .replay-filter-label { display: inline-flex; align-items: center; gap: 4px; min-width: 0; min-height: 0; height: auto; cursor: pointer; line-height: 1; font-weight: 500; border-color: rgba(238, 244, 240, 0.3); }

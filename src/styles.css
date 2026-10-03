@@ -1394,6 +1394,98 @@ p {
   cursor: default;
 }
 
+/* Mode and rules filters: one compact dropdown each, since the game has many modes. */
+.filter-dropdown {
+  position: relative;
+}
+
+.filter-dropdown summary {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--browser-line);
+  border-radius: var(--r-md);
+  color: var(--browser-text);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: var(--fs-md);
+  gap: var(--s-2);
+  list-style: none;
+  min-height: 42px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.filter-dropdown summary::-webkit-details-marker {
+  display: none;
+}
+
+.filter-dropdown summary::after {
+  border-bottom: 1.5px solid currentColor;
+  border-right: 1.5px solid currentColor;
+  content: "";
+  height: 6px;
+  margin-top: -3px;
+  opacity: 0.7;
+  transform: rotate(45deg);
+  width: 6px;
+}
+
+.filter-dropdown[open] summary,
+.filter-dropdown summary:hover {
+  border-color: var(--line-strong);
+}
+
+.filter-dropdown[data-disabled] summary {
+  color: var(--faint);
+  pointer-events: none;
+}
+
+.filter-menu {
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 2px;
+  left: 0;
+  min-width: 100%;
+  padding: var(--s-1);
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 30;
+}
+
+.filter-menu label {
+  align-items: center;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  display: flex;
+  font-size: var(--fs-md);
+  gap: var(--s-2);
+  min-height: 30px;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
+.filter-menu label:hover {
+  background: var(--accent-soft);
+}
+
+.filter-menu input {
+  accent-color: var(--accent);
+  height: 13px;
+  margin: 0;
+  width: 13px;
+}
+
+.filter-count {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  padding-left: var(--s-3);
+}
+
 .duration-filter {
   align-items: center;
   background: var(--surface);
@@ -1475,20 +1567,40 @@ p {
   width: var(--duration-thumb-size);
 }
 
+/* The scroller. Only the cards near the viewport are rendered into
+   .replay-grid-cards; padding and height stand in for the others.
+   Strict containment keeps the page's flex layout from measuring the cards:
+   without it, every row the grid adds re-laid out all of them several times. */
 .replay-grid {
   align-content: start;
+  contain: strict;
   display: grid;
   flex: 1 1 auto;
-  gap: var(--s-3);
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   height: auto;
   min-height: 0;
+  overflow-anchor: none;
   overflow-y: auto;
   padding: 2px 4px 56px 2px;
   scrollbar-color: var(--muted) transparent;
 }
 
-.replay-grid.is-unlocked {
+/* Defines the columns and gaps; cards are placed absolutely by the virtual grid. */
+.replay-grid-cards {
+  display: grid;
+  gap: var(--s-3);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
+  position: relative;
+}
+
+.replay-grid-cards > .replay-card {
+  left: 0;
+  position: absolute;
+  top: 0;
+}
+
+.replay-grid.is-unlocked .replay-grid-cards {
   grid-template-columns: repeat(auto-fit, minmax(min(var(--replay-card-min-width, 300px), 100%), 1fr));
 }
 
@@ -1498,8 +1610,6 @@ p {
   border: 1px solid var(--browser-line);
   border-radius: var(--r-md);
   contain: layout paint style;
-  contain-intrinsic-size: auto calc(214px * var(--card-scale));
-  content-visibility: auto;
   isolation: isolate;
   min-height: calc(214px * var(--card-scale));
   overflow: hidden;
@@ -1523,7 +1633,9 @@ p {
 
 .replay-labels {
   align-items: flex-start;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  justify-items: start;
   gap: calc(10px * var(--card-scale));
   justify-content: space-between;
   left: calc(12px * var(--card-scale));
@@ -1531,14 +1643,6 @@ p {
   right: calc(12px * var(--card-scale));
   top: calc(12px * var(--card-scale));
   z-index: 2;
-}
-
-.replay-label-group {
-  align-items: flex-start;
-  display: flex;
-  flex: 1 1 auto;
-  gap: calc(8px * var(--card-scale));
-  min-width: 0;
 }
 
 .replay-label {
@@ -1558,9 +1662,12 @@ p {
   white-space: nowrap;
 }
 
-.replay-label-group .replay-label {
-  flex: 0 1 auto;
-  max-width: none;
+.replay-labels .replay-label {
+  max-width: 100%;
+}
+
+.replay-labels .match-type {
+  justify-self: end;
 }
 
 .elo-delta {
@@ -1616,38 +1723,52 @@ p {
 
 .replay-play-button {
   align-items: center;
-  background: var(--muted);
-  border: 1px solid var(--muted);
-  border-radius: 50%;
-  box-shadow: 0 0 0 2px var(--line);
-  color: #111512;
+  background: rgba(8, 18, 15, 0.45);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  box-shadow: 0 3px 16px #0004;
+  color: white;
   display: inline-flex;
-  height: 54px;
+  font: inherit;
+  font-size: clamp(11px, calc(13px * var(--card-scale)), 16px);
+  gap: 7px;
+  min-height: 34px;
   justify-content: center;
   opacity: 0;
-  padding: 0;
+  padding: 7px 14px;
+  pointer-events: none;
   position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%) scale(0.92);
+  left: calc(12px * var(--card-scale));
+  bottom: calc(10px * var(--card-scale));
   transition: opacity 140ms ease, transform 140ms ease;
-  width: 54px;
   z-index: 3;
 }
 
+/* The blur applies only while the button shows: a backdrop filter on every
+   card's hidden button made each card a separate compositing surface. */
 .replay-card:hover .replay-play-button,
 .replay-card:focus-within .replay-play-button {
+  backdrop-filter: blur(3px);
   opacity: 1;
-  transform: translate(-50%, -50%) scale(1);
+  pointer-events: auto;
+}
+
+.replay-play-button:hover {
+  background: rgba(8, 18, 15, 0.65);
+  border-color: white;
+}
+
+.replay-play-button:focus-visible {
+  outline: 3px solid #83bdf0;
+  outline-offset: 5px;
 }
 
 .play-glyph {
-  border-bottom: 9px solid transparent;
-  border-left: 15px solid currentColor;
-  border-top: 9px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 8px solid currentColor;
+  border-top: 5px solid transparent;
   display: inline-block;
   height: 0;
-  margin-left: 4px;
   width: 0;
 }
 
@@ -2123,6 +2244,41 @@ p {
 
 .recording-option-card.is-wide {
   grid-column: 1 / -1;
+}
+
+/* Layers drawn into exported videos; the same eight as the player's rail. */
+.export-layers {
+  background: var(--surface-2);
+  border: 1px solid rgba(238, 244, 240, 0.05);
+  border-radius: var(--r-md);
+  display: grid;
+  gap: 6px 14px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  margin: 0;
+  padding: 12px 15px;
+}
+
+.export-layers legend {
+  color: var(--muted);
+  float: left;
+  font-size: var(--fs-sm);
+  grid-column: 1 / -1;
+  margin-bottom: 2px;
+  padding: 0;
+}
+
+.export-layers label {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  font-size: var(--fs-md);
+  gap: var(--s-2);
+  min-height: 26px;
+}
+
+.export-layers input {
+  accent-color: var(--accent);
+  margin: 0;
 }
 
 .recording-option-heading {
@@ -2690,6 +2846,7 @@ p {
   text-shadow: 0 2px 12px rgba(0, 0, 0, 0.72);
   top: 52%;
   transform: translateY(-50%);
+  transition: opacity 140ms ease;
   z-index: 2;
 }
 
@@ -2727,6 +2884,8 @@ p {
 }
 
 .player-name {
+  user-select: text;
+  -webkit-user-select: text;
   flex: 0 1 auto;
   max-width: none;
   min-width: 0;
@@ -2740,27 +2899,89 @@ p {
   align-items: center;
   display: inline-flex;
   flex: 0 1 auto;
-  gap: clamp(3px, calc(5px * var(--card-scale)), 7px);
+  flex-direction: column;
   min-width: 0;
 }
 
-.player-rank-badge {
-  align-items: center;
-  aspect-ratio: 1;
-  background: rgba(16, 21, 19, 0.82);
-  border: 1px solid rgba(139, 198, 164, 0.62);
-  border-radius: clamp(3px, calc(4px * var(--card-scale)), 5px);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.34);
-  color: #a9dfbf;
-  display: inline-flex;
-  flex: 0 0 auto;
-  font-size: clamp(6px, calc(10px * var(--card-scale)), 14px);
+.replay-player .player-name {
+  max-width: 100%;
+}
+
+/* The rank sits under its name, so the matchup line is only as wide as the names. */
+.player-rank {
+  color: var(--browser-muted);
+  font-size: 0.5em;
   font-variant-numeric: tabular-nums;
   font-weight: var(--fw-bold);
-  height: clamp(14px, calc(20px * var(--card-scale)), 28px);
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  margin-top: 0.18em;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.player-rank b {
+  color: var(--browser-text);
+  font-weight: inherit;
+}
+
+.matchup.player-count-3,
+.matchup.player-count-4 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: start;
+  row-gap: calc(2px * var(--card-scale));
+  width: 100%;
+}
+
+.matchup.player-count-3 .matchup-break,
+.matchup.player-count-4 .matchup-break {
+  display: none;
+}
+
+.matchup.player-count-3 .replay-player,
+.matchup.player-count-4 .replay-player {
+  /* Reserve the rank line even when a player has no leaderboard entry. */
+  min-height: 1.98em;
+}
+
+/* Teams occupy opposite columns; each name retains its own filter target. */
+.matchup.has-teams {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  font-size: clamp(7px, calc(16px * var(--card-scale)), 24px);
+  width: 100%;
+}
+
+.matchup.has-teams .replay-team {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(2px * var(--card-scale));
+}
+
+.matchup.has-teams .replay-player {
+  max-width: 100%;
+}
+
+.replay-team {
+  align-items: baseline;
+  display: inline-flex;
+  flex: 0 1 auto;
   justify-content: center;
-  line-height: 1;
-  text-shadow: none;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.team-separator {
+  font-size: 0.8em;
+}
+
+.matchup-break {
+  flex-basis: 100%;
+  height: 0;
 }
 
 .matchup-separator {
@@ -2778,11 +2999,11 @@ p {
 }
 
 .player-3 {
-  color: var(--accent);
+  color: #c084fc;
 }
 
 .player-4 {
-  color: #c084fc;
+  color: #ffa25c;
 }
 
 .winner-line {
@@ -2803,7 +3024,7 @@ p {
   color: var(--muted);
   column-gap: clamp(3px, calc(5px * var(--card-scale)), 7px);
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   font-size: clamp(7px, calc(12px * var(--card-scale)), 16px);
   font-style: normal;
   font-variant-numeric: tabular-nums;
@@ -2822,6 +3043,36 @@ p {
 .replay-age-date {
   flex: 0 0 auto;
   white-space: nowrap;
+}
+
+/* One line in the corner: on narrow cards the date is cut short instead of
+   wrapping onto a second line that pushed the age up the card. */
+.replay-age-date {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Reserve the date area for Play without moving or covering the usernames. */
+.replay-card.can-play:hover .replay-age,
+.replay-card.can-play:focus-within .replay-age {
+  visibility: hidden;
+}
+
+/* Leaves room for Play; the text sits on the card's bottom-left corner. */
+.replay-age {
+  max-width: calc(100% - calc(118px * var(--card-scale)));
+}
+
+.winner-name {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+@media (hover: none) {
+  .replay-play-button { backdrop-filter: blur(3px); opacity: 1; pointer-events: auto; min-height: 44px; }
+  .replay-card.can-play .replay-age { visibility: hidden; }
 }
 
 .replay-age-date {
@@ -3192,6 +3443,34 @@ mark {
   align-content: center;
 }
 
+.index-progress {
+  display: grid;
+  gap: 10px;
+  min-width: min(320px, 80vw);
+}
+
+.index-progress-label b {
+  color: var(--browser-text);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--fw-medium);
+}
+
+.index-progress-track {
+  background: var(--browser-line);
+  border-radius: var(--r-pill);
+  display: block;
+  height: 4px;
+  overflow: hidden;
+}
+
+.index-progress-track span {
+  background: var(--accent);
+  border-radius: inherit;
+  display: block;
+  height: 100%;
+  transition: width 120ms linear;
+}
+
 @media (max-width: 820px) {
   #recordingQueueRoot {
     bottom: 132px;
@@ -3252,7 +3531,7 @@ mark {
     width: 112px;
   }
 
-  .replay-grid {
+  .replay-grid-cards {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }}
 
@@ -3415,7 +3694,7 @@ mark {
     width: auto;
   }
 
-  .replay-grid {
+  .replay-grid-cards {
     gap: var(--s-3);
     grid-template-columns: 1fr;
   }}
@@ -3659,3 +3938,7 @@ mark {
 .example-banner { display:flex; gap:12px; align-items:center; padding:5px 18px; font-size:10px; color:#afc7df; background:#5a92c412; border-bottom:1px solid var(--line); flex-shrink:0; }
 .example-banner span { color:var(--muted); }
 .custom-map-toggle { width:auto; padding:0 8px; gap:5px; font-size:11px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .replay-play-button, .replay-meta { transition: none; }
+}

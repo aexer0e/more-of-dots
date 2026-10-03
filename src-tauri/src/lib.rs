@@ -1,45 +1,44 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{self, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures::stream::{self, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
     WindowEvent,
 };
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-mod recorder_update;
+mod audio;
 mod installed_maps;
 mod maps;
+mod export;
+mod player;
+mod video;
+mod storage;
+mod thumbnails;
 
-use recorder_update::RecorderInstallControl;
-use installed_maps::InstalledMaps;
+use installed_maps::{InstalledMaps, SurfaceDigest};
 
 const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
 const FPS: f64 = 30.0;
 const GAME_DIR_NAME: &str = "War of Dots";
-const REQUIRED_RECORDER_GAME_VERSION: &str = "1.4.1";
-const DEFAULT_SAMPLE_DELTA_MAX_BYTES: usize = 2 * 1024 * 1024;
-const DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SAMPLE_DELTA_RECORDS: usize = 600;
-const MAX_STATS_META_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_REPLAY_PAGE_SIZE: usize = 100;
 const MAX_REPLAY_PAGE_SIZE: usize = 100;
 const REPLAY_PLAYER_LABEL: &str = "replayPlayer";
@@ -47,27 +46,15 @@ const REPLAY_PLAYER_WIDTH: f64 = 960.0;
 const REPLAY_PLAYER_HEIGHT: f64 = 540.0;
 const REPLAY_BACKUP_DIR_NAME: &str = "replay-backups";
 const REPLAY_INDEX_FILE_NAME: &str = "replay-index.json";
-const REPLAY_INDEX_VERSION: u32 = 4;
+// Version 6 stores a digest of each embedded map instead of the image itself;
+// version 7 records whether the replay carries the map deployment it needs.
+const REPLAY_INDEX_VERSION: u32 = 7;
+const REPLAY_THUMBNAIL_CACHE: &str = "replay-thumbnails";
+// A listing prepared at startup is served to the window's first request.
+const WARM_LISTING_LIFETIME: Duration = Duration::from_secs(20);
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-
-#[derive(Default)]
-struct WindowOwnerProcesses {
-    children: Mutex<HashMap<String, Child>>,
-}
-
-#[derive(Default)]
-struct ReplayRecordingControl {
-    state: Mutex<ReplayRecordingControlState>,
-}
-
-#[derive(Default)]
-struct ReplayRecordingControlState {
-    active: bool,
-    cancel_requested: bool,
-    current_cancel_paths: HashSet<PathBuf>,
-}
 
 #[derive(Default)]
 struct ReplayMediaCatalog {
@@ -76,83 +63,34 @@ struct ReplayMediaCatalog {
 
 #[derive(Clone, Debug)]
 enum ReplayThumbnailSource {
-    Base64(String),
+    // An embedded map, cached as `<key>.png` when the replay is indexed and
+    // re-extracted from the replay if that file is gone.
+    Embedded(PathBuf),
     File(PathBuf),
 }
 
-fn spawn_owner_process(label: &str) -> Result<Child, String> {
-    let mut command = Command::new("powershell.exe");
-    command
-        .arg("-NoProfile")
-        .arg("-WindowStyle")
-        .arg("Hidden")
-        .arg("-Command")
-        .arg(format!(
-            "$Host.UI.RawUI.WindowTitle = 'More of Dots owner {label}'; Start-Sleep -Seconds 2147483"
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .spawn()
-        .map_err(|error| format!("Could not start replay window owner process: {error}"))
+/// The replay index, kept in memory after the first listing so refreshes only
+/// look at file metadata instead of re-reading the whole index file.
+#[derive(Default)]
+struct ReplayLibrary {
+    index: Mutex<Option<ReplayIndexStore>>,
+    warm: Mutex<Option<(Instant, ReplayListPayload)>>,
+    // The latest indexing progress, for a window that starts listening late.
+    progress: Mutex<Option<Value>>,
 }
 
-fn owner_pid_for_window(app: &AppHandle, label: &str) -> Result<u32, String> {
-    let owners = app.state::<WindowOwnerProcesses>();
-    let mut children = owners
-        .children
-        .lock()
-        .map_err(|_| "Replay owner process registry is unavailable.".to_string())?;
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomMapDigest {
+    hash: String,
+    #[serde(default)]
+    decoded: bool,
+}
 
-    let needs_spawn = match children.get_mut(label) {
-        Some(child) => child
-            .try_wait()
-            .map_err(|error| format!("Could not inspect replay owner process: {error}"))?
-            .is_some(),
-        None => true,
-    };
-    if needs_spawn {
-        children.insert(label.to_string(), spawn_owner_process(label)?);
+impl CustomMapDigest {
+    fn surface(&self) -> SurfaceDigest {
+        SurfaceDigest { hash: self.hash.clone(), decoded: self.decoded }
     }
-
-    children
-        .get(label)
-        .map(Child::id)
-        .ok_or_else(|| "Replay owner process was not registered.".to_string())
-}
-
-fn stop_all_owner_processes(app: &AppHandle) {
-    let owners = app.state::<WindowOwnerProcesses>();
-    let Ok(mut children) = owners.children.lock() else {
-        return;
-    };
-
-    for (_, mut child) in children.drain() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-impl Drop for WindowOwnerProcesses {
-    fn drop(&mut self) {
-        let Ok(children) = self.children.get_mut() else {
-            return;
-        };
-
-        for (_, mut child) in children.drain() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct UnitAssetsPayload {
-    asset_dir: String,
-    assets: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -170,6 +108,12 @@ struct ReplaySummary {
     file_path: String,
     #[serde(default)]
     version: Option<String>,
+    // The game's match format ("1v1", "2v2", "v3", "v4", "ffa", "experiment", "avalanche").
+    #[serde(default)]
+    mode: Option<String>,
+    // Players per side; 2v2 replays list two usernames for each color.
+    #[serde(default)]
+    team_size: usize,
     players: Vec<PlayerSummary>,
     #[serde(default)]
     draw: bool,
@@ -194,7 +138,11 @@ struct ParsedReplay {
     summary: ReplaySummary,
     result: Option<Value>,
     map_id: Option<String>,
+    // The embedded image is only held between parsing and indexing.
+    #[serde(skip)]
     custom_map_surface: Option<String>,
+    #[serde(default)]
+    custom_map: Option<CustomMapDigest>,
     #[serde(default)]
     has_map: bool,
 }
@@ -263,6 +211,7 @@ struct ReplayListPayload {
 struct ReplayThumbnailPath {
     thumbnail_key: String,
     file_path: String,
+    data_url: String,
 }
 
 #[derive(Serialize)]
@@ -293,18 +242,6 @@ fn system_time_millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-fn file_modified_millis(path: &Path) -> u64 {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .map(system_time_millis)
-        .unwrap_or(0)
-}
-
-fn read_json_file(path: &Path) -> Option<Value> {
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
 }
 
 fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -361,10 +298,14 @@ fn existing_backup_path(backup_dir: &Path, hash: &str) -> Option<PathBuf> {
         })
 }
 
+/// Backup files by their lowercase hash, from one listing of the backup folder.
+type BackupFiles = HashMap<String, PathBuf>;
+
 fn backup_replay_file(
     source_path: &Path,
     hash: &str,
     backup_dir: &Path,
+    known_backups: Option<&BackupFiles>,
 ) -> Result<PathBuf, String> {
     if source_path
         .parent()
@@ -373,8 +314,11 @@ fn backup_replay_file(
         return Ok(source_path.to_path_buf());
     }
 
-    let target = existing_backup_path(backup_dir, hash)
-        .unwrap_or_else(|| backup_path_for_hash(backup_dir, hash, source_path));
+    let existing = match known_backups {
+        Some(backups) => backups.get(&hash.to_ascii_lowercase()).cloned(),
+        None => existing_backup_path(backup_dir, hash),
+    };
+    let target = existing.unwrap_or_else(|| backup_path_for_hash(backup_dir, hash, source_path));
     if !target.exists() {
         fs::copy(source_path, &target).map_err(|error| {
             format!(
@@ -394,14 +338,20 @@ fn candidate_file_name(path: &Path) -> String {
         .to_string()
 }
 
-fn replay_candidate_from_path(
-    path: PathBuf,
+// Directory listings already carry size and times on Windows, so candidates are
+// built from them instead of opening every replay.
+fn replay_candidate_from_entry(
+    entry: &fs::DirEntry,
     thumbnail_replay_dir: Option<PathBuf>,
     known_hash: Option<String>,
     is_backup: bool,
 ) -> Option<ReplayCandidate> {
-    let metadata = path.metadata().ok()?;
-    if !metadata.is_file() || !is_replay_file(&path) {
+    let path = entry.path();
+    if !is_replay_file(&path) {
+        return None;
+    }
+    let metadata = entry.metadata().ok()?;
+    if !metadata.is_file() {
         return None;
     }
     Some(ReplayCandidate {
@@ -482,7 +432,7 @@ fn dedupe_replay_candidates_by_hash(
 fn collect_replay_candidates(
     app: &AppHandle,
     replay_index: &ReplayIndexStore,
-) -> Result<Vec<ReplayCandidate>, String> {
+) -> Result<(Vec<ReplayCandidate>, BackupFiles), String> {
     let replay_dirs = discover_replay_dirs();
     let fallback_thumbnail_dir = replay_dirs.first().cloned();
     let mut candidates: BTreeMap<String, ReplayCandidate> = BTreeMap::new();
@@ -496,9 +446,8 @@ fn collect_replay_candidates(
         })?;
 
         for entry in entries.flatten() {
-            let source_path = entry.path();
             if let Some(mut candidate) =
-                replay_candidate_from_path(source_path, Some(replay_dir.clone()), None, false)
+                replay_candidate_from_entry(&entry, Some(replay_dir.clone()), None, false)
             {
                 if let Some(entry) = replay_index
                     .entries
@@ -520,6 +469,7 @@ fn collect_replay_candidates(
             backup_dir.display()
         )
     })?;
+    let mut backups = BackupFiles::new();
     for entry in backup_entries.flatten() {
         let backup_path = entry.path();
         let hash = backup_path
@@ -530,8 +480,11 @@ fn collect_replay_candidates(
             })
             .map(ToOwned::to_owned);
         if let Some(candidate) =
-            replay_candidate_from_path(backup_path, fallback_thumbnail_dir.clone(), hash, true)
+            replay_candidate_from_entry(&entry, fallback_thumbnail_dir.clone(), hash.clone(), true)
         {
+            if let Some(hash) = hash {
+                backups.entry(hash.to_ascii_lowercase()).or_insert(backup_path);
+            }
             insert_candidate(&mut candidates, candidate);
         }
     }
@@ -543,29 +496,49 @@ fn collect_replay_candidates(
             .cmp(&left.modified)
             .then_with(|| left.file_name.cmp(&right.file_name))
     });
-    Ok(candidates)
+    Ok((candidates, backups))
 }
 
 fn load_replay_index(path: &Path) -> ReplayIndexStore {
-    let Some(value) = read_json_file(path) else {
-        return ReplayIndexStore {
-            version: REPLAY_INDEX_VERSION,
-            entries: BTreeMap::new(),
-        };
+    let empty = || ReplayIndexStore {
+        version: REPLAY_INDEX_VERSION,
+        entries: BTreeMap::new(),
     };
-    let store = serde_json::from_value::<ReplayIndexStore>(value).unwrap_or_default();
-    if store.version != REPLAY_INDEX_VERSION {
-        return ReplayIndexStore {
-            version: REPLAY_INDEX_VERSION,
-            entries: BTreeMap::new(),
-        };
+    let Ok(bytes) = fs::read(path) else {
+        return empty();
+    };
+    if let Ok(store) = serde_json::from_slice::<ReplayIndexStore>(&bytes) {
+        if store.version == REPLAY_INDEX_VERSION {
+            return store;
+        }
     }
-    store
+    // Summaries from another schema are rebuilt, but file hashes are still valid
+    // and spare hashing every replay again.
+    let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+        return empty();
+    };
+    let Some(entries) = value.get_mut("entries").and_then(Value::as_object_mut) else {
+        return empty();
+    };
+    entries.retain(|_, entry| {
+        entry.get("hash").and_then(Value::as_str).is_some_and(|hash| !hash.is_empty())
+    });
+    for entry in entries.values_mut() {
+        if let Some(entry) = entry.as_object_mut() {
+            entry.remove("parsed");
+        }
+    }
+    value["version"] = json!(REPLAY_INDEX_VERSION);
+    serde_json::from_value::<ReplayIndexStore>(value).unwrap_or_else(|_| empty())
 }
 
 fn write_replay_index(path: &Path, store: &ReplayIndexStore) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
-    fs::write(path, text).map_err(|error| format!("Could not write {}: {error}", path.display()))
+    let text = serde_json::to_vec(store).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, text)
+        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))
 }
 
 fn replay_index_entry_matches_metadata(
@@ -590,6 +563,7 @@ fn replay_index_entry_matches(entry: &ReplayIndexEntry, candidate: &ReplayCandid
 fn parsed_replay_from_index(
     entry: &ReplayIndexEntry,
     candidate: &ReplayCandidate,
+    backups: &BackupFiles,
 ) -> Option<ParsedReplay> {
     if !replay_index_entry_matches(entry, candidate) {
         return None;
@@ -599,8 +573,10 @@ fn parsed_replay_from_index(
     parsed.summary.file_name = candidate.file_name.clone();
     parsed.summary.modified = candidate.modified;
     parsed.summary.thumbnail_data_url = None;
-    let backup_path = PathBuf::from(&entry.backup_path);
-    parsed.summary.file_path = if backup_path.is_file() {
+    let backed_up = backups
+        .get(&entry.hash.to_ascii_lowercase())
+        .is_some_and(|path| path_key(path) == path_key_from_str(&entry.backup_path));
+    parsed.summary.file_path = if backed_up {
         entry.backup_path.clone()
     } else {
         candidate.original_path.to_string_lossy().to_string()
@@ -611,13 +587,17 @@ fn parsed_replay_from_index(
 fn parse_replay_candidate(
     candidate: &ReplayCandidate,
     backup_dir: &Path,
+    backups: &BackupFiles,
 ) -> Result<(ParsedReplay, ReplayIndexEntry), String> {
     let hash = match candidate.known_hash.as_deref() {
         Some(hash) => hash.to_string(),
         None => sha256_file(&candidate.path)?,
     };
-    let backup_path = backup_replay_file(&candidate.path, &hash, backup_dir)?;
+    let backup_path = backup_replay_file(&candidate.path, &hash, backup_dir, Some(backups))?;
     let mut parsed = parse_replay(&backup_path)?;
+    // The index keeps only the embedded map's digest; thumbnails are made
+    // from the replay when a card first needs one.
+    parsed.custom_map_surface = None;
     parsed.summary.file_name = candidate.file_name.clone();
     parsed.summary.modified = candidate.modified;
     parsed.summary.file_path = backup_path.to_string_lossy().to_string();
@@ -638,63 +618,6 @@ fn parse_replay_candidate(
 
 fn path_key_from_str(value: &str) -> String {
     value.replace('/', r"\").to_ascii_lowercase()
-}
-
-fn sample_delta_max_bytes() -> usize {
-    env::var("WOD_SAMPLE_DELTA_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SAMPLE_DELTA_MAX_BYTES)
-        .clamp(64 * 1024, 8 * 1024 * 1024)
-}
-
-fn sample_delta_max_record_bytes() -> usize {
-    env::var("WOD_SAMPLE_DELTA_MAX_RECORD_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SAMPLE_DELTA_MAX_RECORD_BYTES)
-        .clamp(256 * 1024, 16 * 1024 * 1024)
-}
-
-fn read_stats_meta_file(path: &Path) -> Option<Value> {
-    let metadata = fs::metadata(path).ok()?;
-    if metadata.len() > MAX_STATS_META_BYTES {
-        return None;
-    }
-    let mut value = read_json_file(path)?;
-    if let Value::Object(object) = &mut value {
-        let embedded_sample_count = object
-            .get("samples")
-            .and_then(Value::as_array)
-            .map(|samples| samples.len());
-        object.insert("samples".to_string(), Value::Array(Vec::new()));
-        if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
-            if let Some(count) = embedded_sample_count {
-                summary
-                    .entry("embedded_sample_count".to_string())
-                    .or_insert_with(|| json!(count));
-                summary
-                    .entry("sample_count".to_string())
-                    .or_insert_with(|| json!(count));
-            }
-        }
-    }
-    Some(value)
-}
-
-fn latest_progress_event(path: &Path) -> (Option<Value>, usize) {
-    let Ok(text) = fs::read_to_string(path) else {
-        return (None, 0);
-    };
-    let mut latest = None;
-    let mut count = 0;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            latest = Some(value);
-            count += 1;
-        }
-    }
-    (latest, count)
 }
 
 fn steam_game_dir() -> PathBuf {
@@ -754,29 +677,6 @@ fn cache_media_file(app: &AppHandle, category: &str, source: &Path) -> Result<Pa
             )
         })?;
     }
-    Ok(destination)
-}
-
-fn cache_base64_png(
-    app: &AppHandle,
-    category: &str,
-    cache_key: &str,
-    encoded: &str,
-) -> Result<PathBuf, String> {
-    let payload = encoded
-        .split_once(",")
-        .filter(|(prefix, _)| prefix.starts_with("data:") && prefix.ends_with(";base64"))
-        .map(|(_, payload)| payload)
-        .unwrap_or(encoded);
-    let destination = media_cache_dir(app, category)?.join(format!("{cache_key}.png"));
-    if destination.is_file() {
-        return Ok(destination);
-    }
-    let bytes = BASE64
-        .decode(payload.as_bytes())
-        .map_err(|error| format!("Could not decode cached PNG data: {error}"))?;
-    fs::write(&destination, bytes)
-        .map_err(|error| format!("Could not write {}: {error}", destination.display()))?;
     Ok(destination)
 }
 
@@ -1232,7 +1132,7 @@ fn replay_home_player(
     players: &[PlayerSummary],
     candidates: &[HomePlayerCandidate],
 ) -> Option<String> {
-    if players.len() != 2 {
+    if team_count(players) != 2 {
         return None;
     }
 
@@ -1246,16 +1146,16 @@ fn replay_home_player(
         })
         .collect::<Vec<_>>();
 
-    match eligible.as_slice() {
+    // The player seen in the most replays, when no one else ties.
+    let most = eligible.iter().map(|(_, count)| *count).max()?;
+    match eligible.iter().filter(|(_, count)| *count == most).collect::<Vec<_>>().as_slice() {
         [(player, _)] => Some(player.name.clone()),
-        [(left, left_count), (right, right_count)] if left_count > right_count => {
-            Some(left.name.clone())
-        }
-        [(left, left_count), (right, right_count)] if right_count > left_count => {
-            Some(right.name.clone())
-        }
         _ => None,
     }
+}
+
+fn team_count(players: &[PlayerSummary]) -> usize {
+    players.iter().map(|player| player.team_index).collect::<HashSet<_>>().len()
 }
 
 fn is_fallback_player_name(name: &str) -> bool {
@@ -1266,13 +1166,14 @@ fn is_fallback_player_name(name: &str) -> bool {
     number.parse::<usize>().is_ok()
 }
 
+/// Lists the home player's team first, with the home player first in it.
 fn put_home_player_first(players: &mut [PlayerSummary], home_player: &str) {
-    if let Some(index) = players
-        .iter()
-        .position(|player| player.name.eq_ignore_ascii_case(home_player))
-    {
-        players.swap(0, index);
-    }
+    let Some(home_team) = home_team_index(players, Some(home_player)) else {
+        return;
+    };
+    players.sort_by_key(|player| {
+        (player.team_index != home_team, !player.name.eq_ignore_ascii_case(home_player))
+    });
 }
 
 fn is_replay_file(path: &Path) -> bool {
@@ -1295,7 +1196,18 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
         bytes
     };
 
-    let raw: Value = serde_json::from_slice(&json_bytes).map_err(|error| error.to_string())?;
+    let (raw, end_frame) = match serde_json::from_slice::<ReplayHeader>(&json_bytes) {
+        Ok(header) => {
+            let raw = Value::Object(header.fields);
+            let end_frame = raw.get("end").and_then(Value::as_f64).unwrap_or(header.last_frame);
+            (raw, end_frame)
+        }
+        Err(_) => {
+            let raw: Value = serde_json::from_slice(&json_bytes).map_err(|error| error.to_string())?;
+            let end_frame = replay_end_frame(&raw);
+            (raw, end_frame)
+        }
+    };
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1307,10 +1219,8 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
         .ok()
         .and_then(system_time_to_secs)
         .unwrap_or(0);
-    let names = replay_player_names(&raw);
-    let players: Vec<PlayerSummary> = names
+    let players: Vec<PlayerSummary> = replay_players(&raw)
         .into_iter()
-        .enumerate()
         .map(|(team_index, name)| PlayerSummary {
             name,
             team_index,
@@ -1318,8 +1228,12 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
         })
         .collect();
 
-    let end_frame = replay_end_frame(&raw);
     let duration_seconds = duration_seconds(end_frame);
+    let custom_map_surface = custom_map_surface(&raw);
+    let custom_map = custom_map_surface.as_deref().map(|surface| {
+        let digest = SurfaceDigest::of(surface);
+        CustomMapDigest { hash: digest.hash, decoded: digest.decoded }
+    });
     let result = raw.get("result").cloned();
 
     Ok(ParsedReplay {
@@ -1330,6 +1244,8 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
                 .get("version")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            mode: raw.get("mode").and_then(Value::as_str).map(str::to_string),
+            team_size: replay_team_size(&raw),
             players,
             draw: result.as_ref().is_some_and(replay_result_is_draw),
             length: format_duration_seconds(duration_seconds),
@@ -1344,24 +1260,78 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
         },
         result,
         map_id: replay_map_id(&raw),
-        custom_map_surface: custom_map_surface(&raw),
+        custom_map_surface,
+        custom_map,
         has_map: raw.get("map").is_some(),
     })
 }
 
+/// The fields a replay summary needs. Replays are mostly per-frame orders
+/// keyed by frame number; those are skipped without building values, and
+/// only the highest frame number is kept.
+struct ReplayHeader {
+    fields: serde_json::Map<String, Value>,
+    last_frame: f64,
+}
+
+impl<'de> Deserialize<'de> for ReplayHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HeaderVisitor;
+
+        impl<'de> Visitor<'de> for HeaderVisitor {
+            type Value = ReplayHeader;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a replay object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ReplayHeader, A::Error> {
+                let mut fields = serde_json::Map::new();
+                let mut last_frame = 0.0;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" | "mode" | "player_usernames" | "result" | "end" | "map"
+                        | "custom_map" => {
+                            fields.insert(key, map.next_value::<Value>()?);
+                        }
+                        _ => {
+                            if let Ok(frame) = key.parse::<f64>() {
+                                last_frame = f64::max(last_frame, frame);
+                            }
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ReplayHeader { fields, last_frame })
+            }
+        }
+
+        deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
 fn installed_map_catalog() -> InstalledMaps {
+    InstalledMaps::read(game_install_candidates())
+}
+
+fn game_install_candidates() -> Vec<PathBuf> {
     let mut roots = discover_steamapps_dirs().into_iter()
         .map(|steamapps| steamapps.join("common").join(GAME_DIR_NAME))
         .collect::<Vec<_>>();
     push_unique_path(&mut roots, steam_game_dir());
-    InstalledMaps::read(roots)
+    roots
+}
+
+/// Installed game folders, used only to read official map images for replay simulation.
+pub(crate) fn installed_game_dirs() -> Vec<PathBuf> {
+    game_install_candidates().into_iter().filter(|root| root.join("assets").is_dir()).collect()
 }
 
 fn refresh_replay_map_label(replay: &mut ParsedReplay, maps: &InstalledMaps) {
-    replay.summary.event_label = maps.event_label(
-        replay.map_id.as_deref(), replay.custom_map_surface.as_deref(), replay.has_map,
-    );
-    let identity = maps.identity(replay.map_id.as_deref(), replay.custom_map_surface.as_deref());
+    let surface = replay.custom_map.as_ref().map(CustomMapDigest::surface);
+    replay.summary.event_label =
+        maps.event_label_for(replay.map_id.as_deref(), surface.as_ref(), replay.has_map);
+    let identity = maps.identity_for(replay.map_id.as_deref(), surface.as_ref());
     replay.summary.map_key = identity.as_ref().map(|(key, _)| key.clone());
     replay.summary.map_label = identity.map(|(_, label)| label);
 }
@@ -1373,25 +1343,39 @@ fn replay_event_label(raw: &Value) -> Option<String> {
     )
 }
 
-fn replay_player_names(raw: &Value) -> Vec<String> {
-    let mut names = raw
-        .get("player_usernames")
-        .and_then(Value::as_array)
-        .map(|players| {
-            players
-                .iter()
-                .take(4)
-                .enumerate()
-                .map(|(index, name)| clean_player_name(&flatten_name(name), index))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    while names.len() < 2 {
-        names.push(fallback_player_name(names.len()));
+/// Every player with their team (side) index. Teams list their members
+/// (`[[{username}, {username}], …]` in 2v2), so each teammate is a player of their own.
+fn replay_players(raw: &Value) -> Vec<(usize, String)> {
+    let mut players = Vec::new();
+    let sides = raw.get("player_usernames").and_then(Value::as_array).cloned().unwrap_or_default();
+    for (team, side) in sides.iter().take(4).enumerate() {
+        let members = match side {
+            Value::Array(members) if !members.is_empty() => members.iter().collect::<Vec<_>>(),
+            _ => vec![side],
+        };
+        for member in members {
+            let name = clean_player_name(&flatten_name(member), players.len());
+            players.push((team, name));
+        }
     }
+    for team in sides.len().min(4)..2 {
+        players.push((team, fallback_player_name(players.len())));
+    }
+    players
+}
 
-    names
+fn replay_team_size(raw: &Value) -> usize {
+    raw.get("player_usernames")
+        .and_then(Value::as_array)
+        .map(|sides| {
+            sides
+                .iter()
+                .map(|side| side.as_array().map_or(1, Vec::len))
+                .max()
+                .unwrap_or(1)
+        })
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn flatten_name(value: &Value) -> String {
@@ -1434,9 +1418,10 @@ fn fallback_player_name(index: usize) -> String {
     format!("Player {}", index + 1)
 }
 
-fn mark_winner(players: &mut [PlayerSummary], winner_index: Option<usize>) {
-    for (index, player) in players.iter_mut().enumerate() {
-        player.winner = winner_index == Some(index);
+/// Marks every player of the winning team.
+fn mark_winner(players: &mut [PlayerSummary], winning_team: Option<usize>) {
+    for player in players.iter_mut() {
+        player.winner = winning_team == Some(player.team_index);
     }
 }
 
@@ -1444,7 +1429,8 @@ fn replay_result_is_draw(result: &Value) -> bool {
     result.as_f64() == Some(0.5)
 }
 
-fn replay_winner_index(
+/// The winning team's index.
+fn replay_winner_team(
     result: Option<&Value>,
     players: &[PlayerSummary],
     home_player: Option<&str>,
@@ -1470,7 +1456,8 @@ fn result_player_name_index(result: &Value, players: &[PlayerSummary]) -> Option
 
     players
         .iter()
-        .position(|player| player.name.to_ascii_lowercase() == normalized)
+        .find(|player| player.name.to_ascii_lowercase() == normalized)
+        .map(|player| player.team_index)
 }
 
 fn result_special_winner_index(
@@ -1508,24 +1495,26 @@ fn result_flag_winner_index(
         return None;
     }
 
-    let perspective_index = home_player_index(players, home_player)?;
+    let home_team = home_team_index(players, home_player)?;
 
     if home_won {
-        return Some(perspective_index);
+        return Some(home_team);
     }
 
-    if players.len() == 2 {
-        return Some(if perspective_index == 0 { 1 } else { 0 });
+    // With two teams, the other one won.
+    if team_count(players) == 2 {
+        return players.iter().map(|player| player.team_index).find(|team| *team != home_team);
     }
 
     None
 }
 
-fn home_player_index(players: &[PlayerSummary], home_player: Option<&str>) -> Option<usize> {
+fn home_team_index(players: &[PlayerSummary], home_player: Option<&str>) -> Option<usize> {
     home_player.and_then(|home_player| {
         players
             .iter()
-            .position(|player| player.name.eq_ignore_ascii_case(home_player))
+            .find(|player| player.name.eq_ignore_ascii_case(home_player))
+            .map(|player| player.team_index)
     })
 }
 
@@ -1579,14 +1568,14 @@ fn thumbnail_source_for_replay(
     replay_dir: &Path,
     replay: &ParsedReplay,
 ) -> Option<(String, ReplayThumbnailSource)> {
-    if let Some(surface) = replay.custom_map_surface.as_deref() {
-        let payload = surface
-            .split_once(',')
-            .filter(|(prefix, _)| prefix.starts_with("data:") && prefix.ends_with(";base64"))
-            .map(|(_, payload)| payload)
-            .unwrap_or(surface);
-        let key = format!("custom-{}", sha256_text(payload));
-        return Some((key, ReplayThumbnailSource::Base64(payload.to_string())));
+    if let Some(custom) = replay.custom_map.as_ref() {
+        // An embedded image that is not valid base64 has nothing to show.
+        return custom.decoded.then(|| {
+            (
+                embedded_thumbnail_key(&custom.hash),
+                ReplayThumbnailSource::Embedded(PathBuf::from(&replay.summary.file_path)),
+            )
+        });
     }
 
     let map_id = replay.map_id.as_deref()?;
@@ -1650,178 +1639,6 @@ fn current_launch_request_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(root.join("current.json"))
 }
 
-async fn run_backend(
-    app: &AppHandle,
-    command: &str,
-    extra_args: Vec<String>,
-) -> Result<Value, String> {
-    run_backend_with_owner(app, command, extra_args, process::id()).await
-}
-
-async fn run_backend_for_window(
-    app: &AppHandle,
-    window_label: &str,
-    command: &str,
-    extra_args: Vec<String>,
-) -> Result<Value, String> {
-    let owner_pid = owner_pid_for_window(app, window_label)?;
-    run_backend_with_owner(app, command, extra_args, owner_pid).await
-}
-
-async fn run_backend_with_owner(
-    app: &AppHandle,
-    command: &str,
-    extra_args: Vec<String>,
-    owner_pid: u32,
-) -> Result<Value, String> {
-    let recorder_path = resolve_recorder_path()?;
-    let runtime_dir = app_runtime_dir(app)?;
-    let mut args = vec![
-        "--desktop-command".to_string(),
-        command.to_string(),
-        "--runtime-dir".to_string(),
-        runtime_dir.to_string_lossy().to_string(),
-        "--owner-pid".to_string(),
-        owner_pid.to_string(),
-    ];
-    args.extend(extra_args);
-
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut command = Command::new(&recorder_path);
-        command.args(args);
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
-        command.output().map_err(|error| {
-            format!(
-                "Could not start More of Dots Recorder at {}: {error}",
-                recorder_path.display()
-            )
-        })
-    })
-    .await
-    .map_err(|error| format!("Recorder launch task failed: {error}"))??;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        let message = if stdout.trim().is_empty() {
-            stderr.trim().to_string()
-        } else {
-            stdout.trim().to_string()
-        };
-        return Err(if message.is_empty() {
-            "Backend command failed without output.".to_string()
-        } else {
-            message
-        });
-    }
-
-    serde_json::from_str(stdout.trim()).map_err(|error| {
-        format!(
-            "Backend returned invalid JSON: {error}. stdout={:?} stderr={:?}",
-            stdout.trim(),
-            stderr.trim()
-        )
-    })
-}
-
-fn resolve_recorder_path() -> Result<PathBuf, String> {
-    let mut candidates = Vec::new();
-    if let Some(configured) = env::var_os("WOD_RECORDER_PATH") {
-        candidates.push(PathBuf::from(configured));
-    }
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        let local_app_data = PathBuf::from(local_app_data);
-        candidates.push(
-            local_app_data
-                .join("Programs")
-                .join("More of Dots Recorder")
-                .join("more-of-dots-recorder.exe"),
-        );
-        candidates.push(
-            local_app_data
-                .join("More of Dots Recorder")
-                .join("more-of-dots-recorder.exe"),
-        );
-    }
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            candidates.push(parent.join("more-of-dots-recorder.exe"));
-        }
-    }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
-        .ok_or_else(|| {
-            "More of Dots Recorder is not installed. Install the separate recorder package or set WOD_RECORDER_PATH. The main app remains usable without it.".to_string()
-        })
-}
-
-#[tauri::command]
-async fn recorder_status(app: AppHandle) -> Result<Value, String> {
-    let recorder_path = resolve_recorder_path()?;
-    let mut value = run_backend(&app, "recorder-capabilities", Vec::new()).await?;
-    if value.pointer("/supported_versions/target_game_version").and_then(Value::as_str)
-        != Some(REQUIRED_RECORDER_GAME_VERSION)
-    {
-        return Err(format!("Update More of Dots Recorder to record with game {REQUIRED_RECORDER_GAME_VERSION}. Older recorders cannot record the new game mode."));
-    }
-    if let Some(object) = value.as_object_mut() {
-        object.insert("installed".to_string(), Value::Bool(true));
-        object.insert("executable".to_string(), json!(recorder_path));
-    }
-    Ok(value)
-}
-
-/// Asks the installed recorder to identify itself, or `None` when there is not a
-/// working one on disk. Update decisions need to tell "absent" apart from
-/// "present but broken", and both answer the same way here: reinstall.
-async fn installed_recorder(app: &AppHandle) -> Option<Value> {
-    resolve_recorder_path().ok()?;
-    run_backend(app, "recorder-capabilities", Vec::new())
-        .await
-        .ok()
-}
-
-#[tauri::command]
-async fn check_recorder_update(app: AppHandle) -> Result<Value, String> {
-    recorder_update::check(&app).await
-}
-
-#[tauri::command]
-async fn install_recorder(app: AppHandle) -> Result<Value, String> {
-    // NSIS cannot replace the recorder while a job holds its image open, and it
-    // reports that as a bare exit code. Refusing here produces an explanation the
-    // user can act on instead.
-    {
-        let control = app.state::<ReplayRecordingControl>();
-        let state = control
-            .state
-            .lock()
-            .map_err(|_| "Recording state is unavailable.".to_string())?;
-        if state.active {
-            return Err(
-                "Recording is in progress. Let the queue finish before updating the recorder."
-                    .to_string(),
-            );
-        }
-    }
-    let control = app.state::<RecorderInstallControl>();
-    recorder_update::install(&app, &control).await
-}
-
-#[tauri::command]
-fn cancel_recorder_install(app: AppHandle) -> Result<bool, String> {
-    app.state::<RecorderInstallControl>().cancel();
-    Ok(true)
-}
-
-#[tauri::command]
-async fn list_recorder_versions(app: AppHandle) -> Result<Value, String> {
-    run_backend(&app, "list-game-versions", Vec::new()).await
-}
-
 #[tauri::command]
 fn recording_default_directory(app: AppHandle) -> Result<PathBuf, String> {
     let videos_dir = app
@@ -1855,24 +1672,119 @@ fn open_recording_output_directory(output_path: String) -> Result<bool, String> 
     Ok(true)
 }
 
-#[tauri::command]
-async fn list_jobs(app: AppHandle) -> Result<Value, String> {
-    run_backend(
-        &app,
-        "list-jobs",
-        vec!["--limit".to_string(), "20".to_string()],
-    )
-    .await
+/// Runs `work` over `items` on a few threads, keeping the order of results.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+    progress: impl Fn(usize) + Sync,
+) -> Vec<R> {
+    let threads = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(items.len());
+    if threads <= 1 {
+        return items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let result = work(item);
+                progress(index + 1);
+                result
+            })
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let slots = items.iter().map(|_| Mutex::new(None)).collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(index) else { break };
+                let result = work(item);
+                if let Ok(mut slot) = slots[index].lock() {
+                    *slot = Some(result);
+                }
+                progress(done.fetch_add(1, Ordering::Relaxed) + 1);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().ok().flatten().expect("every item is processed"))
+        .collect()
 }
 
-#[tauri::command]
-async fn release_job_artifacts(app: AppHandle, job_id: String) -> Result<Value, String> {
-    run_backend(
-        &app,
-        "release-job-artifacts",
-        vec!["--job-id".to_string(), job_id],
-    )
-    .await
+/// Reports indexing progress to the replay browser, at most every 60 ms.
+struct IndexProgress<'a> {
+    app: &'a AppHandle,
+    phase: &'static str,
+    total: usize,
+    last: Mutex<Option<Instant>>,
+}
+
+impl<'a> IndexProgress<'a> {
+    // Small batches finish before a progress bar would be readable.
+    const MIN_TOTAL: usize = 24;
+
+    fn new(app: &'a AppHandle, phase: &'static str, total: usize) -> Self {
+        let progress = Self { app, phase, total, last: Mutex::new(None) };
+        progress.report(0);
+        progress
+    }
+
+    fn report(&self, done: usize) {
+        if self.total < Self::MIN_TOTAL {
+            return;
+        }
+        let Ok(mut last) = self.last.lock() else { return };
+        let now = Instant::now();
+        if done != 0 && done != self.total && last.is_some_and(|last| now - last < Duration::from_millis(60)) {
+            return;
+        }
+        *last = Some(now);
+        let payload = json!({ "phase": self.phase, "done": done, "total": self.total });
+        if let Ok(mut current) = self.app.state::<ReplayLibrary>().progress.lock() {
+            *current = Some(payload.clone());
+        }
+        let _ = self.app.emit("replay-index-progress", payload);
+    }
+}
+
+fn embedded_thumbnail_key(hash: &str) -> String {
+    format!("custom-{hash}")
+}
+
+/// Writes an embedded map image to the thumbnail cache, named by its digest.
+fn cache_embedded_map(thumbnail_dir: &Path, hash: &str, surface: &str) -> Result<PathBuf, String> {
+    let destination = thumbnail_dir.join(format!("{}.png", embedded_thumbnail_key(hash)));
+    if destination.is_file() {
+        return Ok(destination);
+    }
+    let (_, bytes) = SurfaceDigest::with_bytes(surface);
+    let bytes = bytes.ok_or_else(|| "Embedded map image is not valid base64.".to_string())?;
+    thumbnails::write_atomically(&bytes, &destination)?;
+    Ok(destination)
+}
+
+/// Hashes new replays in parallel; known replays reuse the hash from the index.
+fn hash_unknown_candidates(app: &AppHandle, candidates: &mut [ReplayCandidate]) {
+    let unknown = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.known_hash.is_none())
+        .map(|(index, candidate)| (index, candidate.path.clone()))
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return;
+    }
+    let progress = IndexProgress::new(app, "hash", unknown.len());
+    let hashes = parallel_map(&unknown, |(_, path)| sha256_file(path).ok(), |done| progress.report(done));
+    for ((index, _), hash) in unknown.into_iter().zip(hashes) {
+        // Unreadable files stay unhashed and are reported by the dedupe step.
+        candidates[index].known_hash = hash;
+    }
 }
 
 fn list_replays_impl(
@@ -1880,9 +1792,64 @@ fn list_replays_impl(
     offset: usize,
     limit: usize,
 ) -> Result<ReplayListPayload, String> {
+    let library = app.state::<ReplayLibrary>();
+    let mut index = library
+        .index
+        .lock()
+        .map_err(|_| "The replay index is unavailable.".to_string())?;
+    if offset == 0 && limit == 0 {
+        let warm = library.warm.lock().ok().and_then(|mut warm| warm.take());
+        if let Some((prepared, payload)) = warm {
+            if prepared.elapsed() < WARM_LISTING_LIFETIME {
+                return Ok(payload);
+            }
+        }
+    }
+    let result = list_replays_locked(app, &mut index, offset, limit);
+    if let Ok(mut progress) = library.progress.lock() {
+        *progress = None;
+    }
+    result
+}
+
+/// Indexes the library while the window loads, so its first listing is ready.
+fn warm_replay_listing(app: &AppHandle) {
+    let library = app.state::<ReplayLibrary>();
+    let Ok(mut index) = library.index.lock() else { return };
+    if index.is_some() {
+        return;
+    }
+    let result = list_replays_locked(app, &mut index, 0, 0);
+    if let Ok(mut progress) = library.progress.lock() {
+        *progress = None;
+    }
+    match result {
+        Ok(payload) => {
+            if let Ok(mut warm) = library.warm.lock() {
+                *warm = Some((Instant::now(), payload));
+            }
+        }
+        Err(error) => eprintln!("{error}"),
+    }
+}
+
+/// Forgets a prepared listing after the library changes.
+fn discard_warm_listing(app: &AppHandle) {
+    if let Ok(mut warm) = app.state::<ReplayLibrary>().warm.lock() {
+        *warm = None;
+    }
+}
+
+fn list_replays_locked(
+    app: &AppHandle,
+    index_slot: &mut Option<ReplayIndexStore>,
+    offset: usize,
+    limit: usize,
+) -> Result<ReplayListPayload, String> {
     let index_path = replay_index_path(app)?;
-    let mut index = load_replay_index(&index_path);
-    let candidates = collect_replay_candidates(app, &index)?;
+    let index = index_slot.get_or_insert_with(|| load_replay_index(&index_path));
+    let (mut candidates, backups) = collect_replay_candidates(app, index)?;
+    hash_unknown_candidates(app, &mut candidates);
     let (candidates, dedupe_errors) = dedupe_replay_candidates_by_hash(candidates);
     for error in dedupe_errors {
         eprintln!("{error}");
@@ -1902,8 +1869,6 @@ fn list_replays_impl(
     let backup_dir = replay_backup_dir(app)?;
     let installed_maps = installed_map_catalog();
     let mut thumbnail_sources = HashMap::new();
-    let mut parsed_replays = Vec::new();
-    let mut index_changed = false;
     let offset = offset.min(candidates.len());
     let limit = if limit == 0 {
         // Frontend sends 0 for the "All" items-per-page option.
@@ -1912,36 +1877,62 @@ fn list_replays_impl(
         limit.clamp(1, MAX_REPLAY_PAGE_SIZE)
     };
     let page_end = offset.saturating_add(limit).min(candidates.len());
+    let page = &candidates[offset..page_end];
 
-    for candidate in &candidates[offset..page_end] {
-        let key = path_key(&candidate.original_path);
-        let cached = index
-            .entries
-            .get(&key)
-            .and_then(|entry| parsed_replay_from_index(entry, candidate));
-
-        let mut parsed = match cached {
-            Some(parsed) => parsed,
-            None => match parse_replay_candidate(candidate, &backup_dir) {
+    let mut parsed_page = page
+        .iter()
+        .map(|candidate| {
+            index
+                .entries
+                .get(&path_key(&candidate.original_path))
+                .and_then(|entry| parsed_replay_from_index(entry, candidate, &backups))
+        })
+        .collect::<Vec<_>>();
+    let pending = parsed_page
+        .iter()
+        .enumerate()
+        .filter(|(_, parsed)| parsed.is_none())
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    let index_changed = !pending.is_empty();
+    if index_changed {
+        let progress = IndexProgress::new(app, "parse", pending.len());
+        let results = parallel_map(
+            &pending,
+            |&position| parse_replay_candidate(&page[position], &backup_dir, &backups),
+            |done| progress.report(done),
+        );
+        for (position, result) in pending.into_iter().zip(results) {
+            let candidate = &page[position];
+            match result {
                 Ok((parsed, entry)) => {
-                    index.entries.insert(key, entry);
-                    index_changed = true;
-                    parsed
+                    index.entries.insert(path_key(&candidate.original_path), entry);
+                    parsed_page[position] = Some(parsed);
                 }
-                Err(error) => {
-                    eprintln!("Skipping {}: {error}", candidate.path.display());
-                    continue;
-                }
-            },
-        };
+                Err(error) => eprintln!("Skipping {}: {error}", candidate.path.display()),
+            }
+        }
+    }
 
+    // Replays on the same official map share one image lookup.
+    let mut map_thumbnails: HashMap<(String, String), Option<(String, ReplayThumbnailSource)>> =
+        HashMap::new();
+    let mut parsed_replays = Vec::with_capacity(page.len());
+    for (candidate, parsed) in page.iter().zip(parsed_page) {
+        let Some(mut parsed) = parsed else { continue };
         refresh_replay_map_label(&mut parsed, &installed_maps);
         parsed.summary.score_delta = None;
         parsed.summary.thumbnail_data_url = None;
         parsed.summary.thumbnail_key = None;
         if let Some(replay_dir) = candidate.thumbnail_replay_dir.as_deref() {
-            if let Some((thumbnail_key, source)) = thumbnail_source_for_replay(replay_dir, &parsed)
-            {
+            let thumbnail = match (parsed.custom_map.is_none(), parsed.map_id.as_ref()) {
+                (true, Some(map_id)) => map_thumbnails
+                    .entry((path_key(replay_dir), map_id.clone()))
+                    .or_insert_with(|| thumbnail_source_for_replay(replay_dir, &parsed))
+                    .clone(),
+                _ => thumbnail_source_for_replay(replay_dir, &parsed),
+            };
+            if let Some((thumbnail_key, source)) = thumbnail {
                 thumbnail_sources
                     .entry(thumbnail_key.clone())
                     .or_insert(source);
@@ -1952,7 +1943,7 @@ fn list_replays_impl(
     }
 
     if index_changed {
-        write_replay_index(&index_path, &index)?;
+        write_replay_index(&index_path, index)?;
     }
     if let Ok(mut thumbnails) = app.state::<ReplayMediaCatalog>().thumbnails.lock() {
         *thumbnails = thumbnail_sources;
@@ -1964,12 +1955,12 @@ fn list_replays_impl(
         .map(|mut parsed| {
             let home_player = replay_home_player(&parsed.summary.players, &home_candidates);
             parsed.summary.draw = parsed.result.as_ref().is_some_and(replay_result_is_draw);
-            let winner_index = replay_winner_index(
+            let winning_team = replay_winner_team(
                 parsed.result.as_ref(),
                 &parsed.summary.players,
                 home_player.as_deref(),
             );
-            mark_winner(&mut parsed.summary.players, winner_index);
+            mark_winner(&mut parsed.summary.players, winning_team);
 
             if let Some(home_player) = home_player.as_deref() {
                 put_home_player_first(&mut parsed.summary.players, home_player);
@@ -2055,72 +2046,6 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     }
     let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
-}
-
-fn safe_recording_file_name(requested_name: &str) -> String {
-    let requested = Path::new(requested_name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("replay_10x.mp4");
-    let mut safe = requested
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-                )
-            {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    while safe.ends_with(['.', ' ']) {
-        safe.pop();
-    }
-    if safe.is_empty() {
-        safe = "replay_10x.mp4".to_string();
-    }
-    let mut path = PathBuf::from(safe);
-    if !path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
-    {
-        path.set_extension("mp4");
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("replay_10x.mp4")
-        .to_string()
-}
-
-fn available_recording_path(
-    directory: &Path,
-    requested_name: &str,
-    reserved_paths: &mut HashSet<String>,
-) -> PathBuf {
-    let safe_name = safe_recording_file_name(requested_name);
-    let base = PathBuf::from(&safe_name);
-    let stem = base
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("replay_10x");
-    let mut candidate = directory.join(&base);
-    let mut suffix = 2;
-    while candidate.exists()
-        || candidate.with_extension("partial.mp4").exists()
-        || !reserved_paths.insert(path_key(&candidate))
-    {
-        candidate = directory.join(format!("{stem} ({suffix}).mp4"));
-        suffix += 1;
-    }
-    reserved_paths.insert(path_key(&candidate));
-    candidate
 }
 
 fn available_replay_download_path(directory: &Path, requested_name: &str) -> PathBuf {
@@ -2221,7 +2146,7 @@ fn upload_replay_impl(
         parse_replay(&upload_path)
             .map_err(|error| format!("{file_name} is not a valid replay: {error}"))?;
         let hash = sha256_file(&upload_path)?;
-        let backup_path = backup_replay_file(&upload_path, &hash, &replay_backup_dir(app)?)?;
+        let backup_path = backup_replay_file(&upload_path, &hash, &replay_backup_dir(app)?, None)?;
         let replay_dir = primary_replay_dir()?;
         let replay_path = replay_upload_destination(&replay_dir, &file_name, &hash)?;
         if !replay_path.exists() {
@@ -2240,6 +2165,7 @@ fn upload_replay_impl(
         })
     })();
     let _ = fs::remove_file(&upload_path);
+    discard_warm_listing(app);
     result
 }
 
@@ -2284,6 +2210,7 @@ fn delete_replay_impl(app: &AppHandle, file_path: String) -> Result<usize, Strin
     }
 
     let hash = sha256_file(&source_path)?;
+    let source_size = fs::metadata(&source_path).map_err(|error| error.to_string())?.len();
     let mut targets = Vec::new();
     for directory in &managed_dirs {
         let Ok(entries) = fs::read_dir(directory) else {
@@ -2291,8 +2218,9 @@ fn delete_replay_impl(app: &AppHandle, file_path: String) -> Result<usize, Strin
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
-                && is_replay_file(&path)
+            // Only same-size files can be copies, which spares hashing the library.
+            if is_replay_file(&path)
+                && entry.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.len() == source_size)
                 && sha256_file(&path).is_ok_and(|candidate_hash| candidate_hash == hash)
             {
                 let is_backup = path
@@ -2325,12 +2253,18 @@ fn delete_replay_impl(app: &AppHandle, file_path: String) -> Result<usize, Strin
         ));
     }
 
+    discard_warm_listing(app);
+    let library = app.state::<ReplayLibrary>();
+    let mut index = library
+        .index
+        .lock()
+        .map_err(|_| "The replay index is unavailable.".to_string())?;
     let index_path = replay_index_path(app)?;
-    let mut index = load_replay_index(&index_path);
+    let index = index.get_or_insert_with(|| load_replay_index(&index_path));
     let previous_entry_count = index.entries.len();
     index.entries.retain(|_, entry| entry.hash != hash);
     if index.entries.len() != previous_entry_count {
-        write_replay_index(&index_path, &index)?;
+        write_replay_index(&index_path, index)?;
     }
     Ok(deleted)
 }
@@ -2382,27 +2316,6 @@ struct ReplayDownloadRequest {
     file_name: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReplayRecordingRequest {
-    file_path: String,
-    file_name: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReplayRecordingOptions {
-    destination_dir: String,
-    concurrency: usize,
-    playback_speed: u32,
-    bitrate_kbps: u32,
-    resolution_height: u32,
-    #[serde(default)]
-    music_volume: u32,
-    #[serde(default)]
-    sfx_volume: u32,
-}
-
 #[tauri::command]
 async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2448,658 +2361,6 @@ async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, 
     .map_err(|error| format!("Replay download task failed: {error}"))?
 }
 
-fn append_recording_manifest(
-    manifest_directory: &Path,
-    source_path: &Path,
-    video_path: &Path,
-    status: &Value,
-    options: &ReplayRecordingOptions,
-) -> Result<(), String> {
-    fs::create_dir_all(manifest_directory)
-        .map_err(|error| format!("Could not prepare replay recording app data: {error}"))?;
-    let manifest_path = manifest_directory.join("war-of-dots-replays.json");
-    let mut manifest = fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({"version": 1, "replays": []}));
-    let entries = manifest
-        .as_object_mut()
-        .and_then(|object| {
-            object
-                .entry("replays")
-                .or_insert_with(|| json!([]))
-                .as_array_mut()
-        })
-        .ok_or_else(|| format!("Recording manifest is invalid: {}", manifest_path.display()))?;
-    entries.push(json!({
-        "sourceFile": source_path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
-        "videoFile": video_path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
-        "videoPath": video_path,
-        "speed": options.playback_speed,
-        "bitrateKbps": options.bitrate_kbps,
-        "resolutionHeight": options.resolution_height,
-        "musicVolume": options.music_volume,
-        "sfxVolume": options.sfx_volume,
-        "exportedAt": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs()),
-        "recording": status,
-    }));
-    if let Some(object) = manifest.as_object_mut() {
-        object.insert(
-            "updatedAt".to_string(),
-            json!(SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs())),
-        );
-    }
-    let temporary_path = manifest_directory.join("war-of-dots-replays.json.tmp");
-    let contents = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
-    fs::write(&temporary_path, contents)
-        .map_err(|error| format!("Could not update replay video manifest: {error}"))?;
-    if manifest_path.exists() {
-        fs::remove_file(&manifest_path)
-            .map_err(|error| format!("Could not replace replay video manifest: {error}"))?;
-    }
-    fs::rename(&temporary_path, &manifest_path)
-        .map_err(|error| format!("Could not publish replay video manifest: {error}"))?;
-    Ok(())
-}
-
-#[derive(Clone)]
-struct ReplayRecordingWork {
-    queue_index: usize,
-    replay: ReplayRecordingRequest,
-    source_path: PathBuf,
-    final_path: PathBuf,
-    partial_path: PathBuf,
-    status_path: PathBuf,
-    cancel_path: PathBuf,
-    display_name: String,
-}
-
-struct CompletedReplayRecording {
-    source_path: PathBuf,
-    final_path: PathBuf,
-    encoder_status: Value,
-}
-
-async fn record_one_replay(
-    app: AppHandle,
-    work: ReplayRecordingWork,
-    options: ReplayRecordingOptions,
-    total: usize,
-    concurrency: usize,
-    active_count: Arc<AtomicUsize>,
-    completed_count: Arc<AtomicUsize>,
-    failed_count: Arc<AtomicUsize>,
-    processed_count: Arc<AtomicUsize>,
-) -> Result<Option<CompletedReplayRecording>, String> {
-    {
-        let control = app.state::<ReplayRecordingControl>();
-        let mut state = control
-            .state
-            .lock()
-            .map_err(|_| "Replay recording control is unavailable.".to_string())?;
-        if state.cancel_requested {
-            return Ok(None);
-        }
-        state.current_cancel_paths.insert(work.cancel_path.clone());
-    }
-
-    let active = active_count.fetch_add(1, Ordering::Relaxed) + 1;
-    let processed = processed_count.load(Ordering::Relaxed);
-    let _ = app.emit(
-        "replay-recording-progress",
-        json!({
-            "stage": "starting",
-            "current": processed,
-            "processed": processed,
-            "succeeded": completed_count.load(Ordering::Relaxed),
-            "failed": failed_count.load(Ordering::Relaxed),
-            "total": total,
-            "active": active,
-            "queued": total.saturating_sub(processed.saturating_add(active)),
-            "percent": processed.saturating_mul(100) / total.max(1),
-            "concurrency": concurrency,
-            "queueIndex": work.queue_index,
-            "fileName": work.display_name,
-            "sourcePath": work.source_path.to_string_lossy(),
-            "step": "preparing",
-            "playbackSpeed": options.playback_speed,
-            "bitrateKbps": options.bitrate_kbps,
-            "resolutionHeight": options.resolution_height,
-        }),
-    );
-
-    let result = async {
-        let polling_done = Arc::new(AtomicBool::new(false));
-        let polling_done_for_task = Arc::clone(&polling_done);
-        let polling_app = app.clone();
-        let polling_status_path = work.status_path.clone();
-        let polling_name = work.display_name.clone();
-        let polling_source_path = work.source_path.to_string_lossy().to_string();
-        let polling_active = Arc::clone(&active_count);
-        let polling_completed = Arc::clone(&completed_count);
-        let polling_failed = Arc::clone(&failed_count);
-        let polling_processed = Arc::clone(&processed_count);
-        let queue_index = work.queue_index;
-        let poll_task = tauri::async_runtime::spawn_blocking(move || {
-            let mut last_contents = String::new();
-            while !polling_done_for_task.load(Ordering::Relaxed) {
-                if let Ok(contents) = fs::read_to_string(&polling_status_path) {
-                    if contents != last_contents {
-                        last_contents = contents.clone();
-                        if let Ok(encoder) = serde_json::from_str::<Value>(&contents) {
-                            let processed = polling_processed.load(Ordering::Relaxed);
-                            let active = polling_active.load(Ordering::Relaxed);
-                            let recorder_step = encoder
-                                .get("step")
-                                .and_then(Value::as_str)
-                                .unwrap_or("preparing");
-                            let display_step = if recorder_step == "completed" {
-                                "exporting"
-                            } else {
-                                recorder_step
-                            };
-                            let _ = polling_app.emit(
-                                "replay-recording-progress",
-                                json!({
-                                    "stage": "recording",
-                                    "current": processed,
-                                    "processed": processed,
-                                    "succeeded": polling_completed.load(Ordering::Relaxed),
-                                    "failed": polling_failed.load(Ordering::Relaxed),
-                                    "total": total,
-                                    "active": active,
-                                    "queued": total.saturating_sub(processed.saturating_add(active)),
-                                    "percent": processed.saturating_mul(100) / total.max(1),
-                                    "concurrency": concurrency,
-                                    "queueIndex": queue_index,
-                                    "fileName": polling_name,
-                                    "sourcePath": polling_source_path,
-                                    "step": display_step,
-                                    "encoder": encoder,
-                                }),
-                            );
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        });
-
-        const MAX_ATTEMPTS: usize = 3;
-        let mut attempt_succeeded = false;
-        let mut cancelled = false;
-        let mut last_error = format!("The replay recorder did not produce {}.", work.display_name);
-        for attempt in 1..=MAX_ATTEMPTS {
-            let processed = processed_count.load(Ordering::Relaxed);
-            let active = active_count.load(Ordering::Relaxed);
-            let _ = app.emit(
-                "replay-recording-progress",
-                json!({
-                    "stage": if attempt == 1 { "starting" } else { "retrying" },
-                    "current": processed,
-                    "processed": processed,
-                    "succeeded": completed_count.load(Ordering::Relaxed),
-                    "failed": failed_count.load(Ordering::Relaxed),
-                    "total": total,
-                    "active": active,
-                    "queued": total.saturating_sub(processed.saturating_add(active)),
-                    "percent": processed.saturating_mul(100) / total.max(1),
-                    "concurrency": concurrency,
-                    "queueIndex": work.queue_index,
-                    "fileName": work.display_name,
-                    "sourcePath": work.source_path.to_string_lossy(),
-                    "step": if attempt == 1 { "preparing" } else { "retrying" },
-                    "attempt": attempt,
-                    "maxAttempts": MAX_ATTEMPTS,
-                }),
-            );
-
-            let backend_result = run_backend_for_window(
-                &app,
-                "replay-recorder",
-                "record-replay",
-                vec![
-                    "--input".to_string(),
-                    work.source_path.to_string_lossy().to_string(),
-                    "--filename".to_string(),
-                    work.replay.file_name.clone(),
-                    "--output".to_string(),
-                    work.partial_path.to_string_lossy().to_string(),
-                    "--cancel-path".to_string(),
-                    work.cancel_path.to_string_lossy().to_string(),
-                    "--status-path".to_string(),
-                    work.status_path.to_string_lossy().to_string(),
-                    "--playback-speed".to_string(),
-                    options.playback_speed.to_string(),
-                    "--bitrate-kbps".to_string(),
-                    options.bitrate_kbps.to_string(),
-                    "--resolution-height".to_string(),
-                    options.resolution_height.to_string(),
-                ]
-                .into_iter()
-                .chain(if options.music_volume > 0 || options.sfx_volume > 0 {
-                    vec![
-                        "--music-volume".to_string(),
-                        options.music_volume.to_string(),
-                        "--sfx-volume".to_string(),
-                        options.sfx_volume.to_string(),
-                    ]
-                } else {
-                    Vec::new()
-                })
-                .collect(),
-            )
-            .await;
-
-            let cancel_requested = app
-                .state::<ReplayRecordingControl>()
-                .state
-                .lock()
-                .map_err(|_| "Replay recording control is unavailable.".to_string())?
-                .cancel_requested;
-            match backend_result {
-                Ok(response) => {
-                    let response_status = response
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if cancel_requested || response_status == "cancelled" {
-                        cancelled = true;
-                        break;
-                    }
-                    if response_status == "succeeded" && work.partial_path.is_file() {
-                        attempt_succeeded = true;
-                        break;
-                    }
-                    let detail = response
-                        .pointer("/result/stderr")
-                        .and_then(Value::as_str)
-                        .filter(|message| !message.trim().is_empty())
-                        .or_else(|| response.pointer("/result/message").and_then(Value::as_str));
-                    last_error = detail.map_or_else(
-                        || format!("The replay recorder did not produce {}.", work.display_name),
-                        |message| format!("{}: {message}", work.display_name),
-                    );
-                }
-                Err(error) => {
-                    if cancel_requested {
-                        cancelled = true;
-                        break;
-                    }
-                    last_error = error;
-                }
-            }
-            let _ = fs::remove_file(&work.partial_path);
-            let _ = fs::remove_file(&work.status_path);
-        }
-        polling_done.store(true, Ordering::Relaxed);
-        let _ = poll_task.await;
-
-        if cancelled {
-            return Ok(None);
-        }
-        if !attempt_succeeded {
-            return Err(format!("{last_error} Failed after {MAX_ATTEMPTS} attempts."));
-        }
-
-        let _ = app.emit(
-            "replay-recording-progress",
-            json!({
-                "stage": "exporting",
-                "step": "exporting",
-                "current": processed_count.load(Ordering::Relaxed),
-                "processed": processed_count.load(Ordering::Relaxed),
-                "succeeded": completed_count.load(Ordering::Relaxed),
-                "failed": failed_count.load(Ordering::Relaxed),
-                "total": total,
-                "active": active_count.load(Ordering::Relaxed),
-                "queued": total.saturating_sub(processed_count.load(Ordering::Relaxed).saturating_add(active_count.load(Ordering::Relaxed))),
-                "concurrency": concurrency,
-                "queueIndex": work.queue_index,
-                "fileName": work.display_name,
-                "sourcePath": work.source_path.to_string_lossy(),
-            }),
-        );
-        fs::rename(&work.partial_path, &work.final_path)
-            .map_err(|error| format!("Could not publish {}: {error}", work.final_path.display()))?;
-        let encoder_status = fs::read_to_string(&work.status_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
-            .unwrap_or_else(|| json!({
-                "status": "completed",
-                "speedAfter": options.playback_speed,
-                "bitrateKbps": options.bitrate_kbps,
-                "resolutionHeight": options.resolution_height,
-        }));
-        let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let active_after = active_count.load(Ordering::Relaxed).saturating_sub(1);
-        let _ = app.emit(
-            "replay-recording-progress",
-            json!({
-                "stage": "completed-file",
-                "current": processed,
-                "processed": processed,
-                "succeeded": completed,
-                "failed": failed_count.load(Ordering::Relaxed),
-                "total": total,
-                "active": active_after,
-                "queued": total.saturating_sub(processed.saturating_add(active_after)),
-                "percent": processed.saturating_mul(100) / total.max(1),
-                "concurrency": concurrency,
-                "queueIndex": work.queue_index,
-                "fileName": work.display_name,
-                "sourcePath": work.source_path.to_string_lossy(),
-                "step": "completed",
-                "outputPath": work.final_path,
-            }),
-        );
-        Ok(Some(CompletedReplayRecording {
-            source_path: work.source_path.clone(),
-            final_path: work.final_path.clone(),
-            encoder_status,
-        }))
-    }
-    .await;
-
-    let _ = fs::remove_file(&work.partial_path);
-    let _ = fs::remove_file(&work.status_path);
-    let _ = fs::remove_file(&work.cancel_path);
-    active_count.fetch_sub(1, Ordering::Relaxed);
-    if let Ok(mut state) = app.state::<ReplayRecordingControl>().state.lock() {
-        state.current_cancel_paths.remove(&work.cancel_path);
-    }
-    if let Err(error) = &result {
-        let failed = failed_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let active = active_count.load(Ordering::Relaxed);
-        let _ = app.emit(
-            "replay-recording-progress",
-            json!({
-                "stage": "failed-file",
-                "current": processed,
-                "processed": processed,
-                "succeeded": completed_count.load(Ordering::Relaxed),
-                "failed": failed,
-                "total": total,
-                "active": active,
-                "queued": total.saturating_sub(processed.saturating_add(active)),
-                "percent": processed.saturating_mul(100) / total.max(1),
-                "concurrency": concurrency,
-                "queueIndex": work.queue_index,
-                "fileName": work.display_name,
-                "sourcePath": work.source_path.to_string_lossy(),
-                "step": "failed",
-                "message": error,
-            }),
-        );
-    }
-    result
-}
-
-async fn record_replays_inner(
-    app: &AppHandle,
-    replays: Vec<ReplayRecordingRequest>,
-    options: ReplayRecordingOptions,
-) -> Result<Value, String> {
-    if replays.is_empty() {
-        return Ok(json!({"recorded": 0, "cancelled": false}));
-    }
-    for replay in &replays {
-        let source_path = PathBuf::from(&replay.file_path);
-        if !source_path.is_file() || !is_replay_file(&source_path) {
-            return Err(format!(
-                "Replay file is not readable: {}",
-                source_path.display()
-            ));
-        }
-    }
-
-    if ![1, 2, 4, 6, 10, 15, 20, 30].contains(&options.playback_speed) {
-        return Err("Playback speed must be 1x, 2x, 4x, 6x, 10x, 15x, 20x, or 30x.".to_string());
-    }
-    if ![500, 1000, 2500, 5000, 10000].contains(&options.bitrate_kbps) {
-        return Err("Video bitrate must use one of the supported presets.".to_string());
-    }
-    if ![480, 720, 1080].contains(&options.resolution_height) {
-        return Err("Video resolution must be 480p, 720p, or 1080p.".to_string());
-    }
-    if options.music_volume > 100 || options.sfx_volume > 100 {
-        return Err("Music and sound effect volumes must be between 0 and 100.".to_string());
-    }
-    if options.music_volume > 0 || options.sfx_volume > 0 {
-        let capabilities = recorder_status(app.clone()).await?;
-        let controls = capabilities.get("audio_controls").and_then(Value::as_array);
-        let supports_audio = ["music", "sfx"].iter().all(|control| {
-            controls.is_some_and(|items| items.iter().any(|item| item.as_str() == Some(control)))
-        });
-        if !supports_audio {
-            return Err("Update More of Dots Recorder to record music and sound effects.".to_string());
-        }
-    }
-    let total = replays.len();
-    let concurrency = options.concurrency.clamp(1, total.min(20));
-    let destination_dir = PathBuf::from(&options.destination_dir);
-    if !destination_dir.is_dir() {
-        return Err(format!(
-            "Replay video destination is not a folder: {}",
-            destination_dir.display()
-        ));
-    }
-    let _ = app.emit(
-        "replay-recording-progress",
-        json!({
-            "stage": "staging",
-            "current": 0,
-            "processed": 0,
-            "succeeded": 0,
-            "failed": 0,
-            "total": total,
-            "active": 0,
-            "queued": total,
-            "percent": 0,
-            "concurrency": concurrency,
-            "playbackSpeed": options.playback_speed,
-            "bitrateKbps": options.bitrate_kbps,
-            "resolutionHeight": options.resolution_height,
-            "message": format!("Preparing up to {concurrency} isolated game runtimes"),
-        }),
-    );
-    let recording_root = app_runtime_dir(app)?.join("replay-recordings");
-    fs::create_dir_all(&recording_root).map_err(|error| error.to_string())?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let mut reserved_paths = HashSet::new();
-    let work_items = replays
-        .into_iter()
-        .enumerate()
-        .map(|(index, replay)| {
-            let source_path = PathBuf::from(&replay.file_path);
-            let final_path =
-                available_recording_path(&destination_dir, &replay.file_name, &mut reserved_paths);
-            let partial_path = final_path.with_extension("partial.mp4");
-            let status_path =
-                recording_root.join(format!("recording-{unique}-{index}.status.json"));
-            let cancel_path = recording_root.join(format!("recording-{unique}-{index}.cancel"));
-            let display_name = final_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("replay.mp4")
-                .to_string();
-            ReplayRecordingWork {
-                queue_index: index + 1,
-                replay,
-                source_path,
-                final_path,
-                partial_path,
-                status_path,
-                cancel_path,
-                display_name,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for work in &work_items {
-        let _ = app.emit(
-            "replay-recording-progress",
-            json!({
-                "stage": "queued-file",
-                "step": "waiting-in-queue",
-                "current": 0,
-                "processed": 0,
-                "succeeded": 0,
-                "failed": 0,
-                "total": total,
-                "active": 0,
-                "queued": total,
-                "percent": 0,
-                "concurrency": concurrency,
-                "queueIndex": work.queue_index,
-                "fileName": work.display_name,
-                "sourcePath": work.source_path.to_string_lossy(),
-            }),
-        );
-    }
-
-    let active_count = Arc::new(AtomicUsize::new(0));
-    let completed_count = Arc::new(AtomicUsize::new(0));
-    let failed_count = Arc::new(AtomicUsize::new(0));
-    let processed_count = Arc::new(AtomicUsize::new(0));
-    let worker_results = stream::iter(work_items.into_iter().map(|work| {
-        record_one_replay(
-            app.clone(),
-            work,
-            options.clone(),
-            total,
-            concurrency,
-            Arc::clone(&active_count),
-            Arc::clone(&completed_count),
-            Arc::clone(&failed_count),
-            Arc::clone(&processed_count),
-        )
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut recorded = 0usize;
-    let mut failures = Vec::new();
-    for worker_result in worker_results {
-        match worker_result {
-            Ok(Some(completed)) => {
-                match append_recording_manifest(
-                    &recording_root,
-                    &completed.source_path,
-                    &completed.final_path,
-                    &completed.encoder_status,
-                    &options,
-                ) {
-                    Ok(()) => recorded += 1,
-                    Err(error) => failures.push(error),
-                }
-            }
-            Ok(None) => {}
-            Err(error) => failures.push(error),
-        }
-    }
-    let cancelled = app
-        .state::<ReplayRecordingControl>()
-        .state
-        .lock()
-        .map_err(|_| "Replay recording control is unavailable.".to_string())?
-        .cancel_requested;
-    let stage = if cancelled {
-        "cancelled"
-    } else if failures.is_empty() {
-        "completed"
-    } else {
-        "completed-with-errors"
-    };
-    let processed = processed_count.load(Ordering::Relaxed);
-    let _ = app.emit(
-        "replay-recording-progress",
-        json!({
-            "stage": stage,
-            "current": processed,
-            "processed": processed,
-            "succeeded": recorded,
-            "total": total,
-            "active": 0,
-            "queued": if cancelled { total.saturating_sub(processed) } else { 0 },
-            "percent": processed.saturating_mul(100) / total.max(1),
-            "concurrency": concurrency,
-            "recorded": recorded,
-            "failed": failures.len(),
-            "destination": destination_dir,
-        }),
-    );
-    Ok(json!({
-        "recorded": recorded,
-        "failed": failures.len(),
-        "failures": failures,
-        "cancelled": cancelled,
-        "concurrency": concurrency,
-        "destination": destination_dir,
-    }))
-}
-
-#[tauri::command]
-async fn record_replays(
-    app: AppHandle,
-    replays: Vec<ReplayRecordingRequest>,
-    options: ReplayRecordingOptions,
-) -> Result<Value, String> {
-    {
-        let control = app.state::<ReplayRecordingControl>();
-        let mut state = control
-            .state
-            .lock()
-            .map_err(|_| "Replay recording control is unavailable.".to_string())?;
-        if state.active {
-            return Err("A replay recording queue is already running.".to_string());
-        }
-        state.active = true;
-        state.cancel_requested = false;
-        state.current_cancel_paths.clear();
-    }
-    let result = record_replays_inner(&app, replays, options).await;
-    if let Ok(mut state) = app.state::<ReplayRecordingControl>().state.lock() {
-        state.active = false;
-        state.cancel_requested = false;
-        state.current_cancel_paths.clear();
-    }
-    result
-}
-
-#[tauri::command]
-async fn cancel_replay_recording(app: AppHandle) -> Result<bool, String> {
-    let cancel_paths = {
-        let control = app.state::<ReplayRecordingControl>();
-        let mut state = control
-            .state
-            .lock()
-            .map_err(|_| "Replay recording control is unavailable.".to_string())?;
-        if !state.active {
-            return Ok(false);
-        }
-        state.cancel_requested = true;
-        state
-            .current_cancel_paths
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    for path in cancel_paths {
-        fs::write(&path, b"cancel")
-            .map_err(|error| format!("Could not cancel the current replay recording: {error}"))?;
-    }
-    Ok(true)
-}
-
 #[tauri::command]
 async fn list_replays(
     app: AppHandle,
@@ -3113,9 +2374,45 @@ async fn list_replays(
         .map_err(|error| format!("Replay loading task failed: {error}"))?
 }
 
+/// An embedded map's thumbnail, read from its replay the first time a card
+/// needs it. Only the requested size is written.
+fn embedded_thumbnail_path(thumbnail_dir: &Path, key: &str, replay_path: &Path, small: bool) -> Result<PathBuf, String> {
+    let full = thumbnail_dir.join(format!("{key}.png"));
+    let small_path = thumbnail_dir.join(format!("{key}.small.png"));
+    let wanted = if small { &small_path } else { &full };
+    if wanted.is_file() {
+        return Ok(wanted.clone());
+    }
+    if small && full.is_file() {
+        return small_thumbnail_path(&full);
+    }
+    let surface = parse_replay(replay_path)?
+        .custom_map_surface
+        .ok_or_else(|| format!("{} has no embedded map.", replay_path.display()))?;
+    let hash = key.strip_prefix("custom-").unwrap_or(key);
+    if !small {
+        return cache_embedded_map(thumbnail_dir, hash, &surface);
+    }
+    let (_, png) = SurfaceDigest::with_bytes(&surface);
+    let png = png.ok_or_else(|| "Embedded map image is not valid base64.".to_string())?;
+    thumbnails::write_small_png(&png, &small_path)?;
+    Ok(small_path)
+}
+
+/// The downscaled copy for small replay cards, made once next to the image.
+fn small_thumbnail_path(full: &Path) -> Result<PathBuf, String> {
+    let stem = full.file_stem().and_then(|stem| stem.to_str()).unwrap_or("thumbnail");
+    let small = full.with_file_name(format!("{stem}.small.png"));
+    if !small.is_file() {
+        thumbnails::write_small_variant(full, &small)?;
+    }
+    Ok(small)
+}
+
 fn replay_thumbnail_paths_impl(
     app: &AppHandle,
     thumbnail_keys: Vec<String>,
+    small: bool,
 ) -> Result<Vec<ReplayThumbnailPath>, String> {
     let keys = thumbnail_keys
         .into_iter()
@@ -3137,31 +2434,51 @@ fn replay_thumbnail_paths_impl(
             .filter_map(|key| guard.get(key).cloned().map(|source| (key.clone(), source)))
             .collect::<Vec<_>>()
     };
+    let thumbnail_dir = media_cache_dir(app, REPLAY_THUMBNAIL_CACHE)?;
 
-    let mut paths = Vec::with_capacity(sources.len());
-    for (thumbnail_key, source) in sources {
-        let path = match source {
-            ReplayThumbnailSource::Base64(encoded) => {
-                cache_base64_png(app, "replay-thumbnails", &thumbnail_key, &encoded)?
-            }
-            ReplayThumbnailSource::File(path) => cache_media_file(app, "replay-thumbnails", &path)?,
-        };
-        paths.push(ReplayThumbnailPath {
-            thumbnail_key,
-            file_path: path.to_string_lossy().to_string(),
-        });
-    }
-    Ok(paths)
+    let results = parallel_map(
+        &sources,
+        |(thumbnail_key, source)| -> Result<ReplayThumbnailPath, String> {
+            let path = match source {
+                ReplayThumbnailSource::Embedded(replay) => {
+                    embedded_thumbnail_path(&thumbnail_dir, thumbnail_key, replay, small)?
+                }
+                ReplayThumbnailSource::File(path) => {
+                    let full = cache_media_file(app, REPLAY_THUMBNAIL_CACHE, path)?;
+                    if small { small_thumbnail_path(&full)? } else { full }
+                }
+            };
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            Ok(ReplayThumbnailPath {
+                thumbnail_key: thumbnail_key.clone(),
+                file_path: path.to_string_lossy().to_string(),
+                data_url: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
+            })
+        },
+        |_| {},
+    );
+    // One unreadable map keeps its card's fallback image; the others still load.
+    Ok(results
+        .into_iter()
+        .filter_map(|result| result.map_err(|error| eprintln!("{error}")).ok())
+        .collect())
 }
 
 #[tauri::command]
 async fn replay_thumbnail_paths(
     app: AppHandle,
     thumbnail_keys: Vec<String>,
+    variant: Option<String>,
 ) -> Result<Vec<ReplayThumbnailPath>, String> {
-    tauri::async_runtime::spawn_blocking(move || replay_thumbnail_paths_impl(&app, thumbnail_keys))
+    let small = variant.as_deref() == Some("small");
+    tauri::async_runtime::spawn_blocking(move || replay_thumbnail_paths_impl(&app, thumbnail_keys, small))
         .await
         .map_err(|error| format!("Replay thumbnail task failed: {error}"))?
+}
+
+#[tauri::command]
+fn replay_index_progress(app: AppHandle) -> Option<Value> {
+    app.state::<ReplayLibrary>().progress.lock().ok().and_then(|progress| progress.clone())
 }
 
 fn map_store(app: &AppHandle) -> Result<maps::MapStore, String> {
@@ -3213,73 +2530,6 @@ fn leaderboard_identity() -> Option<String> {
 }
 
 #[tauri::command]
-async fn capture_replay(
-    app: AppHandle,
-    window: WebviewWindow,
-    filename: String,
-    replay_base64: String,
-) -> Result<Value, String> {
-    let runtime_dir = app_runtime_dir(&app)?;
-    let uploads_dir = runtime_dir.join("desktop-uploads");
-    fs::create_dir_all(&uploads_dir).map_err(|error| error.to_string())?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_nanos();
-    let upload_path = uploads_dir.join(format!("{now}.rep"));
-    let bytes = BASE64
-        .decode(replay_base64.as_bytes())
-        .map_err(|error| format!("Replay payload is not valid base64: {error}"))?;
-    fs::write(&upload_path, bytes).map_err(|error| error.to_string())?;
-
-    let result = run_backend_for_window(
-        &app,
-        window.label(),
-        "capture-file",
-        vec![
-            "--input".to_string(),
-            upload_path.to_string_lossy().to_string(),
-            "--filename".to_string(),
-            filename,
-        ],
-    )
-    .await;
-
-    let _ = fs::remove_file(&upload_path);
-    result
-}
-
-#[tauri::command]
-async fn capture_replay_path(
-    app: AppHandle,
-    window: WebviewWindow,
-    filename: String,
-    path: String,
-) -> Result<Value, String> {
-    let input_path = PathBuf::from(&path);
-    if !input_path.is_file() || !is_replay_file(&input_path) {
-        return Err(format!(
-            "Replay file is not readable: {}",
-            input_path.display()
-        ));
-    }
-
-    run_backend_for_window(
-        &app,
-        window.label(),
-        "capture-file",
-        vec![
-            "--input".to_string(),
-            input_path.to_string_lossy().to_string(),
-            "--filename".to_string(),
-            filename,
-        ],
-    )
-    .await
-}
-
-#[tauri::command]
 fn replay_launch_request(app: AppHandle, launch_id: String) -> Result<ReplayLaunchRequest, String> {
     let path = launch_request_path(&app, &launch_id)?;
     let text = fs::read_to_string(&path).map_err(|error| {
@@ -3320,7 +2570,13 @@ async fn open_replay_window(
     file_path: String,
 ) -> Result<String, String> {
     let replay_path = PathBuf::from(&file_path);
-    if !replay_path.is_file() || !is_replay_file(&replay_path) {
+    let simulated = replay_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("repsim") || extension.eq_ignore_ascii_case("jsonl")
+        });
+    if !replay_path.is_file() || (!is_replay_file(&replay_path) && !simulated) {
         return Err(format!(
             "Replay file is not readable: {}",
             replay_path.display()
@@ -3359,15 +2615,27 @@ async fn open_replay_window(
     let window = WebviewWindowBuilder::new(
         &app,
         label.clone(),
-        WebviewUrl::App(format!("index.html?mode=player&launch={launch_id}").into()),
+        WebviewUrl::App(format!("player.html?launch={launch_id}").into()),
     )
     .title(&title)
     .inner_size(REPLAY_PLAYER_WIDTH, REPLAY_PLAYER_HEIGHT)
     .min_inner_size(720.0, 520.0)
+    .theme(Some(tauri::Theme::Dark))
+    .additional_browser_args("--autoplay-policy=no-user-gesture-required --disk-cache-size=16777216 --media-cache-size=8388608 --disable-gpu-shader-disk-cache")
     .visible(true)
     .focused(true)
     .build()
     .map_err(|error| error.to_string())?;
+
+    let player_app = app.clone();
+    let player_label = label.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::Destroyed) {
+            player_app
+                .state::<player::PlayerSessions>()
+                .close(&player_label);
+        }
+    });
 
     window
         .set_title(&title)
@@ -3381,302 +2649,56 @@ async fn open_replay_window(
     Ok(label)
 }
 
-#[tauri::command]
-async fn capture_sample_delta(
-    app: AppHandle,
-    job_id: String,
-    offset: u64,
-) -> Result<Value, String> {
-    if job_id.is_empty() || !job_id.chars().all(|char| char.is_ascii_hexdigit()) {
-        return Err("Invalid job id.".to_string());
-    }
-    let runtime_dir = app_runtime_dir(&app)?;
-    let root = runtime_dir.join("jobs").join(job_id);
-    let sample_path = root.join("stats.json.samples.jsonl");
-    let meta_path = root.join("stats.json.partial.meta.json");
-    let final_stats_path = root.join("stats.json");
-    let meta = read_json_file(&meta_path);
-    let final_stats = read_stats_meta_file(&final_stats_path);
-
-    let Ok(metadata) = fs::metadata(&sample_path) else {
-        return Ok(json!({
-            "found": false,
-            "offset": 0u64,
-            "samples": [],
-            "meta": meta,
-            "final_stats": final_stats,
-        }));
-    };
-
-    let len = metadata.len();
-    let start = offset.min(len);
-    let mut file = File::open(&sample_path)
-        .map_err(|error| format!("Could not open {}: {error}", sample_path.display()))?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| format!("Could not seek {}: {error}", sample_path.display()))?;
-
-    let max_bytes = sample_delta_max_bytes();
-    let max_record_bytes = sample_delta_max_record_bytes();
-    let mut reader = BufReader::new(file);
-    let mut consumed = 0u64;
-    let mut samples = Vec::new();
-    let mut largest_record_bytes = 0usize;
-
-    loop {
-        if samples.len() >= MAX_SAMPLE_DELTA_RECORDS {
-            break;
-        }
-        if consumed as usize >= max_bytes && !samples.is_empty() {
-            break;
-        }
-
-        let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("Could not read {}: {error}", sample_path.display()))?;
-        if bytes_read == 0 {
-            break;
-        }
-        if bytes_read > max_record_bytes {
-            return Err(format!(
-                "Sample stream record is too large: {} bytes at offset {} in {}. Increase WOD_SAMPLE_DELTA_MAX_RECORD_BYTES if this replay is expected.",
-                bytes_read,
-                start.saturating_add(consumed),
-                sample_path.display()
-            ));
-        }
-        if !line.ends_with('\n')
-            && start
-                .saturating_add(consumed)
-                .saturating_add(bytes_read as u64)
-                >= len
-        {
-            break;
-        }
-
-        consumed = consumed.saturating_add(bytes_read as u64);
-        largest_record_bytes = largest_record_bytes.max(bytes_read);
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            samples.push(value);
-        }
-    }
-    let next_offset = start.saturating_add(consumed).min(len);
-
-    Ok(json!({
-        "found": true,
-        "offset": next_offset,
-        "samples": samples,
-        "meta": meta,
-        "final_stats": final_stats,
-        "stream_bytes": len,
-        "read_bytes": consumed,
-        "record_bytes": largest_record_bytes,
-        "records_read": samples.len(),
-    }))
-}
-
-fn unit_assets_impl(app: &AppHandle) -> Result<UnitAssetsPayload, String> {
-    let asset_dir = steam_game_dir().join("assets");
-    let colors = ["blue", "red", "purple", "orange"];
-    let mut names = Vec::new();
-    for color in colors {
-        for suffix in [
-            "inf1",
-            "inf2",
-            "inf3",
-            "tank1",
-            "tank2",
-            "tank3",
-            "ship",
-            "heavy_ship",
-        ] {
-            names.push(format!("{color}_{suffix}"));
-        }
-    }
-    names.push("black_ship".to_string());
-    names.push("capital".to_string());
-    names.push("city_icon".to_string());
-    for color in colors {
-        names.push(format!("{color}_flag"));
-    }
-
-    let mut assets = BTreeMap::new();
-    for name in names {
-        let path = asset_dir.join(format!("{name}.png"));
-        if path.is_file() {
-            let cached = cache_media_file(app, "unit-assets", &path)?;
-            assets.insert(name, cached.to_string_lossy().to_string());
-        }
-    }
-
-    Ok(UnitAssetsPayload {
-        asset_dir: asset_dir.to_string_lossy().to_string(),
-        assets,
-    })
-}
-
-#[tauri::command]
-async fn unit_assets(app: AppHandle) -> Result<UnitAssetsPayload, String> {
-    tauri::async_runtime::spawn_blocking(move || unit_assets_impl(&app))
-        .await
-        .map_err(|error| format!("Unit asset task failed: {error}"))?
-}
-
-#[tauri::command]
-async fn capture_progress(
-    app: AppHandle,
-    window: WebviewWindow,
-    filename: String,
-    started_after_ms: u64,
-) -> Result<Value, String> {
-    let runtime_dir = app_runtime_dir(&app)?;
-    let owner_pid = owner_pid_for_window(&app, window.label())?;
-    let jobs_dir = runtime_dir.join("jobs");
-    let mut best: Option<(u64, PathBuf, Value)> = None;
-    let cutoff = started_after_ms.saturating_sub(250);
-
-    let entries = fs::read_dir(&jobs_dir)
-        .map_err(|error| format!("Could not read {}: {error}", jobs_dir.display()))?;
-    for entry in entries.flatten() {
-        let root = entry.path();
-        if !root.is_dir() {
-            continue;
-        }
-        let job_path = root.join("job.json");
-        let Some(job) = read_json_file(&job_path) else {
-            continue;
-        };
-        let filename_matches =
-            job.get("filename").and_then(Value::as_str) == Some(filename.as_str());
-        let owner_matches = job
-            .get("owner_pid")
-            .and_then(Value::as_u64)
-            .is_some_and(|pid| pid == u64::from(owner_pid));
-        if !filename_matches || !owner_matches {
-            continue;
-        }
-        let progress_path = root.join("live-capture-artifact.json.progress.jsonl");
-        let stats_path = root.join("stats.json");
-        let partial_meta_path = root.join("stats.json.partial.meta.json");
-        let sample_stream_path = root.join("stats.json.samples.jsonl");
-        let artifact_path = root.join("live-capture-artifact.json");
-        let latest_mtime = [
-            file_modified_millis(&job_path),
-            file_modified_millis(&progress_path),
-            file_modified_millis(&stats_path),
-            file_modified_millis(&partial_meta_path),
-            file_modified_millis(&sample_stream_path),
-            file_modified_millis(&artifact_path),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-        if latest_mtime < cutoff {
-            continue;
-        }
-        if best
-            .as_ref()
-            .map(|(mtime, _, _)| latest_mtime > *mtime)
-            .unwrap_or(true)
-        {
-            best = Some((latest_mtime, root, job));
-        }
-    }
-
-    let Some((latest_mtime_ms, root, job)) = best else {
-        return Ok(json!({ "found": false }));
-    };
-
-    let progress_path = root.join("live-capture-artifact.json.progress.jsonl");
-    let artifact_path = root.join("live-capture-artifact.json");
-    let stats_path = root.join("stats.json");
-    let partial_meta_path = root.join("stats.json.partial.meta.json");
-    let (event, event_count) = latest_progress_event(&progress_path);
-    let artifact = read_json_file(&artifact_path);
-    let stats = read_stats_meta_file(&stats_path);
-    let partial_stats = read_json_file(&partial_meta_path);
-    let stats_summary = stats.as_ref().and_then(|value| {
-        let summary = value.get("summary").cloned().unwrap_or(Value::Null);
-        let samples = summary
-            .get("sample_count")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                value
-                    .get("samples")
-                    .and_then(Value::as_array)
-                    .map(|items| items.len() as u64)
-            })
-            .unwrap_or(0);
-        Some(json!({
-            "source": value.get("source"),
-            "sample_rate_hz": value.get("sample_rate_hz"),
-            "sample_count": samples,
-            "summary": summary,
-            "replay_metadata": value.get("replay_metadata").cloned().unwrap_or(Value::Null),
-        }))
-    });
-    let partial_stats_summary = partial_stats.as_ref().and_then(|value| {
-        let summary = value.get("summary").cloned().unwrap_or(Value::Null);
-        let samples = summary
-            .get("sample_count")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                value
-                    .get("samples")
-                    .and_then(Value::as_array)
-                    .map(|items| items.len() as u64)
-            })
-            .unwrap_or(0);
-        Some(json!({
-            "source": value.get("source"),
-            "sample_rate_hz": value.get("sample_rate_hz"),
-            "sample_count": samples,
-            "summary": summary,
-            "replay_metadata": value.get("replay_metadata").cloned().unwrap_or(Value::Null),
-        }))
-    });
-    let artifact_summary = artifact.as_ref().map(|value| {
-        json!({
-            "status": value.get("status"),
-            "completion": value.get("completion").cloned().unwrap_or(Value::Null),
-            "validation": value.get("validation").cloned().unwrap_or(Value::Null),
-            "capture_config": value.get("capture_config").cloned().unwrap_or(Value::Null),
-        })
-    });
-
-    Ok(json!({
-        "found": true,
-        "latest_mtime_ms": latest_mtime_ms,
-        "job": job,
-        "event": event,
-        "event_count": event_count,
-        "artifact": artifact_summary,
-        "stats": stats_summary,
-        "partial_stats": partial_stats_summary,
-    }))
-}
-
+#[cfg(not(test))]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(WindowOwnerProcesses::default())
-        .manage(ReplayRecordingControl::default())
-        .manage(RecorderInstallControl::default())
         .manage(ReplayMediaCatalog::default())
+        .manage(ReplayLibrary::default())
+        .manage(player::PlayerSessions::default())
+        .manage(export::VideoExports::default())
         .setup(|app| {
+            let local = app.path().app_cache_dir()?;
+            // Count installed resources as well; development build artifacts are
+            // outside the user's app footprint and must not consume this budget.
+            let installation = if cfg!(debug_assertions) { 0 } else {
+                app.path().resource_dir().map(|path| storage::directory_bytes(&path)).unwrap_or(0)
+            };
+            let budget = storage::StorageBudget::new(local, installation)?;
+            app.manage(budget.clone());
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                budget.maintain();
+            });
+            let warm_app = app.handle().clone();
+            std::thread::spawn(move || warm_replay_listing(&warm_app));
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        stop_all_owner_processes(&app_handle);
+                        app_handle
+                            .state::<player::PlayerSessions>()
+                            .close_all();
+                        app_handle.state::<export::VideoExports>().cancel_all();
                         app_handle.exit(0);
+                    }
+                });
+            }
+            let args: Vec<String> = env::args().skip(1).collect();
+            let requested = args
+                .iter()
+                .position(|arg| arg == "--replay")
+                .and_then(|index| args.get(index + 1))
+                .or_else(|| args.first().filter(|path| Path::new(path).is_file()));
+            if let Some(path) = requested {
+                let path = path.clone();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = open_replay_window(handle, String::new(), path).await {
+                        eprintln!("{error}");
                     }
                 });
             }
@@ -3692,37 +2714,34 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            recorder_status,
-            check_recorder_update,
-            install_recorder,
-            cancel_recorder_install,
-            list_recorder_versions,
             recording_default_directory,
             open_recording_output_directory,
-            list_jobs,
             list_replays,
             replay_thumbnail_paths,
+            replay_index_progress,
             upload_replay,
             delete_replay,
             download_replay,
             download_replays,
-            record_replays,
-            cancel_replay_recording,
             list_maps,
             read_map,
             save_map,
             create_map,
             delete_maps,
             leaderboard_identity,
-            capture_replay,
-            capture_replay_path,
-            release_job_artifacts,
             replay_launch_request,
             current_replay_launch_request,
             open_replay_window,
-            capture_sample_delta,
-            unit_assets,
-            capture_progress
+            player::open_replay,
+            player::replay_frames,
+            player::render_frame,
+            export::export_replay_videos,
+            export::cancel_replay_exports,
+            player::replay_progress,
+            player::game_audio,
+            player::player_debug_options,
+            player::save_player_snapshot,
+            player::save_player_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -3749,7 +2768,7 @@ mod tests {
         let result = json!(0.5);
 
         assert!(replay_result_is_draw(&result));
-        assert_eq!(replay_winner_index(Some(&result), &players, None), None);
+        assert_eq!(replay_winner_team(Some(&result), &players, None), None);
     }
 
     #[test]
@@ -3781,6 +2800,40 @@ mod tests {
     }
 
     #[test]
+    fn two_versus_two_replays_report_two_players_per_side() {
+        let raw = json!({
+            "mode": "2v2",
+            "player_usernames": [
+                [{ "username": "a" }, { "username": "b" }],
+                [{ "username": "c" }, { "username": "d" }]
+            ]
+        });
+        assert_eq!(replay_team_size(&raw), 2);
+        let players: Vec<_> = replay_players(&raw)
+            .into_iter()
+            .map(|(team_index, name)| PlayerSummary { name, team_index, winner: false })
+            .collect();
+        let names = |players: &[PlayerSummary]| {
+            players.iter().map(|p| format!("{}{}", p.team_index, p.name)).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&players), ["0a", "0b", "1c", "1d"], "each teammate is a player");
+        // The home player's team won: both teammates win, and that team is listed first.
+        let candidates = vec![HomePlayerCandidate { normalized_name: "d".into(), replay_count: 3, first_seen: 0 }];
+        let home = replay_home_player(&players, &candidates);
+        assert_eq!(home.as_deref(), Some("d"));
+        let mut players = players;
+        let winning_team = replay_winner_team(Some(&json!(1)), &players, home.as_deref());
+        mark_winner(&mut players, winning_team);
+        put_home_player_first(&mut players, "d");
+        assert_eq!(names(&players), ["1d", "1c", "0a", "0b"]);
+        assert_eq!(players.iter().map(|p| p.winner).collect::<Vec<_>>(), [true, true, false, false]);
+        let winning_team = replay_winner_team(Some(&json!(0)), &players, Some("d"));
+        mark_winner(&mut players, winning_team);
+        assert!(players[2].winner && players[3].winner && !players[0].winner, "a loss means the other team won");
+        assert_eq!(replay_team_size(&json!({ "player_usernames": [[{ "username": "a" }], [{ "username": "b" }]] })), 1);
+    }
+
+    #[test]
     fn custom_map_surface_reads_new_map_location() {
         let raw = json!({
             "custom_map": null,
@@ -3802,6 +2855,8 @@ mod tests {
                 file_name: "match.rep".to_string(),
                 file_path: r"C:\replays\match.rep".to_string(),
                 version: Some("1.2.18.3".to_string()),
+                mode: None,
+                team_size: 1,
                 players: Vec::new(),
                 draw: false,
                 length: "0:00".to_string(),
@@ -3816,19 +2871,101 @@ mod tests {
             },
             result: None,
             map_id: None,
-            custom_map_surface: Some("YWJj".to_string()),
+            custom_map_surface: None,
+            custom_map: Some(CustomMapDigest { hash: "abc123".to_string(), decoded: true }),
             has_map: true,
         };
 
         let (thumbnail_key, source) =
             thumbnail_source_for_replay(Path::new(r"C:\replays"), &replay).unwrap();
-        assert!(thumbnail_key.starts_with("custom-"));
-        assert!(matches!(source, ReplayThumbnailSource::Base64(value) if value == "YWJj"));
+        assert_eq!(thumbnail_key, "custom-abc123");
+        assert!(matches!(source, ReplayThumbnailSource::Embedded(path) if path == Path::new(r"C:\replays\match.rep")));
+
+        replay.custom_map.as_mut().unwrap().decoded = false;
+        assert!(thumbnail_source_for_replay(Path::new(r"C:\replays"), &replay).is_none());
+        replay.custom_map.as_mut().unwrap().decoded = true;
 
         replay.summary.thumbnail_key = Some(thumbnail_key.clone());
         let serialized = serde_json::to_value(&replay.summary).unwrap();
         assert_eq!(serialized["thumbnailKey"], thumbnail_key);
         assert!(serialized.get("thumbnailDataUrl").is_none());
+    }
+
+    #[test]
+    fn replay_header_skips_frames_and_keeps_summary_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let surface = BASE64.encode(b"custom image");
+        let replay = json!({
+            "version": "1.4.1",
+            "mode": "1v1",
+            "player_usernames": [{"username": "ann"}, {"username": "bob [x]"}],
+            "result": "ann",
+            "0": [[1, 2, 3]],
+            "3600": {"orders": [1, 2]},
+            "120": [],
+            "map": {"map_surface": surface, "infantry": [[[1, 2]]]}
+        });
+        let path = root.path().join("match.rep");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&serde_json::to_vec(&replay).unwrap()).unwrap();
+        fs::write(&path, encoder.finish().unwrap()).unwrap();
+
+        let parsed = parse_replay(&path).unwrap();
+        assert_eq!(parsed.summary.duration_seconds, 120);
+        assert_eq!(parsed.summary.mode.as_deref(), Some("1v1"));
+        let names = parsed.summary.players.iter().map(|player| player.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["ann", "bob"]);
+        assert_eq!(parsed.result, Some(json!("ann")));
+        assert_eq!(parsed.custom_map_surface.as_deref(), Some(surface.as_str()));
+        let digest = parsed.custom_map.as_ref().unwrap();
+        assert_eq!(digest.surface(), SurfaceDigest::of(&surface));
+        assert!(digest.decoded);
+        // The embedded image itself is never written to the index.
+        let stored = serde_json::to_value(&parsed).unwrap();
+        assert!(stored.get("custom_map_surface").is_none());
+
+        fs::write(&path, br#"{"end": 90, "5000": []}"#).unwrap();
+        assert_eq!(parse_replay(&path).unwrap().summary.duration_seconds, 3);
+
+        // Indexing must not reject numbered maps before the engine resolves them.
+        fs::write(&path, br#"{"map": "13", "mode": "2v2"}"#).unwrap();
+        let numbered = parse_replay(&path).unwrap();
+        assert!(serde_json::to_value(&numbered.summary).unwrap().get("playable").is_none());
+        assert_eq!(numbered.map_id.as_deref(), Some("13"));
+        fs::write(&path, br#"{"map": "custom", "custom_map": {"map_surface": "YWJj"}}"#).unwrap();
+        assert!(parse_replay(&path).is_ok());
+        // Existing indexes may contain the retired false flag. Discard it without
+        // requiring users to clear their library or re-import their recordings.
+        let mut cached = serde_json::to_value(&numbered).unwrap();
+        cached["summary"]["playable"] = json!(false);
+        let restored: ParsedReplay = serde_json::from_value(cached).unwrap();
+        assert_eq!(restored.map_id.as_deref(), Some("13"));
+        assert!(serde_json::to_value(restored).unwrap()["summary"].get("playable").is_none());
+    }
+
+    #[test]
+    fn embedded_maps_are_cached_once_by_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let surface = format!("data:image/png;base64,{}", BASE64.encode(b"png bytes"));
+        let digest = SurfaceDigest::of(&surface);
+        let first = cache_embedded_map(root.path(), &digest.hash, &surface).unwrap();
+        let second = cache_embedded_map(root.path(), &digest.hash, &surface).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"png bytes");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(cache_embedded_map(root.path(), "other", "not base64!").is_err());
+    }
+
+    #[test]
+    fn parallel_map_keeps_order_and_reports_every_item() {
+        let items = (0..200).collect::<Vec<_>>();
+        let reported = AtomicUsize::new(0);
+        let doubled = parallel_map(&items, |value| value * 2, |_| {
+            reported.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(doubled, items.iter().map(|value| value * 2).collect::<Vec<_>>());
+        assert_eq!(reported.load(Ordering::Relaxed), 200);
+        assert!(parallel_map(&Vec::<u8>::new(), |value| *value, |_| {}).is_empty());
     }
 
     #[test]
@@ -3992,6 +3129,8 @@ mod tests {
                 file_name: "match.rep".to_string(),
                 file_path: path.to_string_lossy().to_string(),
                 version: Some("1.2.18.3".to_string()),
+                mode: None,
+                team_size: 1,
                 players: Vec::new(),
                 draw: false,
                 length: "0:00".to_string(),
@@ -4007,6 +3146,7 @@ mod tests {
             result: None,
             map_id: None,
             custom_map_surface: None,
+            custom_map: None,
             has_map: false,
         };
         let entry = ReplayIndexEntry {
@@ -4054,7 +3194,10 @@ mod tests {
             &path,
             serde_json::to_vec(&json!({
                 "version": REPLAY_INDEX_VERSION - 1,
-                "entries": {"stale": {"fileName": "stale.rep"}}
+                "entries": {
+                    "stale": {"fileName": "stale.rep"},
+                    "hashed": {"fileName": "hashed.rep", "hash": "abc", "size": 4, "parsed": {"old": "shape"}}
+                }
             }))
             .unwrap(),
         )
@@ -4063,7 +3206,15 @@ mod tests {
         let store = load_replay_index(&path);
 
         assert_eq!(store.version, REPLAY_INDEX_VERSION);
-        assert!(store.entries.is_empty());
+        // Summaries are rebuilt, while file hashes are kept to spare re-hashing.
+        assert_eq!(store.entries.len(), 1);
+        let entry = &store.entries["hashed"];
+        assert_eq!((entry.hash.as_str(), entry.size), ("abc", 4));
+        assert!(entry.parsed.is_none());
+
+        write_replay_index(&path, &store).unwrap();
+        assert_eq!(load_replay_index(&path).entries.len(), 1);
+        assert!(!path.with_extension("json.tmp").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

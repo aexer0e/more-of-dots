@@ -1,8 +1,11 @@
 # More of Dots
 
-[Download More of Dots 1.3.4 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v1.3.4/More.of.Dots_1.3.4_x64-setup.exe)
+[Download More of Dots 2.0.0 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v2.0.0/More.of.Dots_2.0.0_x64-setup.exe)
 
-- Browse, search, and download War of Dots replays
+Version 2.0.0 includes an independent replay player and video exporter in the desktop app.
+
+- Browse, search, download and play War of Dots replays
+- Save independent replay simulations and export MP4 videos
 - Back up discovered replays automatically
 - Follow global leaderboards, track your progress, and compare players
 - Create and edit custom maps, including motorised infantry
@@ -13,104 +16,37 @@ New maps and **Save draft** stay in More of Dots under `%APPDATA%\local.more-of-
 
 If an older custom map is blocking lobbies, use **Delete** beside Edit in the map library. This permanently deletes the installed map and its companion PNG without keeping a backup. Deleting a draft keeps any published copy. Unreadable maps appear with an error and can also be deleted.
 
-## Replay video recorder
+## Replay player
 
-Replay video export is provided by the optional **More of Dots Recorder** package. The main app no longer bundles the PowerShell runner, process-injection DLL, Python worker, or FFmpeg, so a recorder quarantine does not remove the replay browser.
+The library filters replays by **Mode** (1v1, 2v2, 3P, 4P, Experiment, Avalanche) and **Map** (Vanilla or Custom).
 
-The recorder bundles only the immutable War of Dots `1.4.1` build in `%LOCALAPPDATA%\More of Dots Recorder\versions` and copies it into a disposable job runtime. Older replays are normalized to `1.4.1` before launch, including structured player names, an explicit classic game mode, and empty motorised unit lists for older custom maps. Experimental replays retain their mode, units, and orders. Missing or unknown version labels use the same structural fallback when player names and tick orders can be derived. Recordings never launch the user's live Steam `game.exe`.
+2v2 cards place each team on one side with teammates stacked individually. Clicking a name filters to that player. The duration sits at the top centre between the map and mode labels. Player colours follow the game: blue, red, purple, orange.
 
-Recording speeds are 1×, 2×, 4×, 6×, 10×, 15×, 20×, and 30×, with 10× selected by default. The recorder batches complete simulation updates between video frames to preserve replay orders and unit production. Export time depends on simulation cost, resolution, and the computer's speed; 30× does not guarantee an export thirty times faster than real time.
+Hover a replay card to replace its played time and date with a Play pill. Player names and winners stay visible. Double-click or drag over a name to select it for copying; a single click still filters by that player. Click Play to open the replay. The replay opens in its own window and starts within a second, while the rest of the replay is simulated in the background. Hovering the bottom of the window shows the playback pill; hovering the right edge shows the layer rail. Scrolling over the map zooms toward the pointer; scroll out to restore the full map. Drag the map to move the player window. Seeking keeps the current play state and silences audio until scrubbing ends. Space pauses, left/right seek five seconds, up/down seek a minute, `[` and `]` change speed, keys 1 through 8 toggle the layers, and F or double-click toggles fullscreen.
 
-Recording attempts keep `logs.txt`, `job.json`, `video-recording-status.json`, and any `game-error.txt` in `%APPDATA%\local.more-of-dots\jobs\<job-id>`. The status and game error survive disposable runtime cleanup. Collect them soon after a failure, before older jobs are pruned for space.
+Replays sound like the game: its match music, the fighting loop that swells with the number of units in combat, the unit-produced sound and the victory or defeat sound at the end. The speaker button in the pill has **Music** and **SFX** sliders; they start at the volumes saved in the game's settings. Playback speed changes when effects are triggered, while music and effects keep their normal pitch and duration. Seeking resets the audio to the selected replay position. The sounds are read from the installed game (Steam), so the app bundles no audio; without War of Dots installed, replays and videos are silent.
 
-### Installing and updating from the app
+To export videos, select replays and choose **Record**. Pick the export folder, playback speed (1–30×), bitrate, resolution (480p, 720p or 1080p), how many videos to convert at once, which layers to show, and the music and SFX volumes. Videos are converted in the background, without opening a player, much faster than real time: about 120–150 frames per second at 1080p, so a 10-minute game at 1× takes roughly two minutes, and less at higher speeds. A floating panel shows progress; **Stop** cancels unfinished videos and removes their partial files. Videos are H.264 MP4 with the game's sounds as AAC audio (set both volumes to 0 for a silent video), encoded by Windows Media Foundation. With audio, the last frame stays on screen for two seconds while the end sound plays.
 
-The export dialog installs the recorder itself when one is missing or out of date. The app reads `recorder.json` from the latest release, downloads the installer with resumable HTTP ranges, checks it against the published SHA-256 and a minisign signature made with the keypair in `tauri.conf.json`, then runs it with `/S`. Nothing is executed before both checks pass, a manifest offering an older recorder than the installed one is ignored, and installs are refused while a recording holds the recorder open.
+Its internal C# engine simulates replays for playback and renders video exports with the same drawing rules as the player. Playback draws decoded map and unit images in a worker-owned canvas, with frame parsing and read-ahead outside the UI thread. No game executable is launched or loaded. A content-addressed cache reuses completed conversions; each player window has its own frame index and renderer. Internal simulations are saved in independently compressed chunks, so seeking does not require decompressing the entire replay.
 
-The recorder carries its own `wod_replay_server/RECORDER_VERSION`, independent of the app's `VERSION`. Bump it only when the recorder payload changes; otherwise every app patch would push the full installer again. `command_recorder_capabilities` reports it, and the manifest is generated from what the built recorder says rather than from what the build script assumes.
+The fast preview uses browser text and antialiasing, which can look slightly different from the maintained native renderer. Video exports and reference snapshots use the native drawing path. Simulation states are shared by both.
 
-Releases attach `recorder.json` and `recorder.json.sig` even when the recorder was not rebuilt, carrying the previous pair forward unchanged, so a release without a new recorder keeps offering the last good one. The manifest's download URL is pinned to the tag that produced the installer, never to `latest`.
+The imported engine preserves the validated War of Dots 1.4.1 behavior. Its existing offline corpus covers built-in maps, custom maps, classic/experimental modes, boats, combat and production. Avalanche replays are supported too. The reader also attempts older and unfamiliar versions, including legacy custom maps, string player names and mixed infantry/tank production. Historical playback uses reconstructed production rules and the shared simulation, so it is approximate. Orders for units that have not appeared are deferred instead of stopping playback or recording. Number-only replays use a bundled deployment catalog covering 31 classic, 37 experimental and six avalanche layouts. Other map/mode combinations still need a matching starting layout; an available terrain image alone does not specify unit IDs. See [integration notes](docs/replay-player-integration.md) for validation and limitations.
 
-### Publishing a new recorder
+The local storage budget is 500 MB in decimal bytes, counting WebView2 data and the installed app as well as replay caches. Replay caches, including conversions in progress, share a 256 MB limit. The app reserves 50 MB for browser growth, limits browser disk/media caches and evicts the least recently opened simulations before a write would exceed either allowance. Active players keep their files protected. If active replays consume the remaining allowance, conversion stops with a storage message instead of continuing to grow. Closing a player releases its cache for eviction. Startup removes the old uncompressed simulation cache and abandoned conversion files. Original replay backups, map drafts and saved browser preferences are preserved.
 
-The installer embeds game binaries that are deliberately outside source control, so it is built on a machine that already holds the vault and uploaded to the drafted release by hand. Signing happens in Actions, because the release keypair exists only as a secret there.
+### Developing the Windows player
 
-```powershell
-npm run build:recorder
-gh release upload v<app-version> `
-  "recorder-dist/More.of.Dots.Recorder_<recorder-version>_x64-setup.exe" `
-  "recorder-dist/recorder-capabilities.json"
-gh workflow run recorder.yml -f tag=v<app-version>
-```
+Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. The preparation script compiles the maintained source in `engine/repsim`, stages the map and unit artwork and public graphics libraries, and writes a SHA-256 manifest for the staged resources. Video encoding uses Windows Media Foundation, so no encoder is bundled. The installed app does not need the .NET SDK.
 
-The `Publish recorder assets` workflow signs the installer, generates and signs `recorder.json`, attaches both, and removes the capabilities dump it used as a courier for the version and protocol numbers. Publish the release once those assets are on it.
-
-Build the two release artifacts separately:
-
-```powershell
-npm run build
-npm run build:recorder
-```
-
-`npm run build:recorder` produces `recorder-dist/More.of.Dots.Recorder_<version>_x64-setup.exe`. The per-user NSIS installer registers an uninstaller and Start Menu shortcut while keeping the bundled game build outside the program directory so upgrades and recorder quarantines do not erase the vault.
-
-On upgrade the installer clears `payload` before extracting, because PyInstaller renames files between builds and orphans would otherwise accumulate. It skips re-extracting the game vault when a content hash marker and the build on disk both match, which is most of the install time. Silent installs report `3` when the recorder is running and `4` when files could not be written.
-
-The build requires version `1.4.1` in a populated recorder home. It uses `%LOCALAPPDATA%\More of Dots Recorder` by default; set `WOD_BUNDLED_VERSION_VAULT` to use another source. Packaging verifies `game.exe` against `wod_replay_server/supported_versions.json` and embeds that single build in the NSIS installer.
-
-Automated releases build the recorder only when the repository variables `WOD_RECORDER_VAULT_URL` and `WOD_RECORDER_VAULT_SHA256` identify an authorized ZIP whose root contains the `versions` folder. This keeps the game binaries outside source control without adding a downloader to the installed recorder.
-
-The recorder includes FFmpeg and one game build. It does not include DepotDownloader, SteamCMD, Steam authentication, or any game-version network downloader. Users do not need Python or FFmpeg installed.
-
-Set `WOD_RECORDER_PATH` to the standalone recorder executable for development. The catalog describes bundled game builds, while replay compatibility is inferred from player and order schemas. A version label alone does not reject a replay.
-
-For production releases, set `WOD_SIGNING_CERTIFICATE_SHA1` to an Authenticode certificate installed in the build account's certificate store. The build signs both the recorder executable and its probe DLL, and fails if configured signing does not succeed.
-
-Set `WOD_FFMPEG_PATH` during packaging to place the vetted FFmpeg build inside the recorder package. Keep the corresponding FFmpeg license and source-offer obligations with the distributed artifact.
-
-The packaged recorder remains inspectable from a terminal:
-
-```powershell
-more-of-dots-recorder.exe --desktop-command recorder-capabilities
-more-of-dots-recorder.exe --desktop-command list-game-versions
-```
-
-### Recording status protocol
-
-`record-replay` atomically rewrites the JSON file passed with `--status-path`. A client can poll it while the recorder process is running. `protocol_version` is currently `1`, and `step` is one of:
-
-- `waiting-for-game-slot`
-- `opening-game`
-- `starting-replay`
-- `recording`
-- `exporting`
-- `completed`, `cancelled`, or `failed`
-
-During recording, the status includes replay-time progress independently of export speed:
-
-```json
-{
-  "protocol_version": 1,
-  "status": "recording",
-  "step": "recording",
-  "current_seconds": 50.0,
-  "total_seconds": 180.0,
-  "progress_percent": 27.78,
-  "tick": 1500,
-  "end_tick": 5400,
-  "frame_count": 150
-}
-```
-
-`waiting-in-queue` is an orchestration state exposed by More of Dots before a recorder process is assigned to that replay. The app emits `replay-recording-progress` events containing `sourcePath`, `queueIndex`, `step`, aggregate queue counts, and the raw recorder status under `encoder`. This lets every replay retain its own state when several recordings run concurrently.
-
-More of Dots remembers the last video destination and uses the Windows Videos folder on first use. Opening replay export never launches a folder picker; the destination can be changed from the export page. The default preset is 1080p, with 480p and 720p also available. Once submitted, selection is cleared and recording progress moves to a compact bottom-left queue so the replay browser remains interactive.
+`npm run check` checks the existing web modules. `npm run check:native` checks the Rust library and supplies the Windows manifest needed by native dialog imports in the test executable. `npm run build` packages the More of Dots app with the independent player resources. The draft release workflow uses .NET 9 and packages one app installer; it does not fetch a game-version vault or produce a recorder installer.
 
 ## Leaderboard
 
 The Leaderboard tab replaces Region because servers are now mixed. It reads public Elo and World top-100 snapshots from `wod-nations-map.moreofdots.workers.dev`. The app reads only the username from the local game's compressed settings and highlights that player. If no saved login is available, enter an exact username once. The password is never returned to the UI or sent to the worker.
 
-Search runs locally. Compare up to ten players alongside your own rank and score over 24 hours, 7, 30, 90 days, or all available history. Each player keeps a distinct color. The worker returns every two-minute observation where a selected player's rank or score changed and omits consecutive unchanged observations. Charts draw discrete steps at each change and extend the latest value to the end of the selected range. Axis ticks use uniform round intervals.
+Search runs locally. Compare up to ten players alongside your own rank and score over 24 hours, 7 days, 30 days, or all available history. The selected period is remembered across refreshes and restarts. Each player keeps a distinct color. The worker returns every two-minute observation where a selected player's rank or score changed and omits consecutive unchanged observations. Charts draw discrete steps at each change and extend the latest value to the end of the selected range. Axis ticks use uniform round intervals.
 
 The app persists the latest snapshot and up to 12 history queries. It combines concurrent requests, uses the server's published refresh interval to wait for the next expected snapshot, and revalidates expired entries with ETags. Hidden tabs do not poll the network. Saved snapshots remain visible if a refresh fails. Only player histories requested by the current comparison are downloaded.
 
@@ -118,10 +54,10 @@ The app persists the latest snapshot and up to 12 history queries. It combines c
 
 Run `npm run dev` to prepare local examples and start the web UI at `http://127.0.0.1:5173`. Startup copies the newest 100 replays at most, filling any remaining slots from the app's replay backups and skipping duplicate content. It also copies recent editor maps, and map layouts from recent replays into ignored `build/dev-data`. It also saves fresh public Elo and World rankings with available change-only history. All three tabs are populated before Vite starts. Subsequent offline starts can reuse the last saved leaderboard snapshot.
 
-Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to `%APPDATA%\local.more-of-dots\replay-backups`; set `WOD_REPLAY_BACKUP_DIR` to use another backup folder. Only the username is read from game settings; credentials are never copied. Example edits and deletions last for the browser session and do not touch Steam files. Restarting creates fresh copies. Recorder and game-launch actions are unavailable in example mode.
+Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to `%APPDATA%\local.more-of-dots\replay-backups`; set `WOD_REPLAY_BACKUP_DIR` to use another backup folder. Only the username is read from game settings; credentials are never copied. Example edits and deletions last for the browser session and do not touch Steam files. Restarting creates fresh copies. Native playback is unavailable in the browser example workspace.
 
-`npm run dev:web` runs the same example workspace. `npm run dev:desktop` opens the native development app with that example UI. Release builds use the real backend.
+`npm run dev:web` runs the example workspace. `npm run dev:desktop` opens the native development app with the real backend, including replay conversion and playback.
 
-Replay previews support embedded PNGs, old numeric map IDs, and the new relative PNG paths, including Eronion maps. The Custom badge checks the official `assets/fahero_maps`, `assets/zolamare_maps`, and `assets/eronion_maps` folders in discovered Steam installations. Embedded PNGs are compared with the installed images; legacy numeric map IDs remain vanilla. No map list or image hashes are bundled. Each replay listing refreshes the check, including cached replays, so new Steam maps are recognized automatically. Maps absent from the local installation cannot be recognized by path or image. Shock units use the game's `motorised` storage key and infantry artwork with an upward chevron.
+Replay previews support embedded PNGs, old numeric map IDs, and the new relative PNG paths, including Eronion maps. The Custom badge checks the official `assets/fahero_maps`, `assets/zolamare_maps`, and `assets/eronion_maps` folders in discovered Steam installations. Embedded PNGs are compared with the installed images; legacy numeric map IDs remain vanilla. The Custom badge uses the installed assets rather than a bundled map list or image hashes. Each replay listing refreshes the check, including cached replays, so new Steam maps are recognized automatically. Maps absent from the local installation cannot be recognized by path or image. Shock units use the game's `motorised` storage key and infantry artwork with an upward chevron.
 
 The leaderboard uses `/v1/leaderboard/refresh` to retrieve current rankings, exact last observed score changes, and selected player history in one request. Subsequent refreshes replace the overlap at the previous capture and append only changed points. Selection caches persist separately; changing players or range loads that selection once. The server publishes the refresh interval, currently two minutes. Older public endpoints remain supported by the API for previous app releases.

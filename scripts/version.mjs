@@ -110,6 +110,11 @@ export function validateReleaseVersion({ head = "HEAD" } = {}) {
   return validateVersionProgression(current.value, tags.map((candidate) => candidate.tag));
 }
 
+export function tauriTargetArguments(args, configuredTarget) {
+  const explicitTarget = args.some((arg) => arg === "--target" || arg === "-t" || arg.startsWith("--target=") || /^-t.+/.test(arg));
+  return configuredTarget && !explicitTarget ? [...args, "--target", configuredTarget] : [...args];
+}
+
 function runTauri(args) {
   if (!args.length || !["dev", "build"].includes(args[0])) {
     throw new Error("Usage: node scripts/version.mjs tauri <dev|build> [Tauri arguments]");
@@ -119,7 +124,10 @@ function runTauri(args) {
   if (!fs.existsSync(tauriCliPath)) {
     throw new Error("The local Tauri CLI is missing. Run npm ci before starting or building the app.");
   }
-  const result = spawnSync(process.execPath, [tauriCliPath, ...args, "--config", configPath], {
+  // Cargo's environment target changes the artifact directory. Tauri also needs
+  // the target explicitly so its bundler looks in that same directory.
+  const targetArgs = tauriTargetArguments(args, process.env.CARGO_BUILD_TARGET);
+  const result = spawnSync(process.execPath, [tauriCliPath, ...targetArgs, "--config", configPath], {
     cwd: rootDir,
     stdio: "inherit",
   });

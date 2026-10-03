@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param()
 
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Version = (Get-Content -LiteralPath (Join-Path $Root 'VERSION') -Raw).Trim()
 
@@ -27,17 +27,35 @@ function New-SizeEntry([string]$Kind, [string]$Path) {
 
 $entries = @()
 
-$entries += New-SizeEntry 'separate-recorder' (Join-Path $Root 'recorder-dist\more-of-dots-recorder\more-of-dots-recorder.exe')
-$entries += New-SizeEntry 'recorder-nsis-installer' (Join-Path $Root "recorder-dist\More.of.Dots.Recorder_${Version}_x64-setup.exe")
+$entries += New-SizeEntry 'replay-engine' (Join-Path $Root 'src-tauri\resources\player\ReplaySim.Standalone.exe')
 
-$entries += New-SizeEntry 'tauri-exe' (Join-Path $Root 'src-tauri\target\release\more-of-dots.exe')
+$targetRoot = Join-Path $Root 'src-tauri\target'
+if ($env:CARGO_TARGET_DIR) {
+    $targetRoot = [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+}
+# Cargo uses target/<triple>/release when an explicit target is selected.
+# Inspect the existing outputs so a configured cross-target build is audited too.
+$releaseDirectories = @((Join-Path $targetRoot 'release'))
+if (Test-Path -LiteralPath $targetRoot) {
+    $releaseDirectories += @(Get-ChildItem -LiteralPath $targetRoot -Directory |
+        ForEach-Object { Join-Path $_.FullName 'release' })
+}
+$executable = $releaseDirectories |
+    ForEach-Object { Join-Path $_ 'more-of-dots.exe' } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Get-Item |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1
+if (-not $executable) { throw 'The build produced no More of Dots executable to audit.' }
+$releaseDirectory = $executable.DirectoryName
+$entries += New-SizeEntry 'tauri-exe' $executable.FullName
 
-Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri\target\release\bundle\nsis') -Filter '*.exe' -ErrorAction SilentlyContinue |
+Get-ChildItem -LiteralPath (Join-Path $releaseDirectory 'bundle\nsis') -Filter "*${Version}*.exe" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTimeUtc -Descending |
     Select-Object -First 1 |
     ForEach-Object { $entries += New-SizeEntry 'nsis-installer' $_.FullName }
 
-Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri\target\release\bundle\msi') -Filter '*.msi' -ErrorAction SilentlyContinue |
+Get-ChildItem -LiteralPath (Join-Path $releaseDirectory 'bundle\msi') -Filter "*${Version}*.msi" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTimeUtc -Descending |
     Select-Object -First 1 |
     ForEach-Object { $entries += New-SizeEntry 'msi-installer' $_.FullName }

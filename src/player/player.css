@@ -1,0 +1,463 @@
+* {
+  box-sizing: border-box;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  color: #eef4f0;
+  font:
+    14px Inter,
+    "Segoe UI",
+    sans-serif;
+  color-scheme: dark;
+}
+button,
+input,
+select {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+button:disabled,
+select:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+button,
+select,
+input {
+  color: inherit;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid #78b8ef;
+  outline-offset: 4px;
+}
+button {
+  border: 0;
+  background: none;
+}
+button svg {
+  width: 23px;
+  height: 23px;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+  vertical-align: middle;
+}
+button:hover {
+  background: #ffffff12;
+}
+#game {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  display: block;
+  opacity: 0;
+  transition: opacity 0.16s ease-out;
+}
+/* Shown only once the first full-resolution frame of a replay is drawn. */
+[data-screen="player"] #game {
+  opacity: 1;
+}
+.loading {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #c9d3cd;
+  font-size: 14px;
+}
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #ffffff26;
+  border-top-color: #70a8d1;
+  border-radius: 50%;
+  animation: player-spin 0.8s linear infinite;
+}
+@keyframes player-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  #game {
+    transition: none;
+  }
+  .spinner {
+    animation-duration: 2.4s;
+  }
+}
+.glass {
+  background: rgba(12, 23, 25, 0.92);
+  border: 1px solid #ffffff24;
+  box-shadow: 0 12px 32px #0005;
+  backdrop-filter: blur(20px);
+  border-radius: 12px;
+}
+.welcome {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  padding: 24px;
+}
+.welcome h1 {
+  font-size: 21px;
+  font-weight: 500;
+}
+.welcome p {
+  color: #97a49d;
+  max-width: 460px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.primary {
+  padding: 10px 18px;
+  background: #438ac3;
+  border: 1px solid #70a8d1;
+  border-radius: 6px;
+  color: white;
+}
+.primary:hover {
+  background: #529bd5;
+}
+.welcome button {
+  justify-self: center;
+}
+.toast {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 12px 18px;
+  max-width: calc(100% - 40px);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+[hidden] {
+  display: none !important;
+}
+.idle {
+  cursor: none;
+}
+button svg.solid {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* Floating transport pill: play, time, seek, duration, speed, fullscreen. */
+.bar {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  width: min(820px, calc(100% - 32px));
+  height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 0 6px;
+  border-radius: 23px;
+  background: rgba(14, 19, 18, 0.9);
+  border: 1px solid rgba(238, 244, 240, 0.13);
+  box-shadow: 0 10px 30px #0007;
+  backdrop-filter: blur(18px);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 8px);
+  transition:
+    opacity 0.15s,
+    transform 0.15s;
+}
+.show-bar .bar {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, 0);
+}
+.bar .icon-button {
+  border-radius: 50%;
+}
+.icon-button {
+  width: 34px;
+  height: 34px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.icon-button svg {
+  width: 20px;
+  height: 20px;
+}
+.time {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  min-width: 34px;
+}
+.duration {
+  color: #97a49d;
+  text-align: right;
+}
+.seek {
+  position: relative;
+  flex: 1;
+  height: 28px;
+  margin: 0 8px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+/* Focus does not change the seek bar's look. */
+.seek:focus,
+.seek:focus-visible {
+  outline: none;
+}
+.track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  /* Hatching marks frames that are still being simulated. */
+  background: repeating-linear-gradient(
+      135deg,
+      rgba(238, 244, 240, 0.09) 0 3px,
+      transparent 3px 6px
+    ),
+    rgba(238, 244, 240, 0.12);
+  transition: height 0.12s;
+}
+.seek:hover .track,
+.seek.scrubbing .track {
+  height: 6px;
+  border-radius: 3px;
+}
+.prepared,
+.progress {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+}
+.prepared {
+  background: rgba(238, 244, 240, 0.24);
+}
+.progress {
+  background: #78b8ef;
+}
+.head {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px #0007;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.ghost {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.7);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.tip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(10, 14, 13, 0.94);
+  border: 1px solid rgba(238, 244, 240, 0.13);
+  box-shadow: 0 4px 14px #0006;
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.tip small {
+  margin-left: 6px;
+  color: #97a49d;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.speed-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+.chip {
+  min-width: 40px;
+  padding: 4px 8px;
+  border: 1px solid rgba(238, 244, 240, 0.13);
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.speed-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 12px);
+  display: grid;
+  min-width: 72px;
+  padding: 4px;
+  border-radius: 9px;
+}
+.speed-menu button {
+  padding: 6px 10px;
+  border-radius: 5px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.speed-menu [aria-checked="true"] {
+  color: #78b8ef;
+  font-weight: 650;
+}
+.volume-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+/* Music and SFX volumes, as in the game's settings. */
+.volume-menu {
+  position: absolute;
+  right: -40px;
+  bottom: calc(100% + 12px);
+  display: grid;
+  gap: 8px;
+  width: 230px;
+  padding: 12px 14px;
+  border-radius: 9px;
+}
+.volume-menu label {
+  display: grid;
+  grid-template-columns: 42px 1fr 28px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+.volume-menu input {
+  width: 100%;
+  accent-color: #78b8ef;
+}
+.volume-menu output {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #97a49d;
+}
+
+/* Layer rail: eight one-click toggles matching shortcuts 1–8. */
+.rail {
+  position: fixed;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(8px, -50%);
+  transition:
+    opacity 0.15s,
+    transform 0.15s;
+}
+.show-rail .rail {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(0, -50%);
+}
+.layer {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  color: #97a49d;
+}
+.layer svg {
+  width: 18px;
+  height: 18px;
+}
+.layer b {
+  font-size: 9.5px;
+  font-weight: 650;
+  color: rgba(151, 164, 157, 0.55);
+}
+.layer[aria-pressed="true"] {
+  background: rgba(90, 146, 196, 0.2);
+  border-color: rgba(120, 184, 239, 0.45);
+  color: #eef4f0;
+}
+.layer[aria-pressed="true"] svg {
+  color: #78b8ef;
+}
+.layer[aria-pressed="true"] b {
+  color: #97a49d;
+}
+.layer-tip {
+  position: absolute;
+  right: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(10, 14, 13, 0.94);
+  border: 1px solid rgba(238, 244, 240, 0.13);
+  color: #eef4f0;
+  font-size: 12.5px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.layer:hover .layer-tip,
+.layer:focus-visible .layer-tip {
+  display: flex;
+}
+kbd {
+  font:
+    600 10.5px "Segoe UI",
+    sans-serif;
+  color: #97a49d;
+  border: 1px solid rgba(238, 244, 240, 0.18);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+@media (max-height: 520px) {
+  .layer {
+    height: 32px;
+  }
+  .layer b {
+    display: none;
+  }
+}

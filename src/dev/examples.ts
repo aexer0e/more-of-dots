@@ -20,12 +20,21 @@ export async function exampleLeaderboard<T>(url: string): Promise<T> {
   const result: History = { from, to, step, rows: rows.filter((row, index) => index === 0 || JSON.stringify(row.players) !== JSON.stringify(rows[index - 1].players)) };
   return result as T;
 }
+// `?replays=2000` repeats the examples to profile a large library in the browser.
+function stressReplays<T extends { filePath: string }>(replays: T[]): T[] {
+  const count = Math.min(20_000, Number(new URLSearchParams(location.search).get('replays')) || 0);
+  if (!replays.length || count <= replays.length) return replays;
+  return Array.from({ length: count }, (_, index) => {
+    const replay = replays[index % replays.length];
+    return index < replays.length ? replay : { ...replay, filePath: `${replay.filePath}#${index}` };
+  });
+}
 export async function exampleInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   const data = await examples();
   let result: unknown;
   switch (command) {
     case 'leaderboard_identity': result = data.identity; break;
-    case 'list_replays': result = { replays: data.replays.slice(0, 100) }; break;
+    case 'list_replays': result = { replays: stressReplays(data.replays.slice(0, 100)) }; break;
     case 'replay_thumbnail_paths': result = []; break;
     case 'list_maps': result = data.maps; break;
     case 'read_map': result = data.maps.find((m) => m.id === args.fileName); break;

@@ -8,7 +8,8 @@ build = "build.rs"
 
 [lib]
 name = "wod_replay_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# The Windows desktop executable links the Rust library directly.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -16,14 +17,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64 = "0.22"
 flate2 = "1"
-futures = "0.3"
-# Already in the tree via tauri-plugin-updater, so promoting these to direct
-# dependencies costs no extra crates.
-minisign-verify = "0.2"
 png = "0.17"
-# Feature set matched to tauri-plugin-updater's so the shared build of reqwest
-# does not gain a second TLS backend.
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
+# Use the same TLS provider as the updater.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +31,9 @@ tauri-plugin-updater = "2.10.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# Media Foundation H.264 encoding for MP4 export (already a Tauri dependency).
+windows = { version = "0.61", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
 
 [profile.release]
 strip = true
@@ -43,3 +41,17 @@ lto = "thin"
 codegen-units = 16
 panic = "abort"
 opt-level = "z"
+
+# The app is built for size, but replay indexing spends its time hashing,
+# inflating and decoding thumbnails; these few crates are built for speed.
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.miniz_oxide]
+opt-level = 3
+
+[profile.release.package.png]
+opt-level = 3
+
+[profile.release.package.fdeflate]
+opt-level = 3

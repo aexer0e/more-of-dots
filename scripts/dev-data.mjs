@@ -19,11 +19,23 @@ export function safeMapPath(root, value) {
   const target = path.resolve(root, relative);
   return target.startsWith(path.resolve(root) + path.sep) ? target : null;
 }
+const flatten = (p) => Array.isArray(p) ? p.map(flatten).filter(Boolean).join(' / ') : typeof p === 'object' && p ? flatten(p.username ?? p.name ?? p.display_name ?? p.displayName) : String(p ?? '').replace(/ \[.*\]$/, '').trim();
 export function replayNames(raw) {
-  const flatten = (p) => Array.isArray(p) ? p.map(flatten).filter(Boolean).join(' / ') : typeof p === 'object' && p ? flatten(p.username ?? p.name ?? p.display_name ?? p.displayName) : String(p ?? '').replace(/ \[.*\]$/, '').trim();
   const names = (raw.player_usernames ?? []).slice(0, 4).map(flatten);
   while (names.length < 2) names.push('');
   return names.map((name, i) => name || `Player ${i + 1}`);
+}
+// Every player with their side, as the desktop app lists them: 2v2 teammates are players of their own.
+export function replayPlayers(raw) {
+  const players = [];
+  const sides = (raw.player_usernames ?? []).slice(0, 4);
+  sides.forEach((side, teamIndex) => {
+    for (const member of Array.isArray(side) && side.length ? side : [side]) {
+      players.push({ name: flatten(member) || `Player ${players.length + 1}`, teamIndex });
+    }
+  });
+  for (let teamIndex = sides.length; teamIndex < 2; teamIndex++) players.push({ name: `Player ${players.length + 1}`, teamIndex });
+  return players;
 }
 async function replayFiles(directory) {
   if (!directory) return [];
@@ -105,20 +117,22 @@ export async function seedExamples() {
       const bytes = await fs.readFile(file.sourcePath);
       const raw = decodeJson(bytes);
       await fs.writeFile(path.join(dataDir, 'replays', file.name), bytes);
-      const names = replayNames(raw), perspective = names.indexOf(identity);
-      const winner = raw.result === 0.5 ? -1 : typeof raw.result === 'string' && names.includes(raw.result) ? names.indexOf(raw.result) : perspective >= 0 && names.length === 2 && [0, 1, false, true].includes(raw.result) ? (raw.result ? perspective : 1 - perspective) : -1;
+      const players = replayPlayers(raw), perspective = players.find((p) => p.name === identity)?.teamIndex ?? -1;
+      const named = players.find((p) => p.name === raw.result)?.teamIndex;
+      const sides = new Set(players.map((p) => p.teamIndex)).size;
+      const winner = raw.result === 0.5 ? -1 : named !== undefined ? named : perspective >= 0 && sides === 2 && [0, 1, false, true].includes(raw.result) ? (raw.result ? perspective : 1 - perspective) : -1;
       const seconds = Math.floor(Number(raw.end ?? Math.max(0, ...Object.keys(raw).filter((k) => /^\d+$/.test(k)).map(Number))) / 30);
       const png = await mapImage(raw);
       const vanilla = await catalog.isVanilla(raw);
       const mapIdentity = await catalog.identity(raw);
-      replays.push({ ...mapIdentity, fileName: file.name, filePath: '/__examples/replays/' + file.name, version: raw.version, players: names.map((name, teamIndex) => ({ name, teamIndex, winner: winner === teamIndex })).sort((a, b) => Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
+      replays.push({ ...mapIdentity, fileName: file.name, filePath: '/__examples/replays/' + file.name, version: raw.version, mode: raw.mode ?? null, teamSize: Math.max(1, ...(raw.player_usernames ?? []).map(side => Array.isArray(side) ? side.length : 1)), players: players.map((p) => ({ ...p, winner: winner === p.teamIndex })).sort((a, b) => Number(b.teamIndex === perspective) - Number(a.teamIndex === perspective) || Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
       // Recent replay layouts include the new maps and Shock units for editor testing.
       if (png && typeof raw.map === 'object' && maps.length < 12) {
-        const data = { ...raw.map, map_surface: png.toString('base64'), mode: raw.map.mode ?? (names.length === 4 ? 'v4' : names.length === 3 ? 'v3' : '1v1'), motorised: raw.map.motorised ?? names.map(() => []) };
+        const data = { ...raw.map, map_surface: png.toString('base64'), mode: raw.map.mode ?? (sides === 4 ? 'v4' : sides === 3 ? 'v3' : '1v1'), motorised: raw.map.motorised ?? Array.from({ length: sides }, () => []) };
         delete data.path;
         const id = `replay-map-${maps.length + 1}.txt`;
         await fs.writeFile(path.join(dataDir, 'maps', id), JSON.stringify(data));
-        maps.push({ id, fileName: id, name: raw.map.path ? path.basename(raw.map.path, '.png').replaceAll('_', ' ') : `Custom ${maps.length + 1}`, data, width: png.readUInt32BE(16), height: png.readUInt32BE(20), teamCount: names.length, createdAt: file.modified, updatedAt: file.modified });
+        maps.push({ id, fileName: id, name: raw.map.path ? path.basename(raw.map.path, '.png').replaceAll('_', ' ') : `Custom ${maps.length + 1}`, data, width: png.readUInt32BE(16), height: png.readUInt32BE(20), teamCount: sides, createdAt: file.modified, updatedAt: file.modified });
       }
     } catch (error) { console.warn(`Skipping ${file.name}: ${error.message}`); }
   }

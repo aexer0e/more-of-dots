@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -39,26 +40,14 @@ impl InstalledMaps {
         catalog
     }
 
-    fn vanilla_id(&self, map_id: Option<&str>, surface: Option<&str>) -> Option<String> {
+    fn vanilla_id(&self, map_id: Option<&str>, surface: Option<&SurfaceDigest>) -> Option<String> {
         if let Some(surface) = surface {
-            let payload = surface.strip_prefix("data:image/png;base64,").unwrap_or(surface);
-            BASE64.decode(payload).ok().and_then(|bytes| {
-                // Most replays only need a path lookup. Hash installed PNGs only
-                // when an embedded image needs comparing, once per listing.
-                self.hashes.get_or_init(|| {
-                    let mut paths = self.paths.iter().collect::<Vec<_>>();
-                    paths.sort_by_key(|(id, _)| *id);
-                    let mut hashes = HashMap::new();
-                    for (id, files) in paths {
-                        for path in files {
-                            if let Ok(bytes) = fs::read(path) {
-                                hashes.entry(format!("{:x}", Sha256::digest(bytes))).or_insert_with(|| id.clone());
-                            }
-                        }
-                    }
-                    hashes
-                }).get(&format!("{:x}", Sha256::digest(bytes))).cloned()
-            })
+            // Most replays only need a path lookup. Installed PNGs are hashed only
+            // when an embedded image needs comparing, and each file once per process.
+            if !surface.decoded {
+                return None;
+            }
+            self.hashes.get_or_init(|| installed_hashes(&self.paths)).get(&surface.hash).cloned()
         } else if let Some(id) = map_id {
             // Numeric IDs are the legacy built-in map format.
             if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
@@ -70,12 +59,22 @@ impl InstalledMaps {
         } else { None }
     }
 
+    #[cfg(test)]
     pub(crate) fn event_label(&self, map_id: Option<&str>, surface: Option<&str>, has_map: bool) -> Option<String> {
+        self.event_label_for(map_id, surface.map(SurfaceDigest::of).as_ref(), has_map)
+    }
+
+    pub(crate) fn event_label_for(&self, map_id: Option<&str>, surface: Option<&SurfaceDigest>, has_map: bool) -> Option<String> {
         let vanilla = self.vanilla_id(map_id, surface).is_some();
         (has_map && !vanilla).then(|| "Custom".to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self, map_id: Option<&str>, surface: Option<&str>) -> Option<(String, String)> {
+        self.identity_for(map_id, surface.map(SurfaceDigest::of).as_ref())
+    }
+
+    pub(crate) fn identity_for(&self, map_id: Option<&str>, surface: Option<&SurfaceDigest>) -> Option<(String, String)> {
         if let Some(id) = self.vanilla_id(map_id, surface) {
             let label = if let Some(number) = id.strip_prefix("legacy:") {
                 format!("Map {number}")
@@ -90,15 +89,67 @@ impl InstalledMaps {
         }
         // Hash decoded image bytes, not base64 formatting or the replay file.
         // Replays without embedded images fall back to their normalized map path.
-        let bytes = if let Some(surface) = surface {
-            let payload = surface.strip_prefix("data:image/png;base64,").unwrap_or(surface);
-            BASE64.decode(payload).unwrap_or_else(|_| payload.as_bytes().to_vec())
-        } else {
-            map_id?.replace('\\', "/").into_bytes()
+        let hash = match surface {
+            Some(surface) => surface.hash.clone(),
+            None => format!("{:x}", Sha256::digest(map_id?.replace('\\', "/").into_bytes())),
         };
-        let hash = format!("{:x}", Sha256::digest(bytes));
         Some((format!("custom:{hash}"), format!("#{}", &hash[..10])))
     }
+}
+
+/// The identity of an embedded map image: the SHA-256 of its decoded PNG bytes
+/// (of the raw text when it is not valid base64). Replays are indexed with this
+/// digest, so listings never decode or hash the images again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SurfaceDigest {
+    pub(crate) hash: String,
+    pub(crate) decoded: bool,
+}
+
+impl SurfaceDigest {
+    pub(crate) fn of(surface: &str) -> Self {
+        Self::with_bytes(surface).0
+    }
+
+    /// The digest together with the decoded PNG, when the surface is valid base64.
+    pub(crate) fn with_bytes(surface: &str) -> (Self, Option<Vec<u8>>) {
+        let payload = surface.strip_prefix("data:image/png;base64,").unwrap_or(surface);
+        match BASE64.decode(payload) {
+            Ok(bytes) => (Self { hash: format!("{:x}", Sha256::digest(&bytes)), decoded: true }, Some(bytes)),
+            Err(_) => (Self { hash: format!("{:x}", Sha256::digest(payload.as_bytes())), decoded: false }, None),
+        }
+    }
+}
+
+type FileStamp = (PathBuf, u64, Option<SystemTime>);
+
+fn installed_hashes(paths: &HashMap<String, Vec<PathBuf>>) -> HashMap<String, String> {
+    // Listings take a fresh catalog, but an unchanged file keeps its hash.
+    static FILE_HASHES: OnceLock<Mutex<HashMap<FileStamp, String>>> = OnceLock::new();
+    let cache = FILE_HASHES.get_or_init(Default::default);
+    let mut paths = paths.iter().collect::<Vec<_>>();
+    paths.sort_by_key(|(id, _)| *id);
+    let mut hashes = HashMap::new();
+    for (id, files) in paths {
+        for path in files {
+            let Ok(metadata) = fs::metadata(path) else { continue };
+            let stamp = (path.clone(), metadata.len(), metadata.modified().ok());
+            let known = cache.lock().ok().and_then(|cache| cache.get(&stamp).cloned());
+            let hash = match known {
+                Some(hash) => hash,
+                None => {
+                    let Ok(bytes) = fs::read(path) else { continue };
+                    let hash = format!("{:x}", Sha256::digest(bytes));
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.insert(stamp, hash.clone());
+                    }
+                    hash
+                }
+            };
+            hashes.entry(hash).or_insert_with(|| id.clone());
+        }
+    }
+    hashes
 }
 
 #[cfg(test)]

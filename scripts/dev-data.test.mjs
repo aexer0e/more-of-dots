@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { decodeJson, latestReplayFiles, exampleReplayFiles, safeMapPath, replayNames } from './dev-data.mjs';
+import { decodeJson, latestReplayFiles, exampleReplayFiles, safeMapPath, replayNames, replayPlayers } from './dev-data.mjs';
 import { readInstalledMaps } from './installed-maps.mjs';
 
 test('installed map discovery refreshes after updates and excludes user map folders', async () => {
@@ -118,4 +118,6 @@ test('reads both replay encodings and new nested player names', () => {
   assert.deepEqual(decodeJson(gzipSync(bytes)), raw);
   assert.deepEqual(replayNames(raw), ['one', 'two']);
   assert.deepEqual(replayNames({ player_usernames: ['old [Badge]', 'other'] }), ['old', 'other']);
+  assert.deepEqual(replayPlayers({ player_usernames: [[{ username: 'a' }, { username: 'b' }], [{ username: 'c' }, { username: 'd' }]] }),
+    [{ name: 'a', teamIndex: 0 }, { name: 'b', teamIndex: 0 }, { name: 'c', teamIndex: 1 }, { name: 'd', teamIndex: 1 }]);
 });

@@ -89,7 +89,10 @@ export function LeaderboardApp() {
   const [editingMe, setEditingMe] = useState(false);
   const mineRef = useRef<HTMLTableRowElement>(null);
   const [comparisons, setComparisons] = useState<string[]>(() => { try { return (JSON.parse(preference('comparisons', '[]')) as string[]).filter((v) => typeof v === 'string').slice(0, MAX_COMPARISONS); } catch { return []; } });
-  const [days, setDays] = useState(0);
+  const [days, setDays] = useState(() => {
+    const saved = Number(preference('days', '0'));
+    return [0, 1, 7, 30].includes(saved) ? saved : 0;
+  });
   const [metric, setMetric] = useState<'value' | 'rank'>('value');
   const [history, setHistory] = useState<History | null>(null);
   const [inspectedAt, setInspectedAt] = useState<number | null>(null);
@@ -99,6 +102,7 @@ export function LeaderboardApp() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [retry, setRetry] = useState(0);
   const [now, setNow] = useState(Date.now);
+  useEffect(() => remember('days', String(days)), [days]);
   const colorMap = useRef(new Map<string, string>());
   const chosenName = manualName.trim() || identity;
   const me = snapshot?.[board].find((p) => p.nickname.toLocaleLowerCase() === chosenName.toLocaleLowerCase())?.nickname ?? chosenName;

@@ -1,23 +1,33 @@
-export const MATCH_TYPES = ["1v1", "3P FFA", "4P FFA"];
+// Match formats in the game's mode menu, in its order.
+export const MATCH_TYPES = ["1v1", "2v2", "3P", "4P", "Experiment", "Avalanche"];
 export type MapSource = "vanilla" | "custom";
+// Maps are either the game's own (vanilla) or player-made (custom).
+export type ReplayVariant = MapSource;
+export const REPLAY_VARIANTS: { value: ReplayVariant; label: string }[] = [
+  { value: "vanilla", label: "Vanilla" },
+  { value: "custom", label: "Custom" },
+];
 export type ReplayFilterRecord = {
   names: string[];
   normalizedNames: string[];
   matchType: string;
   durationSeconds: number;
   modified: number;
-  winnerIndex: number;
+  // Each name's team (side): teammates are not opponents, and a team wins together.
+  teams: number[];
+  winnerTeam: number;
   isDraw: boolean;
   mapKey: string | null;
   mapLabel: string;
   mapSource: MapSource;
+  variant: ReplayVariant;
   thumbnailKey?: string | null;
   thumbnailDataUrl?: string | null;
 };
 export type ReplayFilters = {
   query: string;
   enabledTypes: Set<string>;
-  sources: Set<MapSource>;
+  sources: Set<ReplayVariant>;
   durationRange: { min: number; max: number };
   mapKey: string | null;
   player: string | null;
@@ -35,7 +45,7 @@ export const normalize = (text: string) => text.trim().toLocaleLowerCase();
 
 export function matchesReplay(record: ReplayFilterRecord, filters: ReplayFilters, omit?: "player" | "map") {
   return filters.enabledTypes.has(record.matchType)
-    && filters.sources.has(record.mapSource)
+    && filters.sources.has(record.variant)
     && record.durationSeconds >= filters.durationRange.min && record.durationSeconds <= filters.durationRange.max
     && (omit === "map" || !filters.mapKey || filters.mapKey === record.mapKey)
     && (omit === "player" || !filters.player || record.normalizedNames.includes(filters.player))
@@ -67,12 +77,13 @@ export function replaySuggestions(records: ReplayFilterRecord[], filters: Replay
         const item = players.get(key) ?? { kind: "player", key, name, rank, replayCount: 0, latestModified: 0,
           winCount: 0, lossCount: 0, drawCount: 0, opponents: [], opponentCounts: new Map<string, number>() };
         item.replayCount++;
-        item.winCount += Number(record.winnerIndex === index);
-        item.lossCount += Number(record.winnerIndex >= 0 && record.winnerIndex !== index);
+        const team = record.teams[index];
+        item.winCount += Number(record.winnerTeam === team);
+        item.lossCount += Number(record.winnerTeam >= 0 && record.winnerTeam !== team);
         item.drawCount += Number(record.isDraw);
         item.latestModified = Math.max(item.latestModified, record.modified);
         record.names.forEach((opponent, opponentIndex) => {
-          if (opponentIndex !== index) item.opponentCounts.set(opponent, (item.opponentCounts.get(opponent) ?? 0) + 1);
+          if (record.teams[opponentIndex] !== team) item.opponentCounts.set(opponent, (item.opponentCounts.get(opponent) ?? 0) + 1);
         });
         players.set(key, item);
       });
@@ -93,6 +104,21 @@ export function replaySuggestions(records: ReplayFilterRecord[], filters: Replay
   const playerItems = [...players.values()].sort(sort).slice(0, limit).map(({ opponentCounts, ...item }) => ({ ...item,
     opponents: [...opponentCounts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([name]) => name) }));
   return [...playerItems, ...[...maps.values()].sort(sort).slice(0, limit)];
+}
+
+/** Names grouped by team, in order: `teamIndex` is the player's side. */
+export function teamNames(players: { name: string; teamIndex?: number }[]): string[][] {
+  const teams = new Map<number, string[]>();
+  players.forEach((player, index) => {
+    const team = player.teamIndex ?? index;
+    teams.set(team, [...(teams.get(team) ?? []), player.name]);
+  });
+  return [...teams.values()];
+}
+
+/** "a vs b", "a & b vs c & d"; `within` and `between` change the separators. */
+export function matchupTitle(players: { name: string; teamIndex?: number }[], between = " vs ", within = " & ") {
+  return teamNames(players).map((team) => team.join(within)).join(between);
 }
 
 export function toggleMatchType(current: Set<string>, type: string) {

@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - VERSION
+  # Rebuilds the current VERSION, e.g. after a cancelled run.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -47,6 +49,17 @@ jobs:
       - name: Prepare signed release configuration
         run: npm run version:release-config
 
+      - name: Read release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          $notes = Get-Content -LiteralPath "docs/releases/$version.md" -Raw -ErrorAction Stop
+          $delimiter = [guid]::NewGuid().ToString()
+          "body<<$delimiter" >> $env:GITHUB_OUTPUT
+          $notes >> $env:GITHUB_OUTPUT
+          $delimiter >> $env:GITHUB_OUTPUT
+
       - name: Build and upload draft release
         uses: tauri-apps/tauri-action@v1
         env:
@@ -56,7 +69,8 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: More of Dots v__VERSION__
-          generateReleaseNotes: true
+          releaseBody: ${{ steps.notes.outputs.body }}
+          generateReleaseNotes: false
           releaseDraft: true
           prerelease: false
           retryAttempts: 2

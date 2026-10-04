@@ -1,6 +1,6 @@
 //! Independent replay conversion, frame indexing, rendering and video encoding.
 //! A session belongs to a webview, so opening another replay cannot replace it.
-use crate::storage::{CacheLease, StorageBudget, CACHE_DIRECTORY};
+use crate::storage::{CacheLease, ReplayCache, CACHE_DIRECTORY};
 use base64::Engine;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,6 @@ struct ReplayIndex {
     changed: Condvar,
     cancelled: AtomicBool,
     packed: AtomicBool,
-    budget: Option<Arc<StorageBudget>>,
     // Both the output and its temporary file stay protected until playback ends.
     _leases: Vec<CacheLease>,
 }
@@ -61,12 +60,11 @@ struct Progress {
 }
 impl ReplayIndex {
     fn new(path: PathBuf, temporary: Option<tempfile::TempPath>) -> Arc<Self> {
-        Self::with_cache(path, temporary, None, Vec::new())
+        Self::with_cache(path, temporary, Vec::new())
     }
     fn with_cache(
         path: PathBuf,
         temporary: Option<tempfile::TempPath>,
-        budget: Option<Arc<StorageBudget>>,
         leases: Vec<CacheLease>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -78,7 +76,6 @@ impl ReplayIndex {
             changed: Condvar::new(),
             cancelled: AtomicBool::new(false),
             packed: AtomicBool::new(false),
-            budget,
             _leases: leases,
         })
     }
@@ -466,11 +463,7 @@ fn flush_chunk(
     block.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
     block.extend_from_slice(&(pending.len() as u32).to_le_bytes());
     block.extend_from_slice(&compressed);
-    if let Some(budget) = &index.budget {
-        budget.write(sink, &block)?;
-    } else {
-        sink.write_all(&block).map_err(|e| e.to_string())?;
-    }
+    sink.write_all(&block).map_err(|e| e.to_string())?;
     // Readers only see a chunk after every byte has reached the file.
     for record in pending.split(|&b| b == b'\n') {
         index_record(index, record, *offset, state)?;
@@ -508,11 +501,7 @@ fn ingest(
     let mut pending_rows = 0;
     if let Some(sink) = sink.as_mut() {
         index.packed.store(true, Ordering::Release);
-        if let Some(budget) = &index.budget {
-            budget.write(sink, PACKED_MAGIC)?;
-        } else {
-            sink.write_all(PACKED_MAGIC).map_err(|e| e.to_string())?;
-        }
+        sink.write_all(PACKED_MAGIC).map_err(|e| e.to_string())?;
         offset = PACKED_MAGIC.len() as u64;
     }
     loop {
@@ -846,10 +835,9 @@ pub async fn open_replay(
             index
         } else {
             let executable = resource(&app, "ReplaySim.Standalone.exe")?;
-            let budget = app.state::<Arc<StorageBudget>>().inner().clone();
-            let cache = budget.root().join(CACHE_DIRECTORY);
+            let store = app.state::<Arc<ReplayCache>>().inner().clone();
+            let cache = store.root().join(CACHE_DIRECTORY);
             fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-            budget.maintain();
             let bytes = fs::read(&supplied).map_err(|e| e.to_string())?;
             let manifest = fs::read(resource(&app, "manifest.json")?).map_err(|e| e.to_string())?;
             let game_dirs = crate::installed_game_dirs();
@@ -861,14 +849,13 @@ pub async fn open_replay(
                 &game_dirs,
             )?;
             let output = cache.join(format!("{key}.rps2"));
-            let output_lease = budget.protect(&output);
-            if output.is_file() {
+            let output_lease = store.protect(&output);
+            let index = if output.is_file() {
                 // Recency is the last successful open, rather than creation.
                 if let Ok(file) = fs::OpenOptions::new().write(true).open(&output) {
                     let _ = file.set_modified(std::time::SystemTime::now());
                 }
-                let index =
-                    ReplayIndex::with_cache(output.clone(), None, Some(budget), vec![output_lease]);
+                let index = ReplayIndex::with_cache(output.clone(), None, vec![output_lease]);
                 spawn_ingest(&index, &session, output);
                 index
             } else {
@@ -897,16 +884,18 @@ pub async fn open_replay(
                 .spawn()
                 .map_err(|e| e.to_string())?;
                 session.job.assign(&mut child)?;
-                let temporary_lease = budget.protect(&temporary);
+                let temporary_lease = store.protect(&temporary);
                 let index = ReplayIndex::with_cache(
                     temporary.to_path_buf(),
                     Some(temporary),
-                    Some(budget),
                     vec![output_lease, temporary_lease],
                 );
                 spawn_conversion(&index, &session, child, sink, output, log);
                 index
-            }
+            };
+            // This replay is now the most recent, so every other closed one goes.
+            store.prune();
+            index
         };
         let previous = session
             .replay
@@ -1275,16 +1264,16 @@ mod tests {
     }
     #[test]
     #[ignore = "requires WOD_STORAGE_FIXTURE pointing to a real cached simulation"]
-    fn real_simulation_compresses_within_budget_and_preserves_seeks() {
+    fn real_simulation_compresses_and_preserves_seeks() {
         let source = PathBuf::from(std::env::var("WOD_STORAGE_FIXTURE").unwrap());
         let (original, _) = index_replay(&source).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let budget = StorageBudget::new(dir.path().into(), 200_000_000).unwrap();
+        let store = ReplayCache::new(dir.path().into()).unwrap();
         let cache = dir.path().join(CACHE_DIRECTORY);
         fs::create_dir(&cache).unwrap();
         let path = cache.join("real.rps2");
-        let lease = budget.protect(&path);
-        let packed = ReplayIndex::with_cache(path.clone(), None, Some(budget.clone()), vec![lease]);
+        let lease = store.protect(&path);
+        let packed = ReplayIndex::with_cache(path.clone(), None, vec![lease]);
         let started = std::time::Instant::now();
         ingest(
             &packed,
@@ -1326,7 +1315,6 @@ mod tests {
             );
         }
         let size = path.metadata().unwrap().len();
-        assert!(size + 200_000_000 < crate::storage::LOCAL_LIMIT);
         println!(
             "Real simulation: {} -> {} bytes; {} frames; {:.1}s; seek rows match exactly",
             source.metadata().unwrap().len(),

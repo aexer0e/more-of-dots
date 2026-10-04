@@ -2661,16 +2661,12 @@ pub fn run() {
         .manage(export::VideoExports::default())
         .setup(|app| {
             let local = app.path().app_cache_dir()?;
-            // Count installed resources as well; development build artifacts are
-            // outside the user's app footprint and must not consume this budget.
-            let installation = if cfg!(debug_assertions) { 0 } else {
-                app.path().resource_dir().map(|path| storage::directory_bytes(&path)).unwrap_or(0)
-            };
-            let budget = storage::StorageBudget::new(local, installation)?;
-            app.manage(budget.clone());
+            let cache = storage::ReplayCache::new(local)?;
+            app.manage(cache.clone());
+            // Opening a replay prunes immediately; this also trims browser caches.
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
-                budget.maintain();
+                cache.maintain();
             });
             let warm_app = app.handle().clone();
             std::thread::spawn(move || warm_replay_listing(&warm_app));

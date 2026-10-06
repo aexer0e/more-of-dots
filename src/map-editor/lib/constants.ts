@@ -63,7 +63,7 @@ export const TERRAIN_COLORS = [
   { name: 'Plains', hex: '#A1C246' },
   { name: 'Forest', hex: '#388336' },
   { name: 'River', hex: '#279BFF' },
-  { name: 'Snow', hex: '#FFFFFF' },
+  { name: 'Snow', hex: '#E3F2F2' },
   { name: 'Mud', hex: '#784B23' },
   { name: 'Sand', hex: '#EEE3B0' },
   { name: 'Hill', hex: '#888A87' },

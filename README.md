@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 2.0.0 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v2.0.0/More.of.Dots_2.0.0_x64-setup.exe)
+[Download More of Dots 2.0.1 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v2.0.1/More.of.Dots_2.0.1_x64-setup.exe)
 
 Version 2.0.0 includes an independent replay player and video exporter in the desktop app.
 
@@ -32,7 +32,7 @@ Its internal C# engine simulates replays for playback and renders video exports 
 
 The fast preview uses browser text and antialiasing, which can look slightly different from the maintained native renderer. Video exports and reference snapshots use the native drawing path. Simulation states are shared by both.
 
-The imported engine preserves the validated War of Dots 1.4.1 behavior. Its existing offline corpus covers built-in maps, custom maps, classic/experimental modes, boats, combat and production. Avalanche replays are supported too. The reader also attempts older and unfamiliar versions, including legacy custom maps, string player names and mixed infantry/tank production. Historical playback uses reconstructed production rules and the shared simulation, so it is approximate. Orders for units that have not appeared are deferred instead of stopping playback or recording. Number-only replays use a bundled deployment catalog covering 31 classic, 37 experimental and six avalanche layouts. Other map/mode combinations still need a matching starting layout; an available terrain image alone does not specify unit IDs. See [integration notes](docs/replay-player-integration.md) for validation and limitations.
+Version 2.0.1 corrects historical production, retreat, movement precision and naval damage. Validation compared all simulation states for 741 complete replays against 16 original game builds, with exact matches. One further recording crashes both matching original builds on an order for a nonexistent unit, so its full playback remains unverified. This validates the tested collection; older and unfamiliar versions still receive a playback attempt. Orders for units that have not appeared are deferred instead of stopping playback or recording. Number-only replays use a bundled deployment catalog covering 49 classic, 38 experimental and six avalanche layouts, including matching three- and four-colour rosters. Other map/mode combinations still need a matching starting layout; an available terrain image alone does not specify unit IDs. See [integration notes](docs/replay-player-integration.md) for the player architecture and [2.0.1 release notes](docs/releases/2.0.1.md) for this update.
 
 Simulated replay caches have no size limit, so conversion and playback never stop for storage. The app keeps only the most recently opened simulation, plus any that an open player is still using; opening another replay deletes the rest, and a 10-second sweep catches anything left over. Disposable WebView2 caches are trimmed to 50 MB. Startup removes the old uncompressed simulation cache and abandoned conversion files. Original replay backups, map drafts and saved browser preferences are preserved.
 

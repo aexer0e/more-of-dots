@@ -157,6 +157,14 @@ internal sealed class Replay
     public required string Version { get; init; }
     public string SourceMode { get; init; } = "classic";
     public bool LegacyProduction { get; init; }
+    public bool ConditionalRetreatRolls => System.Version.TryParse(Version, out var version)
+        && version < new System.Version(1, 3);
+    public bool RoundedRetreatComparison => !System.Version.TryParse(Version, out var version)
+        || version >= new System.Version(1, 3);
+    public bool FullPrecisionPositions => System.Version.TryParse(Version, out var version)
+        && version < new System.Version(1, 2, 23);
+    public bool RollProductionBeforeBlock => LegacyProduction && System.Version.TryParse(Version, out var version)
+        && version >= new System.Version(1, 3);
     public bool ApproximateRules => Version != "1.4.1" || LegacyProduction
         || SourceMode is not ("classic" or "experiment" or "avalanche" or "1v1" or "2v2" or "v3" or "v4" or "ffa");
     public string SimulationProfile => LegacyProduction ? "wod-legacy-mixed-v1" : "wod-1.4.1-ea9225cf";
@@ -202,12 +210,14 @@ internal sealed class Replay
                 ? $"This replay records map number ({id}), but the player has no layout of starting units and cities for this map and mode yet. A matching replay with a full map can provide that layout."
                 : "This replay does not record its map, so it cannot be played back.");
         }
-        var map = ReplayMap.Read(mapValue, Path.GetDirectoryName(Path.GetFullPath(path)) ?? AppContext.BaseDirectory);
+        string versionName = Text(root, "version") ?? "unknown";
+        bool pygameCeRaster = !System.Version.TryParse(versionName, out var mapVersion)
+            || mapVersion >= new System.Version(1, 3, 7);
+        var map = ReplayMap.Read(mapValue, Path.GetDirectoryName(Path.GetFullPath(path)) ?? AppContext.BaseDirectory, pygameCeRaster);
         string matchMode = Text(root, "mode") ?? Text(mapValue, "mode") ?? "classic";
         string modeName = BuiltInDeployments.RulesMode(matchMode);
         // Files with new/unknown version strings still get a playback attempt. The
         // command schema determines production behavior, not an allowlist of versions.
-        string versionName = Text(root, "version") ?? "unknown";
         bool legacyProduction = false, modernProduction = false;
         foreach (var frame in root.EnumerateObject().Where(p => int.TryParse(p.Name, out _) && p.Value.ValueKind == JsonValueKind.Object))
         foreach (var entry in frame.Value.EnumerateObject().Where(p => p.Name.StartsWith("production", StringComparison.Ordinal) && p.Value.ValueKind == JsonValueKind.Object))
@@ -359,7 +369,7 @@ internal sealed class ReplayMap
     public required List<Vec> Cities { get; init; }
     public int[] Capitals { get; init; } = [];
 
-    public static ReplayMap Read(JsonElement map, string replayDirectory)
+    public static ReplayMap Read(JsonElement map, string replayDirectory, bool pygameCeRaster)
     {
         static List<Vec>[] Sides(JsonElement map, string name, int sideCount = 2)
         {
@@ -390,7 +400,7 @@ internal sealed class ReplayMap
               { var a = p.EnumerateArray().ToArray(); return new Vec(a[0].GetDouble(), a[1].GetDouble()); }).ToArray()).ToArray()
             : [];
         int width = surface.Width == 960 ? 1600 : 1920, height = surface.Width == 960 ? 900 : 1080;
-        surface = surface.Rasterize(cities, bridges, width, height);
+        surface = surface.Rasterize(cities, bridges, width, height, pygameCeRaster);
         string? sourceSurface = embeddedSurface
             ? surfaceValue.GetString()
             : MapSurfaceImage.ExternalBase64(mapPath, replayDirectory);
@@ -522,13 +532,21 @@ internal sealed class MapSurfaceImage
         if (File.Exists(companion)) return companion;
         // Official maps (fahero, zolamare, eronion) come from the installed game when it is available.
         if (normalized.StartsWith("assets/", StringComparison.OrdinalIgnoreCase) && !normalized.Contains(".."))
+        {
             foreach (string directory in GameDirectories)
             {
                 string installed = Path.Combine(directory, normalized.Replace('/', Path.DirectorySeparatorChar));
                 if (File.Exists(installed)) return installed;
             }
+            // Keep each author's asset directory. Their numbered PNG filenames
+            // can collide even though the native catalog paths differ.
+            string bundledAsset = Path.Combine(AppContext.BaseDirectory, "maps", normalized.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(bundledAsset)) return bundledAsset;
+        }
         if (normalized.Equals(fileName, StringComparison.OrdinalIgnoreCase)
-            || normalized.StartsWith("assets/fahero_maps/", StringComparison.OrdinalIgnoreCase))
+            || normalized.StartsWith("assets/fahero_maps/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("assets/zolamare_maps/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("assets/eronion_maps/", StringComparison.OrdinalIgnoreCase))
         {
             string bundled = Path.Combine(AppContext.BaseDirectory, "maps", fileName);
             if (File.Exists(bundled)) return bundled;
@@ -544,7 +562,7 @@ internal sealed class MapSurfaceImage
 
     // The native surface is scaled before lookup. Quantize world coordinates
     // only after scaling the complete RGB raster, then apply replay geometry.
-    public MapSurfaceImage Rasterize(IReadOnlyList<Vec> cities, IReadOnlyList<Vec[]> bridges, int width, int height)
+    public MapSurfaceImage Rasterize(IReadOnlyList<Vec> cities, IReadOnlyList<Vec[]> bridges, int width, int height, bool pygameCeFill)
     {
         byte[] ids = new byte[width * height];
         byte[] raster = new byte[width * height * 3];
@@ -573,7 +591,7 @@ internal sealed class MapSurfaceImage
             var offset = new Vec(-delta.Y, delta.X) * 7.5 * (1 / (delta.Length + 0.01));
             var vertices = new[] { bridge[0] + offset, bridge[0] - offset, bridge[1] - offset, bridge[1] + offset }
                 .Select(p => new Vec((int)p.X, (int)p.Y)).ToArray();
-            FillPolygon(ids, vertices, 8, width, height);
+            FillPolygon(ids, vertices, 8, width, height, pygameCeFill);
         }
         // Native pygame radius-nine circle raster, relative to its center.
         // This fixed stencil has 240 pixels and asymmetric pixel endpoints.
@@ -589,7 +607,7 @@ internal sealed class MapSurfaceImage
         return new MapSurfaceImage(width, height, raster, ids);
     }
 
-    private static void FillPolygon(byte[] ids, Vec[] vertices, byte kind, int width, int height)
+    private static void FillPolygon(byte[] ids, Vec[] vertices, byte kind, int width, int height, bool pygameCeFill)
     {
         int bottom = (int)vertices.Max(p => p.Y), top = (int)vertices.Min(p => p.Y);
         for (int y = Math.Max(top, 0); y <= Math.Min(bottom, height - 1); y++)
@@ -602,8 +620,18 @@ internal sealed class MapSurfaceImage
                 if (a.Y > b.Y) (a, b) = (b, a);
                 if ((y >= a.Y && y < b.Y) || (y == bottom && b.Y == bottom))
                 {
-                    float crossing = (float)((y - a.Y) * (b.X - a.X)) / (float)(b.Y - a.Y);
-                    crossings.Add((int)(crossings.Count % 2 == 0 ? Math.Floor(crossing) : Math.Ceiling(crossing)) + (int)a.X);
+                    if (pygameCeFill)
+                    {
+                        // Pygame CE rounds the float32 edge offset by encounter
+                        // parity, then adds the origin and sorts intersections.
+                        float offset = (float)((y - a.Y) * (b.X - a.X)) / (float)(b.Y - a.Y);
+                        crossings.Add((int)(crossings.Count % 2 == 0 ? MathF.Floor(offset) : MathF.Ceiling(offset)) + (int)a.X);
+                    }
+                    else
+                    {
+                        double crossing = (y - a.Y) * (b.X - a.X) / (b.Y - a.Y) + a.X;
+                        crossings.Add((int)crossing);
+                    }
                 }
             }
             crossings.Sort();
@@ -832,7 +860,7 @@ internal sealed class Simulator
         for (int tick = 0; tick < maxTick; tick++)
         {
             ApplyOrders(tick);
-            if (replay.Productions.TryGetValue(tick, out var commands)) foreach (var command in commands) economy.SetProduction(command);
+            if (replay.Productions.TryGetValue(tick, out var commands)) foreach (var command in commands) economy.SetProduction(command, NextRandom);
             var influenceUnits = replay.Units.Where(u => u.Active).Select(u => u.Id).ToHashSet();
             Step(options.NoCombat);
             territory.Update(influenceUnits);
@@ -1067,9 +1095,12 @@ internal sealed class Simulator
             if (unit.ShipTimer > 90) { unit.Ship = !unit.Ship; unit.ShipTimer = 0; }
             if (unit.WaterTimer > 0 && unit.ShipTimer == 0) unit.Health -= Math.Sqrt(unit.WaterTimer) / 500.0;
             if (unit.Ship) unit.Health -= 0.01;
-            unit.Health = PythonRound(unit.Health, 3);
-            unit.Morale = PythonRound(unit.Morale, 2);
-            unit.DamageReceived = PythonRound(damage[i], 3);
+            if (!replay.FullPrecisionPositions)
+            {
+                unit.Health = PythonRound(unit.Health, 3);
+                unit.Morale = PythonRound(unit.Morale, 2);
+            }
+            unit.DamageReceived = replay.FullPrecisionPositions ? damage[i] : PythonRound(damage[i], 3);
             if (unit.Health <= 0) { unit.Active = false; unit.Destroyed = true; }
         }
     }
@@ -1090,12 +1121,18 @@ internal sealed class Simulator
     }
 
 
-    private double DamageFor(Unit unit)
+    internal double DamageFor(Unit unit)
     {
         if (unit.Ship && unit.TargetId >= 0)
+        {
+            if (replay.FullPrecisionPositions)
+                return replay.Units[unit.TargetId].Ship
+                    ? (unit.Type == "tank" ? 0.05 : 0.2)
+                    : (unit.Type == "tank" ? 0.1 : 0.02);
             return replay.Units[unit.TargetId].Ship
                 ? (unit.Type == "tank" ? 0.1 : 0.3)
                 : (unit.Type == "tank" ? 0.16 : 0.04);
+        }
         var terrain = replay.Map.Surface?.At(unit.SimulationPosition) ?? TerrainKind.Plains;
         double[,] damage =
         {
@@ -1188,6 +1225,75 @@ internal sealed class Simulator
         if (comparison > 0 || comparison == 0 && !quotient.IsEven) quotient++;
         double rounded = (double)quotient / Math.Pow(10, digits);
         return negative ? -rounded : rounded;
+    }
+
+    internal static double NativeMaskedMatrixSum(ReadOnlySpan<double> values, int row)
+    {
+        // The game's contiguous (living,living) @ (living,2) NumPy product
+        // uses the SkylakeX small GEMM kernel. Its four-row reduction and
+        // final one/two-row reduction combine the same eight lanes differently.
+        // Keep zero entries: compacting the enemy list changes lane placement.
+        if (values.Length < 16 || 2L * values.Length * values.Length > 1_000_000)
+        {
+            double serial = 0;
+            foreach (double value in values) serial += value;
+            return serial;
+        }
+        Span<double> lanes = stackalloc double[8];
+        lanes.Clear();
+        for (int i = 0; i < values.Length; i++) lanes[i & 7] += values[i];
+        if (row < (values.Length & ~3))
+            return ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+                + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+        return ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6]))
+            + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]));
+    }
+
+    internal static double PythonHypot(double x, double y)
+    {
+        x = Math.Abs(x); y = Math.Abs(y);
+        double result = double.Hypot(x, y);
+        if (!double.IsFinite(result) || result == 0) return result;
+        // Check the library approximation against exact dyadic midpoint
+        // squares. Python's scalar hypot chooses the nearest binary64 root;
+        // the platform Hypot can differ by one ULP on replay collision vectors.
+        static (System.Numerics.BigInteger Mantissa, int Exponent) Parts(double value)
+        {
+            ulong bits = (ulong)BitConverter.DoubleToInt64Bits(value);
+            int exponent = (int)((bits >> 52) & 0x7ff);
+            ulong mantissa = bits & 0x000f_ffff_ffff_ffff;
+            if (exponent != 0) mantissa |= 1UL << 52;
+            return (new System.Numerics.BigInteger(mantissa), exponent == 0 ? -1074 : exponent - 1023 - 52);
+        }
+        static int Compare(System.Numerics.BigInteger a, int ae, System.Numerics.BigInteger b, int be)
+        {
+            int common = Math.Min(ae, be);
+            return (a << (ae - common)).CompareTo(b << (be - common));
+        }
+        var xp = Parts(x); var yp = Parts(y);
+        int sumExponent = Math.Min(xp.Exponent * 2, yp.Exponent * 2);
+        var sum = (xp.Mantissa * xp.Mantissa << (xp.Exponent * 2 - sumExponent))
+            + (yp.Mantissa * yp.Mantissa << (yp.Exponent * 2 - sumExponent));
+        int CompareMidpoint(double a, double b)
+        {
+            var ap = Parts(a); var bp = Parts(b);
+            int exponent = Math.Min(ap.Exponent, bp.Exponent);
+            var midpoint = (ap.Mantissa << (ap.Exponent - exponent)) + (bp.Mantissa << (bp.Exponent - exponent));
+            return Compare(sum, sumExponent, midpoint * midpoint, (exponent - 1) * 2);
+        }
+        while (true)
+        {
+            bool odd = (BitConverter.DoubleToInt64Bits(result) & 1) != 0;
+            double previous = Math.BitDecrement(result), next = Math.BitIncrement(result);
+            int low = CompareMidpoint(previous, result);
+            if (low < 0 || low == 0 && odd) { result = previous; continue; }
+            if (double.IsFinite(next))
+            {
+                int high = CompareMidpoint(result, next);
+                if (high > 0 || high == 0 && odd) { result = next; continue; }
+            }
+            return result;
+        }
     }
 
     internal static double NumpyRound(double value, int digits)

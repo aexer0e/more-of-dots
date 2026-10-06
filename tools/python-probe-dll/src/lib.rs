@@ -87,21 +87,25 @@ unsafe extern "system" fn worker(parameter: *mut c_void) -> DWord {
         }
     };
 
-    let python_name = CString::new("python314.dll").expect("static string has no nul");
+    // Historical game builds embed Python 3.12; newer builds use 3.14.
+    // Resolve the interpreter actually loaded by the target, not the host Python.
+    let python_names = ["python314.dll", "python313.dll", "python312.dll", "python311.dll"];
     let python = (0..80).find_map(|_| {
-        let handle = GetModuleHandleA(python_name.as_ptr());
-        if handle.is_null() {
-            thread::sleep(Duration::from_millis(250));
-            None
-        } else {
-            Some(handle)
+        for name in python_names {
+            let name = CString::new(name).expect("static string has no nul");
+            let handle = GetModuleHandleA(name.as_ptr());
+            if !handle.is_null() {
+                return Some(handle);
+            }
         }
+        thread::sleep(Duration::from_millis(250));
+        None
     });
     let Some(python) = python else {
         write_status(
             module,
             "failed",
-            "python314.dll is not loaded in the target process.",
+            "No supported Python interpreter DLL is loaded in the target process.",
         );
         return 1;
     };

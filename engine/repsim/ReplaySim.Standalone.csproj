@@ -18,6 +18,6 @@
     <EmbeddedResource Include="maps\deployments.json" LogicalName="replay-deployments" />
     <InternalsVisibleTo Include="ReplaySim.Tests" />
     <None Update="THIRD-PARTY-NOTICES.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <None Include="maps\*.png" CopyToOutputDirectory="Always" CopyToPublishDirectory="Always" />
+    <None Include="maps\**\*.png" CopyToOutputDirectory="Always" CopyToPublishDirectory="Always" />
   </ItemGroup>
 </Project>

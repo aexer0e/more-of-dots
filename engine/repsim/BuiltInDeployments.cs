@@ -37,14 +37,23 @@ internal static class BuiltInDeployments
             _ => null,
         };
         if (!int.TryParse(text?.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int number)) return false;
-        // Special modes need their own saved layout. Never substitute the
-        // unmodified two-side roster for an avalanche or multi-color scenario.
+        // Special modes need their saved layout. A multi-color match may use
+        // the classic catalog only when that roster has the requested colors.
         string? profile = NormalizeMode(mode) switch
         {
             "" or "1v1" or "2v2" or "classic" or "experiment" or "avalanche" => RulesMode(mode),
+            "v3" or "v4" => "classic",
             _ => null,
         };
-        return profile is not null && Catalog.Value.TryGetProperty(number.ToString(CultureInfo.InvariantCulture), out var entry)
-            && entry.TryGetProperty(profile, out map);
+        if (profile is null || !Catalog.Value.TryGetProperty(number.ToString(CultureInfo.InvariantCulture), out var entry)
+            || !entry.TryGetProperty(profile, out map)) return false;
+        int requiredColors = NormalizeMode(mode) switch { "v3" => 3, "v4" => 4, _ => 0 };
+        if (requiredColors > 0 && (!map.TryGetProperty("infantry", out var infantry)
+            || infantry.GetArrayLength() != requiredColors))
+        {
+            map = default;
+            return false;
+        }
+        return true;
     }
 }

@@ -32,6 +32,8 @@ engine/repsim/bin/
 engine/repsim/obj/
 engine/tests/bin/
 engine/tests/obj/
+engine/web/bin/
+engine/web/obj/
 wod-replay-server.spec
 more-of-dots-recorder.spec
 tools/python-probe-dll/target/

@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.WebAssembly">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <DefineConstants>$(DefineConstants);BROWSER</DefineConstants>
+    <!-- The same trimming settings as the desktop engine: the reflection-based JSON
+         serialization of anonymous types must keep working. -->
+    <TrimMode>partial</TrimMode>
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
+    <NoWarn>$(NoWarn);IL2026</NoWarn>
+    <!-- Interpreted WebAssembly is many times slower than the desktop engine. -->
+    <RunAOTCompilation>true</RunAOTCompilation>
+    <WasmEnableSIMD>true</WasmEnableSIMD>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- One engine: the simulation is compiled from the desktop sources. Only the
+         SDL presentation worker and the Windows video encoder are left out. -->
+    <Compile Include="..\repsim\*.cs" Exclude="..\repsim\ReferenceRenderer.cs;..\repsim\ReferenceText.cs;..\repsim\VideoExport.cs" />
+    <EmbeddedResource Include="..\repsim\maps\deployments.json" LogicalName="replay-deployments" />
+  </ItemGroup>
+</Project>

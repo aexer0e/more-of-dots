@@ -12,11 +12,13 @@ import {
 } from "./overlays.js";
 let canvas,
   renderer,
+  base,
   onFrame = () => {},
   onStatus = () => {},
   onProgress = () => {};
-export function initializeEngine(target, callbacks) {
+export function initializeEngine(target, root, callbacks) {
   canvas = target;
+  base = root;
   renderer = new Renderer(canvas);
   onFrame = callbacks.frame;
   onStatus = callbacks.status;
@@ -228,7 +230,7 @@ async function asset(name) {
   if (!player.assets.has(name))
     player.assets.set(
       name,
-      image(`/player-assets/${name}.png`).then((img) => {
+      image(`${base}player-assets/${name}.png`).then((img) => {
         renderer.texture(name, img);
         return img;
       }),

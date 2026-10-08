@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./host.js";
 import { displayOptions } from "./overlays.js";
 import { LatestTask } from "./scheduling.js";
 
@@ -124,7 +124,9 @@ export function initializeEngine(canvas, handlers) {
     callbacks.error?.(error);
   };
   const surface = canvas.transferControlToOffscreen();
-  ready = call("init", { canvas: surface }, [surface]);
+  // The worker fetches artwork relative to where the app is served.
+  const base = new URL(import.meta.env.BASE_URL, location.href).href;
+  ready = call("init", { canvas: surface, base }, [surface]);
   // Surface startup errors even before a replay is selected.
   ready.catch((error) => callbacks.error?.(error));
   addEventListener("beforeunload", () => {

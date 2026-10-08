@@ -1,7 +1,7 @@
 import "./player.css";
-import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
+import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
+import { addFile, chooseReplay as pickReplay, gameAudio as hostAudio, invoke } from "./host.js";
 import { initializeEngine, player, loadReplay, paint } from "./client.js";
 import { displayOptions } from "./overlays.js";
 import { ReplaySound } from "./sound.js";
@@ -89,20 +89,10 @@ const launch = new URLSearchParams(location.search).get("launch");
 // A replay opened from the library starts on the loading state, never on the
 // start screen.
 showScreen(launch ? "loading" : "welcome");
-// The game's music and sound effects follow the replay. They are read from the
-// installed game, along with its saved volumes.
-const gameAudio = isTauri()
-  ? invoke("game_audio").catch(() => null)
-  : Promise.resolve(null);
-const sound = new ReplaySound(async () => {
-  const files = (await gameAudio)?.files;
-  return (
-    files &&
-    Object.fromEntries(
-      Object.entries(files).map(([name, path]) => [name, convertFileSrc(path)]),
-    )
-  );
-});
+// The game's music and sound effects follow the replay. The desktop app reads
+// them from the installed game, along with its saved volumes.
+const gameAudio = hostAudio().catch(() => null);
+const sound = new ReplaySound(async () => (await gameAudio)?.files);
 const renderer = initializeEngine(canvas, {
   frame: () => {},
   // The engine's own loading messages would flicker over the loading screen.
@@ -148,7 +138,9 @@ void gameAudio.then((game) => {
   if (game?.files) return;
   soundInstalled = false;
   $("volume").disabled = true;
-  $("volume").title = "Install War of Dots to hear its music and sounds";
+  $("volume").title = isTauri()
+    ? "Install War of Dots to hear its music and sounds"
+    : "Sound is not available";
   showVolume();
 });
 function setVolume(music, sfx, remember = true) {
@@ -437,13 +429,8 @@ async function openPath(path) {
   }
 }
 async function chooseReplay() {
-  const path = await open({
-    multiple: false,
-    filters: [
-      { name: "War of Dots replay", extensions: ["rep", "repsim", "jsonl"] },
-    ],
-  });
-  if (typeof path === "string") await openPath(path);
+  const path = await pickReplay();
+  if (path) await openPath(path);
 }
 function resize(draw = true) {
   const scale = Math.min(window.devicePixelRatio || 1, 7680 / innerWidth, 4320 / innerHeight);
@@ -735,6 +722,17 @@ if (isTauri())
     )
       void openPath(event.payload.paths[0]);
   });
+else {
+  addEventListener("dragover", (event) => event.preventDefault());
+  addEventListener("drop", async (event) => {
+    event.preventDefault();
+    const file = event.dataTransfer?.files[0];
+    if (file) void openPath(await addFile(file));
+  });
+  // A link can name the replay to play: ?replay=<url>
+  const linked = new URLSearchParams(location.search).get("replay");
+  if (linked) void openPath(linked);
+}
 // QA can inspect and render a fixed frame through the same production path.
 window.replayPlayer = {
   player,

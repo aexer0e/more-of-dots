@@ -1,0 +1,23 @@
+name: Update hosted replay player
+
+# The hosted player at aexer0e/wod-replay-player holds no source of its own. It
+# is rebuilt from this repository whenever the version changes.
+on:
+  push:
+    paths:
+      - VERSION
+
+jobs:
+  notify:
+    name: Request site build
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch to the site repository
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/aexer0e/wod-replay-player/dispatches \
+            -f event_type=more-of-dots-updated \
+            -f "client_payload[sha]=${{ github.sha }}"

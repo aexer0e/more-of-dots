@@ -25,7 +25,7 @@ self.onmessage = async ({ data }) => {
   try {
     if (data.kind === "init") {
       canvas = data.canvas;
-      renderer = initializeEngine(canvas, {
+      renderer = initializeEngine(canvas, data.base, {
         frame: (frame) =>
           postMessage({ kind: "frame", frame, epoch: activeEpoch }),
         status: (message) => postMessage({ kind: "status", message }),

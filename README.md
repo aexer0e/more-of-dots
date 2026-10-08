@@ -42,6 +42,10 @@ Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. 
 
 `npm run check` checks the existing web modules. `npm run check:native` checks the Rust library and supplies the Windows manifest needed by native dialog imports in the test executable. `npm run build` packages the More of Dots app with the independent player resources. The draft release workflow uses .NET 9 and packages one app installer; it does not fetch a game-version vault or produce a recorder installer.
 
+### Hosted player
+
+The same player and engine run in the browser at https://aexer0e.dev/wod-replay-player/. `npm run build:site` compiles the engine to WebAssembly and builds the site into `build/site`; it needs the .NET `wasm-tools` workload. The site is published from `aexer0e/wod-replay-player`, which rebuilds from this repository when `VERSION` changes. See [hosted player notes](docs/web-player.md).
+
 ## Leaderboard
 
 The Leaderboard tab replaces Region because servers are now mixed. It reads public Elo and World top-100 snapshots from `wod-nations-map.moreofdots.workers.dev`. The app reads only the username from the local game's compressed settings and highlights that player. If no saved login is available, enter an exact username once. The password is never returned to the UI or sent to the worker.

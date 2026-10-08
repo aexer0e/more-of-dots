@@ -14,6 +14,7 @@
     "check:replays": "node --test scripts/replay-filters.test.mjs",
     "check": "npm run check:version && npm run check:leaderboard && npm run check:map && npm run check:examples && npm run check:replays && npm run check:player && npm run check:web",
     "build:web": "tsc && vite build",
+    "build:site": "node scripts/build-site.mjs",
     "size:audit": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/size-audit.ps1",
     "build": "node scripts/version.mjs tauri build && npm run size:audit",
     "check:leaderboard": "node --test scripts/leaderboard.test.mjs scripts/leaderboard-chart.test.mjs scripts/leaderboard-activity.test.mjs",

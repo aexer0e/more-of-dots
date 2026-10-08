@@ -8,7 +8,9 @@ internal static class Program
 {
     private static int Main(string[] args)
     {
+#if !BROWSER
         if(args.Length>0 && args[0]=="--render-worker")return ReferenceRenderer.Run();
+#endif
         try
         {
             var options = Options.Parse(args);
@@ -22,7 +24,9 @@ internal static class Program
                 throw new ArgumentException("An input .rep file is required.");
 
             MapSurfaceImage.GameDirectories = options.GameDirectories;
+#if !BROWSER
             if (options.ExportVideo) return VideoExport.Run(options);
+#endif
             var replay = Replay.Read(options.Input);
             if (options.ExportTerrain is not null) replay.Map.Surface!.Export(options.ExportTerrain);
             var output = options.Output ?? Path.ChangeExtension(options.Input, ".repsim");
@@ -507,6 +511,8 @@ internal sealed class MapSurfaceImage
     }
 
     public static IReadOnlyList<string> GameDirectories { get; set; } = [];
+    /// The last map file that was not found, so a host can supply it and retry.
+    public static string? Unresolved { get; set; }
     internal byte[] Pixels => pixels;
 
     public static MapSurfaceImage? LoadExternal(string? replayPath, string replayDirectory)
@@ -551,6 +557,7 @@ internal sealed class MapSurfaceImage
             string bundled = Path.Combine(AppContext.BaseDirectory, "maps", fileName);
             if (File.Exists(bundled)) return bundled;
         }
+        Unresolved = normalized;
         return null;
     }
 
@@ -908,7 +915,12 @@ internal sealed class Simulator
             writer.Write(",\"render_profile\":\"wod-1.4.1-ea9225cf\",\"rendered_map_surface\":");
             WriteJsonString(writer, replay.Map.Surface!.PngBase64());
             writer.Write(",\"player_labels\":");
+#if BROWSER
+            // The page draws the names itself; there is no SDL text renderer in a browser.
+            writer.Write(JsonSerializer.Serialize(replay.PlayerLabels.Select(team => team.Select(label => new { text = label }))));
+#else
             writer.Write(JsonSerializer.Serialize(replay.PlayerLabels.Select((team, side) => team.Select(label => ReferenceText.Render(label,side,60,1.5)))));
+#endif
         }
         if (!string.IsNullOrWhiteSpace(replay.Map.MapSurface))
         {

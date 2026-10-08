@@ -75,6 +75,8 @@ export class Renderer extends NativeRenderer {
         ctx.transform(dx, dy, -dy, dx, 0, 0);
         if (draw.flipY) ctx.scale(1, -1);
         ctx.globalAlpha = draw.alpha ?? 1;
+        // The game's maps are pixel art; smoothing would blur their hard edges.
+        ctx.imageSmoothingEnabled = draw.name !== "map";
         ctx.drawImage(image, -size[0] / 2, -size[1] / 2, ...size);
         ctx.restore();
       } else {

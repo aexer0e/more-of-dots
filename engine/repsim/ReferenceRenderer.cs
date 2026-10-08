@@ -98,7 +98,7 @@ internal static class ReferenceRenderer
         public void Texture(string name,byte[] encoded)
         {
             if(textures.TryGetValue(name,out uint previous))glDeleteTextures(1,ref previous);
-            textures[name]=LoadTexture(encoded);
+            textures[name]=LoadTexture(encoded,name=="map");
         }
 
         /// Returns a buffer that the next call reuses.
@@ -174,7 +174,8 @@ internal static class ReferenceRenderer
     }
 
     private static Vec Vector(JsonElement element){var items=element.EnumerateArray().ToArray();return new(items[0].GetDouble(),items[1].GetDouble());}
-    private static uint LoadTexture(byte[] encoded)
+    // The game's maps are pixel art, so the map is sampled without smoothing.
+    private static uint LoadTexture(byte[] encoded,bool sharp=false)
     {
         var handle=GCHandle.Alloc(encoded,GCHandleType.Pinned);IntPtr source=IntPtr.Zero,converted=IntPtr.Zero;
         try {
@@ -184,7 +185,7 @@ internal static class ReferenceRenderer
             if(converted==IntPtr.Zero)throw new InvalidOperationException("Cannot convert artwork");
             var surface=Marshal.PtrToStructure<SdlSurface>(converted);var pixels=new byte[surface.W*surface.H*4];
             for(int y=0;y<surface.H;y++)Marshal.Copy(surface.Pixels+y*surface.Pitch,pixels,(surface.H-1-y)*surface.W*4,surface.W*4);
-            glGenTextures(1,out uint texture);glBindTexture(3553,texture);glTexParameteri(3553,10241,9729);glTexParameteri(3553,10240,9729);glTexParameteri(3553,10242,33071);glTexParameteri(3553,10243,33071);
+            glGenTextures(1,out uint texture);glBindTexture(3553,texture);int filter=sharp?9728:9729;glTexParameteri(3553,10241,filter);glTexParameteri(3553,10240,filter);glTexParameteri(3553,10242,33071);glTexParameteri(3553,10243,33071);
             glTexImage2D(3553,0,6408,surface.W,surface.H,0,6408,5121,pixels);return texture;
         } finally {if(converted!=IntPtr.Zero)SDL_FreeSurface(converted);if(source!=IntPtr.Zero)SDL_FreeSurface(source);handle.Free();}
     }

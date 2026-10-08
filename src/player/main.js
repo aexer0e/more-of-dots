@@ -22,6 +22,7 @@ const icons = {
   full: icon('<path d="M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5"/>'),
   volume: icon('<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4Z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>'),
   muted: icon('<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4Z"/><path d="m16 10 4.5 4.5m0-4.5L16 14.5"/>'),
+  drop: icon('<path d="M14 3.5H7A1.5 1.5 0 0 0 5.5 5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8Zm0 0V8h4.5M12 11v6m-2.5-2.5L12 17l2.5-2.5"/>'),
   open: icon('<path d="M3.5 7.5V18a1.5 1.5 0 0 0 1.5 1.5h14a1.5 1.5 0 0 0 1.5-1.5V9.5A1.5 1.5 0 0 0 19 8h-7l-2-2.5H5A1.5 1.5 0 0 0 3.5 7Z"/>'),
 };
 // Rail icons follow the order of displayOptions and their 1–8 shortcuts.
@@ -72,6 +73,7 @@ document.querySelector("#player-ui").innerHTML = `
     <button id="fullscreen" class="icon-button" aria-label="Fullscreen" title="Fullscreen (F)">${icons.full}</button>
   </section>
   <div id="toast" class="toast glass" role="status" hidden></div>
+  <div id="drop" class="drop" hidden><div>${icons.drop}<span>Drop to play</span></div></div>
 `;
 const $ = (id) => document.getElementById(id);
 const canvas = $("game");
@@ -723,9 +725,17 @@ if (isTauri())
       void openPath(event.payload.paths[0]);
   });
 else {
+  // The frame shows only while a file is over the window. Entering a child
+  // element fires dragenter before the dragleave of the one just left.
+  const carriesFile = (event) => event.dataTransfer?.types.includes("Files");
+  let dragDepth = 0;
+  const dropFrame = (depth) => ($("drop").hidden = (dragDepth = depth) <= 0);
+  addEventListener("dragenter", (event) => carriesFile(event) && dropFrame(dragDepth + 1));
+  addEventListener("dragleave", (event) => carriesFile(event) && dropFrame(dragDepth - 1));
   addEventListener("dragover", (event) => event.preventDefault());
   addEventListener("drop", async (event) => {
     event.preventDefault();
+    dropFrame(0);
     const file = event.dataTransfer?.files[0];
     if (file) void openPath(await addFile(file));
   });

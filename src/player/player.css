@@ -149,6 +149,38 @@ button:hover {
   overflow-wrap: anywhere;
   font-size: 13px;
 }
+.drop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+.drop::before {
+  content: "";
+  position: absolute;
+  inset: 16px;
+  border: 2px dashed #70a8d1;
+  border-radius: 12px;
+}
+.drop div {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 500;
+}
+.drop svg {
+  width: 36px;
+  height: 36px;
+  fill: none;
+  stroke: #70a8d1;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 [hidden] {
   display: none !important;
 }

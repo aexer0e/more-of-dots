@@ -20,6 +20,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Independent replay engine compilation failed.'
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'engine/native') -Filter '*.dll' | Copy-Item -Destination $destination -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'engine/native/NOTICES.md') -Destination $destination -Force
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'engine/native') -Filter '*LICENSE.txt' | Copy-Item -Destination $destination -Force
+# Region selection loads this probe into the running game.
+$probeProject = Join-Path $projectRoot 'tools/python-probe-dll'
+& cargo build --release --quiet --manifest-path (Join-Path $probeProject 'Cargo.toml')
+if ($LASTEXITCODE -ne 0) { throw 'Region probe compilation failed.' }
+Copy-Item -LiteralPath (Join-Path $probeProject 'target/release/wod_python_probe.dll') -Destination $destination -Force
 # The video converter draws with the same unit artwork as the player.
 $artwork = Join-Path $destination 'player-assets'
 New-Item -ItemType Directory -Force -Path $artwork | Out-Null

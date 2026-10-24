@@ -30,6 +30,7 @@ mod installed_maps;
 mod maps;
 mod export;
 mod player;
+mod region;
 mod video;
 mod storage;
 mod thumbnails;
@@ -2735,7 +2736,9 @@ pub fn run() {
             player::game_audio,
             player::player_debug_options,
             player::save_player_snapshot,
-            player::save_player_diagnostics
+            player::save_player_diagnostics,
+            region::region_status,
+            region::select_region
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

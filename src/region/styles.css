@@ -1,0 +1,313 @@
+/* Region page. Built from the shared tokens: flat surfaces, hairlines, one accent. */
+.region-host {
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  min-height: 0;
+  overflow: auto;
+}
+
+.region-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  max-width: 720px;
+  padding: var(--s-4) 0 var(--s-5);
+  width: 100%;
+}
+
+.region-page svg {
+  fill: none;
+  flex-shrink: 0;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.region-heading,
+.region-title,
+.region-heading-actions {
+  align-items: center;
+  display: flex;
+  gap: var(--s-2);
+}
+
+.region-heading {
+  justify-content: space-between;
+}
+
+.region-title svg {
+  color: var(--accent);
+  height: 18px;
+  width: 18px;
+}
+
+.region-title h1 {
+  font-size: 19px;
+  font-weight: var(--fw-bold);
+  letter-spacing: -0.025em;
+  margin: 0;
+}
+
+.region-checked {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.region-icon-button {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  width: 28px;
+}
+
+.region-icon-button svg {
+  height: 15px;
+  width: 15px;
+}
+
+.region-icon-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.region-icon-button.is-loading svg {
+  animation: region-spin 900ms linear infinite;
+}
+
+.region-status {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  display: flex;
+  gap: var(--s-3);
+  min-height: 62px;
+  padding: var(--s-3) var(--s-4);
+}
+
+.region-status-dot {
+  background: var(--faint);
+  border-radius: 50%;
+  flex: 0 0 8px;
+  height: 8px;
+  width: 8px;
+}
+
+.region-status.is-online .region-status-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 4px rgba(53, 192, 162, 0.16);
+}
+
+.region-status.is-offline .region-status-dot {
+  background: var(--muted);
+}
+
+.region-status-copy,
+.region-current {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.region-status-copy {
+  flex: 1;
+}
+
+.region-status strong {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-bold);
+}
+
+.region-status small {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.region-current {
+  border-left: 1px solid var(--line);
+  padding-left: var(--s-4);
+  text-align: right;
+}
+
+.region-current small {
+  font-size: var(--fs-xs);
+}
+
+.region-error {
+  background: var(--danger-soft);
+  border: 1px solid rgba(239, 71, 111, 0.32);
+  border-radius: var(--r-md);
+  color: #f3a7b9;
+  font-size: var(--fs-sm);
+  padding: var(--s-2) var(--s-3);
+}
+
+.region-options {
+  display: grid;
+  gap: var(--s-2);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.region-option {
+  align-items: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  justify-content: flex-start;
+  min-height: 116px;
+  padding: var(--s-3);
+  text-align: left;
+  transition: background 120ms, border-color 120ms;
+}
+
+.region-option:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--accent-line);
+}
+
+.region-option:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 1px;
+}
+
+.region-option-code {
+  background: rgba(238, 244, 240, 0.05);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.06em;
+  line-height: 1;
+  padding: 4px 6px;
+}
+
+.region-option-label {
+  color: var(--text);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-bold);
+  letter-spacing: -0.01em;
+}
+
+.region-option-server {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  margin-top: -4px;
+}
+
+.region-option-state {
+  align-items: center;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: var(--fs-sm);
+  gap: 6px;
+  margin-top: auto;
+}
+
+.region-option-state svg {
+  height: 14px;
+  width: 14px;
+}
+
+.region-option:hover:not(:disabled) .region-option-state {
+  color: var(--text);
+}
+
+.region-option.is-selected {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.region-option.is-selected .region-option-code {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.region-option.is-selected .region-option-state {
+  color: #a9cbea;
+}
+
+.region-option:disabled {
+  background: var(--surface);
+  cursor: default;
+}
+
+.region-option.is-selected:disabled {
+  background: var(--accent-soft);
+}
+
+.region-option:disabled:not(.is-selected):not(.is-applying) .region-option-label {
+  color: var(--muted);
+}
+
+.region-option:disabled:not(.is-selected):not(.is-applying) .region-option-state {
+  color: var(--faint);
+}
+
+.region-option.is-applying {
+  border-color: var(--accent-line);
+}
+
+.region-option.is-applying .region-option-state {
+  color: var(--text);
+}
+
+.region-spinner {
+  animation: region-spin 760ms linear infinite;
+  border: 2px solid var(--accent-soft);
+  border-radius: 50%;
+  border-top-color: var(--accent);
+  height: 12px;
+  width: 12px;
+}
+
+@keyframes region-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 600px) {
+  .region-options {
+    grid-template-columns: 1fr;
+  }
+
+  .region-option {
+    align-items: center;
+    flex-direction: row;
+    gap: var(--s-3);
+    min-height: 52px;
+  }
+
+  .region-option-server {
+    margin-top: 0;
+  }
+
+  .region-option-state {
+    margin: 0 0 0 auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .region-option {
+    transition: none;
+  }
+
+  .region-icon-button.is-loading svg,
+  .region-spinner {
+    animation-duration: 2400ms;
+  }
+}

@@ -31,7 +31,7 @@ tauri-plugin-updater = "2.10.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 # Media Foundation H.264 encoding for MP4 export (already a Tauri dependency).
 windows = { version = "0.61", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
 

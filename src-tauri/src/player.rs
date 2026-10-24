@@ -185,7 +185,11 @@ pub(crate) fn hidden(command: &mut Command) -> &mut Command {
 }
 // Windows owns these handles and terminates workers if the app crashes or exits.
 #[cfg(windows)]
-pub(crate) struct ProcessJob(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct ProcessJob(
+    windows_sys::Win32::Foundation::HANDLE,
+    // Children Wine refused to put in the job, stopped one by one instead.
+    std::sync::Mutex<Vec<u32>>,
+);
 #[cfg(windows)]
 unsafe impl Send for ProcessJob {}
 #[cfg(windows)]
@@ -199,7 +203,7 @@ impl ProcessJob {
             if handle.is_null() {
                 return Err(std::io::Error::last_os_error().to_string());
             }
-            let job = Self(handle);
+            let job = Self(handle, Default::default());
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             if SetInformationJobObject(
@@ -223,6 +227,14 @@ impl ProcessJob {
             ) == 0
             {
                 let error = std::io::Error::last_os_error().to_string();
+                // Wine and Proton can refuse this (the process is already in a
+                // job). The engine then runs outside the job and is stopped by id.
+                if is_wine() {
+                    if let Ok(mut loose) = self.1.lock() {
+                        loose.push(child.id());
+                    }
+                    return Ok(());
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
@@ -233,7 +245,24 @@ impl ProcessJob {
     pub(crate) fn terminate(&self) {
         unsafe {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+            use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::*};
+            for id in self.1.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default() {
+                let process = OpenProcess(PROCESS_TERMINATE, 0, id);
+                if !process.is_null() {
+                    TerminateProcess(process, 1);
+                    CloseHandle(process);
+                }
+            }
         }
+    }
+}
+/// Wine's ntdll exports `wine_get_version`; Windows' does not.
+#[cfg(windows)]
+fn is_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        !ntdll.is_null() && GetProcAddress(ntdll, b"wine_get_version\0".as_ptr()).is_some()
     }
 }
 #[cfg(windows)]

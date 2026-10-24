@@ -22,9 +22,6 @@ use tauri::{
     WindowEvent,
 };
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
 mod audio;
 mod installed_maps;
 mod maps;
@@ -52,8 +49,6 @@ const REPLAY_INDEX_VERSION: u32 = 7;
 const REPLAY_THUMBNAIL_CACHE: &str = "replay-thumbnails";
 // A listing prepared at startup is served to the window's first request.
 const WARM_LISTING_LIFETIME: Duration = Duration::from_secs(20);
-
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 
 #[derive(Default)]
@@ -1664,8 +1659,7 @@ fn open_recording_output_directory(output_path: String) -> Result<bool, String> 
         .ok_or_else(|| "Recorded video has no output folder.".to_string())?;
     let mut command = Command::new("explorer.exe");
     command.arg(directory);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
+    crate::player::hidden(&mut command);
     command
         .spawn()
         .map_err(|error| format!("Could not open {}: {error}", directory.display()))?;
@@ -2001,9 +1995,9 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>(),
     );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script])
-        .creation_flags(CREATE_NO_WINDOW)
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script]);
+    let output = crate::player::hidden(&mut command)
         .output()
         .map_err(|error| format!("Could not open the Save As dialog: {error}"))?;
     if !output.status.success() {
@@ -2033,9 +2027,9 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>(),
     );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script])
-        .creation_flags(CREATE_NO_WINDOW)
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script]);
+    let output = crate::player::hidden(&mut command)
         .output()
         .map_err(|error| format!("Could not open the folder picker: {error}"))?;
     if !output.status.success() {

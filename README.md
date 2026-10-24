@@ -36,6 +36,10 @@ Version 2.0.1 corrects historical production, retreat, movement precision and na
 
 Simulated replays are not written to disk. Disposable WebView2 caches are trimmed to 50 MB. Startup removes the simulation caches left by earlier versions. Original replay backups, map drafts and saved browser preferences are preserved.
 
+### Linux (Steam Proton / Wine)
+
+More of Dots runs under Proton or Wine. Wine has no H.264 encoder behind Media Foundation, so video export falls back to FFmpeg. It looks for `MORE_OF_DOTS_FFMPEG`, then `ffmpeg.exe` beside the app, then `PATH`, then the host's `/usr/bin`, `/usr/local/bin` and `/run/current-system/sw/bin` (drive `Z:`). The simplest setup is a Windows `ffmpeg.exe` (with libx264) placed in the app's install folder. Steam's container may hide the host's FFmpeg. Replay playback needs no extra setup. The replay-download dialogs still use PowerShell and are not supported under Wine.
+
 ### Developing the Windows player
 
 Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. The preparation script compiles the maintained source in `engine/repsim`, stages the map and unit artwork and public graphics libraries, and writes a SHA-256 manifest for the staged resources. Video encoding uses Windows Media Foundation, so no encoder is bundled. The installed app does not need the .NET SDK.

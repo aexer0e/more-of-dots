@@ -1,4 +1,4 @@
-import { invoke, exampleMode } from "./platform";
+import { invoke, exampleMode, regionSupported } from "./platform";
 import { exportBusy, openExportSetup } from "./replays/export";
 import { getVersion } from "@tauri-apps/api/app";
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
@@ -1356,7 +1356,9 @@ function renderBrowserNav(): string {
     <nav class="browser-nav" aria-label="Main navigation">
       <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
       <button class="browser-nav-button ${browserPage === "leaderboard" ? "is-active" : ""}" type="button" data-browser-page="leaderboard">Leaderboard</button>
-      <button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>
+      ${regionSupported
+        ? `<button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>`
+        : `<button class="browser-nav-button is-unavailable" type="button" aria-disabled="true" title="Region selection is only available on Windows">Region</button>`}
       <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
       <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
     </nav>
@@ -1890,7 +1892,7 @@ function bindBrowserEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const page = button.dataset.browserPage;
-      const nextPage: BrowserPage = page === "leaderboard" || page === "region" || page === "mapEditor" ? page : "replays";
+      const nextPage: BrowserPage = page === "leaderboard" || (page === "region" && regionSupported) || page === "mapEditor" ? page : "replays";
       void switchBrowserPage(nextPage);
     });
   });

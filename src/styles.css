@@ -841,6 +841,15 @@ p {
   color: var(--browser-text);
 }
 
+.browser-nav-button.is-unavailable,
+.browser-nav-button.is-unavailable:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--faint);
+  cursor: default;
+  opacity: 0.55;
+}
+
 .app-version-button {
   background: rgba(238, 244, 240, 0.05);
   border-color: transparent;

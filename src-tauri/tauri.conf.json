@@ -48,6 +48,7 @@
     "targets": "all",
     "icon": [
       "icons/icon.ico",
+      "icons/icon.icns",
       "icons/more-of-dots-icon.png"
     ],
     "windows": {

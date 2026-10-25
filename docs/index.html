@@ -200,8 +200,15 @@
       margin-top: 48px;
     }
 
+    /* An odd screenshot out sits centred under the pairs, at a pair's width. */
+    .shot-single {
+      width: calc(50% - 16px);
+      margin: 48px auto 0;
+    }
+
     @media (max-width: 640px) {
       .shot-pair { grid-template-columns: 1fr; gap: 40px; }
+      .shot-single { width: 100%; margin-top: 40px; }
     }
 
     /* ---- terrain divider ---- */
@@ -264,39 +271,6 @@
     .features p {
       color: var(--muted);
       font-size: 0.95rem;
-    }
-
-    /* ---- platform notes ---- */
-
-    .notes {
-      margin-top: 56px;
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 18px;
-      font-size: 0.9rem;
-      color: var(--muted);
-    }
-
-    .notes div {
-      border-top: 3px solid var(--line);
-      padding-top: 10px;
-    }
-
-    .notes strong {
-      display: block;
-      color: var(--text);
-    }
-
-    .notes code {
-      font-family: Consolas, "SF Mono", monospace;
-      font-size: 0.88em;
-      background: rgba(43, 38, 32, 0.07);
-      padding: 1px 5px;
-      border-radius: 4px;
-    }
-
-    @media (max-width: 640px) {
-      .notes { grid-template-columns: 1fr; }
     }
 
     /* ---- dots divider ---- */
@@ -403,8 +377,8 @@
         <li>
           <span class="dot" aria-hidden="true"></span>
           <div>
-            <strong>Every map, every mode</strong>
-            <p>Replays open on all 80 official maps in 1v1, 2v2, free-for-all and experiment mode.</p>
+            <strong>Region selection</strong>
+            <p>Choose the server region the game matches you on, while it runs. Available on Windows.</p>
           </div>
         </li>
         <li>
@@ -449,9 +423,9 @@
     <div class="shot-pair">
       <figure class="tilt-l">
         <div class="shot">
-          <img src="screenshots/map-editor.png" alt="The map editor with a river map, red and blue units, cities and bridges" width="1280" height="720" loading="lazy">
+          <img src="screenshots/region.png" alt="Region selection with War of Dots running, the Frankfurt server selected and Singapore available, each with its ping" width="1280" height="720" loading="lazy">
         </div>
-        <figcaption><span class="cap-dot blue"></span>Map editor</figcaption>
+        <figcaption><span class="cap-dot blue"></span>Region selection</figcaption>
       </figure>
       <figure class="tilt-r">
         <div class="shot">
@@ -461,18 +435,19 @@
       </figure>
     </div>
 
-    <div class="notes">
-      <div><strong>Windows</strong>Windows 10 or later. Region selection is available here only.</div>
-      <div><strong>macOS</strong>Apple silicon, macOS 11 or later. On first launch, choose Open Anyway in System Settings &gt; Privacy &amp; Security.</div>
-      <div><strong>Linux</strong>An AppImage, for War of Dots through Steam's Proton. Run <code>chmod +x</code> on the file, then open it.</div>
-    </div>
+    <figure class="shot-single tilt-l">
+      <div class="shot">
+        <img src="screenshots/map-editor.png" alt="The map editor with a river map, red and blue units, cities and bridges" width="1280" height="720" loading="lazy">
+      </div>
+      <figcaption><span class="cap-dot blue"></span>Map editor</figcaption>
+    </figure>
 
     <div class="dots" aria-hidden="true">
       <span></span><span></span><span></span><span></span><span></span><span></span>
     </div>
 
     <footer>
-      <span>Made by <a href="https://github.com/aexer0e">Eeb</a></span>
+      <span>Made by <a href="https://github.com/aexer0e">aexer0e</a></span>
       <span>Not affiliated with War of Dots</span>
     </footer>
   </div>

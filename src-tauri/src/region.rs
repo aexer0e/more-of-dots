@@ -1,7 +1,8 @@
 //! Region selection for a running War of Dots. A small probe DLL is loaded into
 //! the game and runs `region_payload.py` in its Python interpreter, which makes
 //! the game prefer the chosen region's server when it queues.
-use super::{app_runtime_dir, steam_game_dir};
+use super::app_runtime_dir;
+use crate::game::configured_game_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -88,10 +89,10 @@ fn is_game_executable(path: &Path) -> bool {
     let in_game_dir = path.parent().is_some_and(|dir| {
         dir.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(super::GAME_DIR_NAME))
+            .is_some_and(|name| name.eq_ignore_ascii_case(crate::game::GAME_DIR_NAME))
             || dir
                 .to_string_lossy()
-                .eq_ignore_ascii_case(&steam_game_dir().to_string_lossy())
+                .eq_ignore_ascii_case(&configured_game_dir().to_string_lossy())
     });
     named_game && in_game_dir
 }

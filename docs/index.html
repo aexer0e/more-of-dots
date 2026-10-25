@@ -4,11 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>More of Dots</title>
-  <meta name="description" content="A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.">
+  <meta name="description" content="A free app for War of Dots on Windows, macOS and Linux. Watch and export replays, follow the leaderboards, and build custom maps.">
   <link rel="icon" type="image/png" href="icon.png">
   <meta property="og:title" content="More of Dots">
-  <meta property="og:description" content="A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.">
-  <meta property="og:image" content="screenshots/replays.png">
+  <meta property="og:description" content="A free app for War of Dots on Windows, macOS and Linux. Watch and export replays, follow the leaderboards, and build custom maps.">
+  <meta property="og:image" content="screenshots/player.png">
   <style>
     :root {
       --bg: #f7f3e8;
@@ -115,6 +115,28 @@
     }
 
     .btn.primary:hover { background: var(--green-dark); }
+
+    /* The other platforms, on one line under the main button. */
+    .also {
+      margin-top: 16px;
+      font-size: 0.95rem;
+      color: var(--muted);
+      display: flex;
+      gap: 6px 18px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .also a {
+      color: var(--text);
+      font-weight: 600;
+      text-decoration-thickness: 2px;
+      text-underline-offset: 3px;
+    }
+
+    html[data-platform="windows"] .also [data-download="windows"],
+    html[data-platform="macos"] .also [data-download="macos"],
+    html[data-platform="linux"] .also [data-download="linux"] { display: none; }
 
     .fine-print {
       margin-top: 14px;
@@ -244,6 +266,39 @@
       font-size: 0.95rem;
     }
 
+    /* ---- platform notes ---- */
+
+    .notes {
+      margin-top: 56px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    .notes div {
+      border-top: 3px solid var(--line);
+      padding-top: 10px;
+    }
+
+    .notes strong {
+      display: block;
+      color: var(--text);
+    }
+
+    .notes code {
+      font-family: Consolas, "SF Mono", monospace;
+      font-size: 0.88em;
+      background: rgba(43, 38, 32, 0.07);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+
+    @media (max-width: 640px) {
+      .notes { grid-template-columns: 1fr; }
+    }
+
     /* ---- dots divider ---- */
 
     .dots {
@@ -295,18 +350,25 @@
       <path d="M3 8 C 20 2, 36 10, 52 6 S 84 2, 100 7 S 132 10, 148 5 S 178 3, 187 7"
             fill="none" stroke="#5c8a3c" stroke-width="4" stroke-linecap="round"/>
     </svg>
-    <p class="tagline">A free Windows app for War of Dots. Browse and record replays, track your rankings, and create custom maps.</p>
+    <p class="tagline">A free app for War of Dots on Windows, macOS and Linux. Watch and export replays, follow the leaderboards, and build custom maps.</p>
     <div class="buttons">
-      <a class="btn primary" id="download-btn" href="https://github.com/aexer0e/more-of-dots/releases/download/v1.3.4/More.of.Dots_1.3.4_x64-setup.exe">Download for Windows</a>
-      <a class="btn" href="https://github.com/aexer0e/more-of-dots">Source on GitHub</a>
+      <a class="btn primary" data-download="current" href="https://github.com/aexer0e/more-of-dots/releases/latest">Download for <span data-platform-name>Windows</span></a>
+      <a class="btn" href="https://aexer0e.dev/wod-replay-player/">Watch replays in your browser</a>
     </div>
-    <p class="fine-print" id="fine-print">Free · Open source · Windows installer · v1.3.4</p>
+    <p class="also">
+      <span>Also for</span>
+      <a data-download="windows" href="https://github.com/aexer0e/more-of-dots/releases/latest">Windows</a>
+      <a data-download="macos" href="https://github.com/aexer0e/more-of-dots/releases/latest">macOS</a>
+      <a data-download="linux" href="https://github.com/aexer0e/more-of-dots/releases/latest">Linux</a>
+      <a href="https://github.com/aexer0e/more-of-dots">Source on GitHub</a>
+    </p>
+    <p class="fine-print">Free · Open source · <span data-version>v2.1.0</span></p>
 
     <figure class="shot-hero tilt-l">
       <div class="shot">
-        <img src="screenshots/replays.png" alt="The replay browser showing a grid of War of Dots replays with map thumbnails, player names and winners" width="1280" height="720">
+        <img src="screenshots/player.png" alt="The replay player showing a 2v2 match on Zolamare 51, with front lines, units, player names, casualty and troop counts, and the playback bar" width="1280" height="720">
       </div>
-      <figcaption><span class="cap-dot blue"></span>Replay browser</figcaption>
+      <figcaption><span class="cap-dot blue"></span>Replay player, 2v2 on Zolamare 51</figcaption>
     </figure>
   </div>
 
@@ -327,15 +389,29 @@
         <li>
           <span class="dot" aria-hidden="true"></span>
           <div>
-            <strong>Replay browser</strong>
-            <p>Search by player, filter matches, and preview the latest maps. Replays are backed up automatically.</p>
+            <strong>Replay player</strong>
+            <p>Open any replay in its own window. Seek, change speed and toggle layers, with the game's own music and sounds.</p>
           </div>
         </li>
         <li>
           <span class="dot" aria-hidden="true"></span>
           <div>
-            <strong>Replay recording</strong>
-            <p>Export replays as videos, including older compatible replays. Install or update the recorder from the export dialog.</p>
+            <strong>Video export</strong>
+            <p>Turn replays into MP4 videos with sound, up to 1080p and much faster than real time.</p>
+          </div>
+        </li>
+        <li>
+          <span class="dot" aria-hidden="true"></span>
+          <div>
+            <strong>Every map, every mode</strong>
+            <p>Replays open on all 80 official maps in 1v1, 2v2, free-for-all and experiment mode.</p>
+          </div>
+        </li>
+        <li>
+          <span class="dot" aria-hidden="true"></span>
+          <div>
+            <strong>Replay browser</strong>
+            <p>Search by player, filter by mode and map, and keep a backup of every replay.</p>
           </div>
         </li>
         <li>
@@ -358,16 +434,37 @@
     <div class="shot-pair">
       <figure class="tilt-r">
         <div class="shot">
-          <img src="screenshots/map-editor.png" alt="The map editor with terrain painting tools and red and blue units placed on a custom map" width="1280" height="720" loading="lazy">
+          <img src="screenshots/replays.png" alt="The replay browser showing a grid of War of Dots replays with map names, modes, durations, player names and winners" width="1280" height="720" loading="lazy">
         </div>
-        <figcaption><span class="cap-dot red"></span>Map editor</figcaption>
+        <figcaption><span class="cap-dot red"></span>Replay browser</figcaption>
       </figure>
       <figure class="tilt-l">
         <div class="shot">
-          <img src="screenshots/leaderboard.png" alt="Global rankings with your player highlighted and a chart comparing player progress" width="1280" height="720" loading="lazy">
+          <img src="screenshots/export.png" alt="The video export dialog with the export folder, playback speed, bitrate, resolution, music and sound effect volumes, and layer choices" width="1280" height="720" loading="lazy">
         </div>
-        <figcaption><span class="cap-dot blue"></span>Leaderboards</figcaption>
+        <figcaption><span class="cap-dot blue"></span>Video export</figcaption>
       </figure>
+    </div>
+
+    <div class="shot-pair">
+      <figure class="tilt-l">
+        <div class="shot">
+          <img src="screenshots/map-editor.png" alt="The map editor with a river map, red and blue units, cities and bridges" width="1280" height="720" loading="lazy">
+        </div>
+        <figcaption><span class="cap-dot blue"></span>Map editor</figcaption>
+      </figure>
+      <figure class="tilt-r">
+        <div class="shot">
+          <img src="screenshots/leaderboard.png" alt="Global Elo rankings with your player highlighted and a chart comparing three players' progress" width="1280" height="720" loading="lazy">
+        </div>
+        <figcaption><span class="cap-dot red"></span>Leaderboards</figcaption>
+      </figure>
+    </div>
+
+    <div class="notes">
+      <div><strong>Windows</strong>Windows 10 or later. Region selection is available here only.</div>
+      <div><strong>macOS</strong>Apple silicon, macOS 11 or later. On first launch, choose Open Anyway in System Settings &gt; Privacy &amp; Security.</div>
+      <div><strong>Linux</strong>An AppImage, for War of Dots through Steam's Proton. Run <code>chmod +x</code> on the file, then open it.</div>
     </div>
 
     <div class="dots" aria-hidden="true">
@@ -381,20 +478,30 @@
   </div>
 
   <script>
-    // Point the download button at the newest installer; the hardcoded
-    // v1.3.4 app link stays as the fallback if this fails or JS is off.
-    fetch("https://api.github.com/repos/aexer0e/more-of-dots/releases/latest")
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((release) => {
-        const exe = (release.assets || []).find((a) => /^More\.of\.Dots_\d+\.\d+\.\d+_x64-setup\.exe$/.test(a.name));
-        if (!exe) return;
-        document.getElementById("download-btn").href = exe.browser_download_url;
-        if (release.tag_name) {
-          document.getElementById("fine-print").textContent =
-            "Free · Open source · Windows installer · " + release.tag_name;
-        }
-      })
-      .catch(() => {});
+    // Points each download link at the newest release's installer for its platform
+    // and names the visitor's platform on the main button. Without the API, the
+    // links keep pointing at the latest release page.
+    (function () {
+      var patterns = { windows: /_x64-setup\.exe$/, macos: /_aarch64\.dmg$/, linux: /_amd64\.AppImage$/ };
+      var name = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent;
+      var platform = /win/i.test(name) ? "windows" : /mac/i.test(name) ? "macos" : /linux|x11|cros/i.test(name) ? "linux" : "windows";
+      document.documentElement.dataset.platform = platform;
+      document.querySelector("[data-platform-name]").textContent = { windows: "Windows", macos: "macOS", linux: "Linux" }[platform];
+      document.querySelector("[data-download='current']").dataset.download = platform;
+
+      fetch("https://api.github.com/repos/aexer0e/more-of-dots/releases/latest")
+        .then(function (response) { return response.ok ? response.json() : Promise.reject(); })
+        .then(function (release) {
+          var assets = release.assets || [];
+          document.querySelectorAll("[data-download]").forEach(function (link) {
+            var pattern = patterns[link.dataset.download];
+            var asset = pattern && assets.find(function (item) { return pattern.test(item.name); });
+            if (asset) link.href = asset.browser_download_url;
+          });
+          if (release.tag_name) document.querySelector("[data-version]").textContent = release.tag_name;
+        })
+        .catch(function () {});
+    })();
   </script>
 </body>
 </html>

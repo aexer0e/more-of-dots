@@ -21,6 +21,12 @@
       "port": 4174
     },
     {
+      "name": "landing",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "4175", "--bind", "127.0.0.1", "--directory", "docs"],
+      "port": 4175
+    },
+    {
       "name": "site-pages",
       "runtimeExecutable": "npx",
       "runtimeArgs": ["--prefix", "share", "wrangler", "dev", "--config", "share/wrangler.jsonc", "--port", "8787", "--var", "SITE_ORIGIN:http://127.0.0.1:4174"],

@@ -44,6 +44,9 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
     case 'leaderboard_identity': result = data.identity; break;
     case 'list_replays': result = { replays: stressReplays(data.replays.slice(0, 100)) }; break;
     case 'replay_thumbnail_paths': result = []; break;
+    // The export dialog asks for a default folder and the game's sounds; examples never write videos.
+    case 'recording_default_directory': result = 'C:\\Users\\Player\\Videos'; break;
+    case 'game_audio': result = { files: {}, music: 0.3, sfx: 0.3 }; break;
     case 'list_maps': result = data.maps; break;
     case 'read_map': result = data.maps.find((m) => m.id === args.fileName); break;
     case 'save_map': {

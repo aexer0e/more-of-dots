@@ -1456,7 +1456,7 @@ fn recording_default_directory(app: AppHandle) -> Result<PathBuf, String> {
     let videos_dir = app
         .path()
         .video_dir()
-        .map_err(|error| format!("Windows Videos folder is unavailable: {error}"))?;
+        .map_err(|error| format!("The Videos folder is unavailable: {error}"))?;
     fs::create_dir_all(&videos_dir)
         .map_err(|error| format!("Could not prepare {}: {error}", videos_dir.display()))?;
     Ok(videos_dir)

@@ -381,6 +381,8 @@ mod tests {
         assert!(normalize_region("OCE").is_err());
     }
 
+    // Region selection runs only on Windows, where these paths parse.
+    #[cfg(windows)]
     #[test]
     fn only_the_war_of_dots_executable_counts() {
         assert!(is_game_executable(Path::new(

@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 2.0.2 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v2.0.2/More.of.Dots_2.0.2_x64-setup.exe)
+[Download the latest More of Dots](https://github.com/aexer0e/more-of-dots/releases/latest): the `-setup.exe` installer for Windows, the `.dmg` for macOS on Apple silicon, or the `.AppImage` for Linux.
 
 Version 2.0.0 includes an independent replay player and video exporter in the desktop app.
 

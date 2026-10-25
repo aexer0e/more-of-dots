@@ -4,7 +4,7 @@ More of Dots for macOS has not been tested on a Mac by its developer. Before a r
 
 ## Install
 
-1. Open the `.dmg` from the draft release and drag More of Dots to Applications.
+1. Open the `.dmg` from the draft release, or from the `more-of-dots-macOS` artifact of a pull request's Build run, and drag More of Dots to Applications.
 2. Open the app. macOS blocks it the first time because it is not notarized. Open **System Settings > Privacy & Security**, choose **Open Anyway** for More of Dots, and confirm.
 3. If macOS reports that the app is damaged, run this in Terminal and open it again:
 

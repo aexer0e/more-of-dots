@@ -1,0 +1,84 @@
+name: Build
+
+# Builds and tests the app on every platform it ships for, so a change that
+# only breaks the macOS build is caught before release. The macOS app is kept
+# as an artifact for testing on a Mac.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            bundles: nsis
+          # Apple silicon only; macos-latest runs on it.
+          - name: macOS
+            runner: macos-latest
+            bundles: app,dmg
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # OpenH264's x86 assembly; Apple silicon builds use its Arm code instead.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Check web modules
+        run: npm run check
+
+      - name: Stage the replay engine
+        run: npm run prepare:player
+
+      - name: Test the engine
+        run: npm run check:engine
+
+      - name: Test the Rust library
+        run: npm run check:native
+
+      - name: Build the app
+        run: node scripts/version.mjs tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Keep the installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: more-of-dots-${{ runner.os }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/dmg/*.dmg

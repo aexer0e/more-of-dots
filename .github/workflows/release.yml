@@ -1,4 +1,4 @@
-name: Draft Windows release
+name: Draft release
 
 on:
   push:
@@ -15,11 +15,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build and draft
+  draft:
+    name: Draft release
     if: github.ref_name == github.event.repository.default_branch
-    runs-on: windows-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release-id: ${{ steps.draft.outputs.result }}
 
     steps:
       - name: Check out repository and tags
@@ -28,8 +30,56 @@ jobs:
           fetch-depth: 0
 
       - name: Validate release version
-        shell: pwsh
         run: node scripts/version.mjs release-check
+
+      # Both platform builds upload to this one draft.
+      - name: Create or reuse the draft
+        id: draft
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const fs = require("node:fs");
+            const version = fs.readFileSync("VERSION", "utf8").trim();
+            const tag = `v${version}`;
+            const body = fs.readFileSync(`docs/releases/${version}.md`, "utf8");
+            const releases = await github.paginate(github.rest.repos.listReleases, context.repo);
+            const existing = releases.find((release) => release.tag_name === tag);
+            if (existing) {
+              if (!existing.draft) throw new Error(`${tag} is already published.`);
+              return String(existing.id);
+            }
+            const { data } = await github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: `More of Dots ${tag}`,
+              body,
+              draft: true,
+              prerelease: false,
+            });
+            return String(data.id);
+
+  build:
+    name: Build for ${{ matrix.name }}
+    needs: draft
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            bundles: nsis
+          # Apple silicon only; macos-latest runs on it.
+          - name: macOS
+            runner: macos-latest
+            bundles: app,dmg
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Set up .NET 9
         uses: actions/setup-dotnet@v4
@@ -43,38 +93,30 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      # OpenH264's x86 assembly; Apple silicon builds use its Arm code instead.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
       - name: Install JavaScript dependencies
         run: npm ci
 
       - name: Prepare signed release configuration
         run: npm run version:release-config
 
-      - name: Read release notes
-        id: notes
-        shell: pwsh
-        run: |
-          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
-          $notes = Get-Content -LiteralPath "docs/releases/$version.md" -Raw -ErrorAction Stop
-          $delimiter = [guid]::NewGuid().ToString()
-          "body<<$delimiter" >> $env:GITHUB_OUTPUT
-          $notes >> $env:GITHUB_OUTPUT
-          $delimiter >> $env:GITHUB_OUTPUT
-
-      - name: Build and upload draft release
+      - name: Build and upload to the draft
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: v__VERSION__
-          releaseName: More of Dots v__VERSION__
-          releaseBody: ${{ steps.notes.outputs.body }}
-          generateReleaseNotes: false
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.draft.outputs.release-id }}
           retryAttempts: 2
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
-          args: --bundles nsis --config build/tauri.version.conf.json
+          args: --bundles ${{ matrix.bundles }} --config build/tauri.version.conf.json

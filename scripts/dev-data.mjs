@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import { gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -75,8 +76,20 @@ async function getJson(url) {
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
+// Steam's default library on each platform, as the desktop app looks for it.
+function defaultGameDir() {
+  if (process.platform === 'win32') return 'C:\\Program Files (x86)\\Steam\\steamapps\\common\\War of Dots';
+  const steam = process.platform === 'darwin' ? 'Library/Application Support/Steam' : '.local/share/Steam';
+  return path.join(os.homedir(), steam, 'steamapps', 'common', 'War of Dots');
+}
+// The app's data folder, where it keeps the replay backups.
+function appDataDir() {
+  if (process.platform === 'win32') return process.env.APPDATA ? path.join(process.env.APPDATA, 'local.more-of-dots') : null;
+  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'local.more-of-dots');
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'local.more-of-dots');
+}
 export async function seedExamples() {
-  const game = process.env.WOD_GAME_DIR || 'C:\\Program Files (x86)\\Steam\\steamapps\\common\\War of Dots';
+  const game = process.env.WOD_GAME_DIR || defaultGameDir();
   await fs.mkdir(path.join(dataDir, 'replays'), { recursive: true });
   await fs.mkdir(path.join(dataDir, 'maps'), { recursive: true });
   await fs.mkdir(path.join(dataDir, 'images'), { recursive: true });
@@ -106,7 +119,7 @@ export async function seedExamples() {
     return null;
   };
   const replays = [], maps = [];
-  const backup = process.env.WOD_REPLAY_BACKUP_DIR || (process.env.APPDATA ? path.join(process.env.APPDATA, 'local.more-of-dots', 'replay-backups') : null);
+  const backup = process.env.WOD_REPLAY_BACKUP_DIR || (appDataDir() ? path.join(appDataDir(), 'replay-backups') : null);
   const files = await exampleReplayFiles(path.join(game, 'replays'), backup);
   const copiedNames = new Set(files.map((file) => file.name));
   for (const name of await fs.readdir(path.join(dataDir, 'replays'))) {

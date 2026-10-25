@@ -45,12 +45,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "nsis",
-      "msi"
-    ],
+    "targets": ["nsis", "app", "dmg", "appimage"],
     "icon": [
       "icons/icon.ico",
+      "icons/icon.icns",
       "icons/more-of-dots-icon.png"
     ],
     "windows": {
@@ -58,6 +56,10 @@
         "installMode": "currentUser",
         "displayLanguageSelector": false
       }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
     },
     "resources": [
       "resources/player/**/*"

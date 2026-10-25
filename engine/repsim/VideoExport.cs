@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -22,52 +23,92 @@ internal static class VideoExport
         var mapSize = staticRecord.GetProperty("static_core").GetProperty("map_size");
         double worldWidth = mapSize[0].GetDouble(), worldHeight = mapSize[1].GetDouble();
 
-        using var surface = new ReferenceRenderer.Surface(options.Width, options.Height);
         string assets = options.AssetsDirectory ?? Path.Combine(AppContext.BaseDirectory, "player-assets");
-        foreach (string file in Directory.EnumerateFiles(assets, "*.png"))
-            surface.Texture(Path.GetFileNameWithoutExtension(file), File.ReadAllBytes(file));
+        var artwork = Directory.EnumerateFiles(assets, "*.png")
+            .Select(file => (name: Path.GetFileNameWithoutExtension(file), bytes: File.ReadAllBytes(file))).ToList();
         string surfaceData = staticRecord.TryGetProperty("rendered_map_surface", out var rendered)
             ? rendered.GetString()!
             : staticRecord.GetProperty("source_map_surface").GetString()!;
-        surface.Texture("map", MapTexture(surfaceData, (int)worldWidth, (int)worldHeight));
+        artwork.Add(("map", MapTexture(surfaceData, (int)worldWidth, (int)worldHeight)));
         var labels = new List<FrameDraws.Label>();
         if (staticRecord.TryGetProperty("player_labels", out var teams))
             foreach (var (team, side) in teams.EnumerateArray().Select((team, side) => (team, side)))
                 foreach (var (label, slot) in team.EnumerateArray().Select((label, slot) => (label, slot)))
                 {
                     string key = $"player-{side}-{slot}";
-                    surface.Texture(key, Convert.FromBase64String(label.GetProperty("image").GetString()!));
+                    artwork.Add((key, Convert.FromBase64String(label.GetProperty("image").GetString()!)));
                     var size = label.GetProperty("size");
                     // One line per player, teams in order.
                     labels.Add(new FrameDraws.Label(key, size[0].GetDouble(), size[1].GetDouble(), labels.Count));
                 }
+        // Frames are simulated in order and drawn on several surfaces at once, then written in order.
+        using var surfaces = new BlockingCollection<ReferenceRenderer.Surface>();
+        for (int i = 0; i < options.RenderThreads; i++)
+        {
+            var surface = new ReferenceRenderer.Surface(options.Width, options.Height);
+            foreach (var (name, bytes) in artwork) surface.Texture(name, bytes);
+            surfaces.Add(surface);
+        }
+        var pending = new Queue<Task<byte[]>>();
 
         var draws = new FrameDraws(options.Width, options.Height, worldWidth, worldHeight, options.Layers, labels);
         int step = options.Step, end = Math.Min(replay.EndTick, options.MaxFrame ?? replay.EndTick);
         int total = end / step + 1, written = 0;
         var stateText = new StringWriter(new StringBuilder(1 << 16));
         using var output = Console.OpenStandardOutput();
+        int frameBytes = options.Width * options.Height * 3;
+        void Write(int keep)
+        {
+            while (pending.Count > keep)
+            {
+                byte[] frame = pending.Dequeue().GetAwaiter().GetResult();
+                output.Write(frame, 0, frameBytes);
+                ArrayPool<byte>.Shared.Return(frame);
+                if (++written % 15 == 0 || written == total) Console.Error.WriteLine($"progress {written} {total}");
+            }
+        }
         Console.Error.WriteLine($"progress 0 {total}");
         // Sound cues for every simulated tick ("sound frame fighting producedSides"),
         // then the replay result, which picks the end sound.
         var cues = new StringBuilder();
-        simulator.Run(options, frame =>
+        try
         {
-            cues.Append("sound ").Append(frame).Append(' ').Append(simulator.FightCount).Append(' ').Append(simulator.TakeProducedSides()).Append('\n');
-            if (frame % step != 0) return;
-            Console.Error.Write(cues.ToString());
-            cues.Clear();
-            stateText.GetStringBuilder().Clear();
-            simulator.WriteState(stateText, frame);
-            using var state = JsonDocument.Parse(stateText.GetStringBuilder().ToString());
-            // The parsed request reads the builder's buffer, so render before the next Build.
-            var bytes = draws.Build(state.RootElement);
-            if (options.DumpDraws is not null)
-                File.AppendAllText(options.DumpDraws, Encoding.UTF8.GetString(bytes.Span) + "\n");
-            using var request = JsonDocument.Parse(bytes);
-            output.Write(surface.Render(request.RootElement));
-            if (++written % 15 == 0 || written == total) Console.Error.WriteLine($"progress {written} {total}");
-        });
+            simulator.Run(options, frame =>
+            {
+                cues.Append("sound ").Append(frame).Append(' ').Append(simulator.FightCount).Append(' ').Append(simulator.TakeProducedSides()).Append('\n');
+                if (frame % step != 0) return;
+                Console.Error.Write(cues.ToString());
+                cues.Clear();
+                stateText.GetStringBuilder().Clear();
+                simulator.WriteState(stateText, frame);
+                using var state = JsonDocument.Parse(stateText.GetStringBuilder().ToString());
+                // The draw list reuses one buffer, so each frame keeps its own copy.
+                byte[] request = draws.Build(state.RootElement).ToArray();
+                if (options.DumpDraws is not null)
+                    File.AppendAllText(options.DumpDraws, Encoding.UTF8.GetString(request) + "\n");
+                pending.Enqueue(Task.Run(() =>
+                {
+                    var surface = surfaces.Take();
+                    try
+                    {
+                        using var document = JsonDocument.Parse(request);
+                        byte[] frame = ArrayPool<byte>.Shared.Rent(frameBytes);
+                        surface.Render(document.RootElement).AsSpan(0, frameBytes).CopyTo(frame);
+                        return frame;
+                    }
+                    finally { surfaces.Add(surface); }
+                }));
+                // Two frames per surface keep every surface busy while the oldest frame is written.
+                Write(options.RenderThreads * 2);
+            });
+            Write(0);
+        }
+        finally
+        {
+            foreach (var task in pending) try { task.Wait(); } catch { }
+            surfaces.CompleteAdding();
+            foreach (var surface in surfaces) surface.Dispose();
+        }
         Console.Error.Write(cues.ToString());
         Console.Error.WriteLine(replay.Result is double result ? $"result {result.ToString(CultureInfo.InvariantCulture)}" : "result none");
         output.Flush();

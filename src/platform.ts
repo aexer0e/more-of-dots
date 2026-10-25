@@ -5,3 +5,5 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
   if (exampleMode) return (await import('./dev/examples')).exampleInvoke<T>(command, args);
   return nativeInvoke<T>(command, args);
 }
+// Region selection loads a helper into the running game, which only works on Windows.
+export const regionSupported = /Windows/i.test(navigator.userAgent);

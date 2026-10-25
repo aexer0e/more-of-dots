@@ -1,6 +1,6 @@
 # More of Dots
 
-[Download More of Dots 2.0.2 for Windows (NSIS installer)](https://github.com/aexer0e/more-of-dots/releases/download/v2.0.2/More.of.Dots_2.0.2_x64-setup.exe)
+[Download the latest More of Dots](https://github.com/aexer0e/more-of-dots/releases/latest): the `-setup.exe` installer for Windows, the `.dmg` for macOS on Apple silicon, or the `.AppImage` for Linux.
 
 Version 2.0.0 includes an independent replay player and video exporter in the desktop app.
 
@@ -9,6 +9,8 @@ Version 2.0.0 includes an independent replay player and video exporter in the de
 - Back up discovered replays automatically
 - Follow global leaderboards, track your progress, and compare players
 - Create and edit custom maps, including motorised infantry
+
+More of Dots runs on Windows and on macOS with Apple silicon. A Linux AppImage is also built, for playing the game through Steam's Proton; it is less tested. Region selection is available on Windows only; elsewhere its tab is shown but cannot be opened.
 
 ## Custom maps
 
@@ -26,21 +28,29 @@ Hover a replay card to replace its played time and date with a Play pill. Player
 
 Replays sound like the game: its match music, the fighting loop that swells with the number of units in combat, the unit-produced sound and the victory or defeat sound at the end. The speaker button in the pill has **Music** and **SFX** sliders; they start at the volumes saved in the game's settings. Playback speed changes when effects are triggered, while music and effects keep their normal pitch and duration. Seeking resets the audio to the selected replay position. The sounds are read from the installed game (Steam), so the app bundles no audio; without War of Dots installed, replays and videos are silent.
 
-To export videos, select replays and choose **Record**. Pick the export folder, playback speed (1–30×), bitrate, resolution (480p, 720p or 1080p), how many videos to convert at once, which layers to show, and the music and SFX volumes. Videos are converted in the background, without opening a player, much faster than real time: about 120–150 frames per second at 1080p, so a 10-minute game at 1× takes roughly two minutes, and less at higher speeds. A floating panel shows progress; **Stop** cancels unfinished videos and removes their partial files. Videos are H.264 MP4 with the game's sounds as AAC audio (set both volumes to 0 for a silent video), encoded by Windows Media Foundation. With audio, the last frame stays on screen for two seconds while the end sound plays.
+To export videos, select replays and choose **Record**. Pick the export folder, playback speed (1–30×), bitrate, resolution (480p, 720p or 1080p), how many videos to convert at once, which layers to show, and the music and SFX volumes. Videos are converted in the background, without opening a player, much faster than real time: about 120–150 frames per second at 1080p, so a 10-minute game at 1× takes roughly two minutes, and less at higher speeds. A floating panel shows progress; **Stop** cancels unfinished videos and removes their partial files. Videos are H.264 MP4 with the game's sounds as AAC audio (set both volumes to 0 for a silent video), encoded by OpenH264 and FDK AAC inside the app, so every platform encodes the same way. The bitrate is an upper limit; simple scenes use less. With audio, the last frame stays on screen for two seconds while the end sound plays.
 
-Its internal C# engine simulates replays for playback and renders video exports with the same drawing rules as the player. Playback draws decoded map and unit images in a worker-owned canvas, with frame parsing and read-ahead outside the UI thread. No game executable is launched or loaded. Each player window has its own renderer and keeps its replay's frames in memory, in independently compressed chunks of 60 frames, so seeking decompresses only the chunk it needs. See [replay frame chunks](docs/replay-frames.md).
+Its internal C# engine simulates replays for playback and renders video exports with the same drawing rules as the player, drawing frames with Skia on the CPU on several cores. Playback draws decoded map and unit images in a worker-owned canvas, with frame parsing and read-ahead outside the UI thread. No game executable is launched or loaded. Each player window has its own renderer and keeps its replay's frames in memory, in independently compressed chunks of 60 frames, so seeking decompresses only the chunk it needs. See [replay frame chunks](docs/replay-frames.md).
 
 The fast preview uses browser text and antialiasing, which can look slightly different from the maintained native renderer. Video exports and reference snapshots use the native drawing path. Simulation states are shared by both.
 
-Version 2.0.1 corrects historical production, retreat, movement precision and naval damage. Validation compared all simulation states for 741 complete replays against 16 original game builds, with exact matches. One further recording crashes both matching original builds on an order for a nonexistent unit, so its full playback remains unverified. This validates the tested collection; older and unfamiliar versions still receive a playback attempt. Orders for units that have not appeared are deferred instead of stopping playback or recording. Number-only replays use a bundled deployment catalog covering 49 classic, 38 experimental and six avalanche layouts, including matching three- and four-colour rosters. Other map/mode combinations still need a matching starting layout; an available terrain image alone does not specify unit IDs. See [integration notes](docs/replay-player-integration.md) for the player architecture and [2.0.1 release notes](docs/releases/2.0.1.md) for this update.
+Version 2.0.1 corrects historical production, retreat, movement precision and naval damage. Validation compared all simulation states for 741 complete replays against 16 original game builds, with exact matches. One further recording crashes both matching original builds on an order for a nonexistent unit, so its full playback remains unverified. This validates the tested collection; older and unfamiliar versions still receive a playback attempt. Orders for units that have not appeared are deferred instead of stopping playback or recording. Number-only replays use a bundled catalog of starting layouts for all 80 official maps the game ships (57 two-colour, 9 three-colour and 14 four-colour), read from the game's own map table, plus seven avalanche layouts. Every map plays in every match format: 1v1, 2v2 and free-for-all use the map's layout, and experimental matches turn some of its infantry into motorised units, as the game does. A map added by a later game update takes its layout from any of the player's replays that records it, such as an experiment-mode replay. See [integration notes](docs/replay-player-integration.md) for the player architecture and [2.0.1 release notes](docs/releases/2.0.1.md) for this update.
 
-Simulated replays are not written to disk. Disposable WebView2 caches are trimmed to 50 MB. Startup removes the simulation caches left by earlier versions. Original replay backups, map drafts and saved browser preferences are preserved.
+Simulated replays are not written to disk. On Windows, disposable WebView2 caches are trimmed to 50 MB. Startup removes the simulation caches left by earlier versions. Original replay backups, map drafts and saved browser preferences are preserved.
 
-### Developing the Windows player
+### Developing the desktop app
 
-Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. The preparation script compiles the maintained source in `engine/repsim`, stages the map and unit artwork and public graphics libraries, and writes a SHA-256 manifest for the staged resources. Video encoding uses Windows Media Foundation, so no encoder is bundled. The installed app does not need the .NET SDK.
+Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. On Windows and Linux also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. The build scripts find it on `PATH` or in its installer's default folder (`C:\Program Files\NASM`); set `NASM` to its path if it is elsewhere. Apple silicon builds need no extra tools.
 
-`npm run check` checks the existing web modules. `npm run check:native` checks the Rust library and supplies the Windows manifest needed by native dialog imports in the test executable. `npm run build` packages the More of Dots app with the independent player resources. The draft release workflow uses .NET 9 and packages one app installer; it does not fetch a game-version vault or produce a recorder installer.
+`npm run prepare:player` (run by `dev:desktop` and `build`) publishes the engine in `engine/repsim` for the current platform, stages the unit artwork and third-party notices, and writes a SHA-256 manifest for the staged resources. On Windows it also builds the Region probe. The installed app does not need the .NET SDK.
+
+`npm run check` checks the web modules. `npm run check:native` runs the Rust tests; on Windows it supplies the manifest that native dialog imports need in the test executable. `npm run check:engine` runs the engine tests. `npm run build` packages the app for the current platform: the NSIS installer on Windows, the app and disk image on macOS, and the AppImage on Linux. The draft release workflow builds all three into one draft release.
+
+macOS and Linux installers cannot be built on Windows. To send them to testers before a release, push the branch and run `npm run installers`. It downloads the installers the Build workflow made for the current commit into `build/installers`, starting a build and waiting for it if there is none yet. It needs the GitHub CLI, signed in.
+
+macOS builds are signed ad hoc, not notarized. The first time the app is opened, macOS asks to confirm it under **System Settings > Privacy & Security > Open Anyway**. Before a release, follow the [macOS test checklist](docs/macos-testing.md).
+
+The parity and research tools that verified the engine against the original game builds are in `dev/parity`. They are for debugging only and are not part of the app.
 
 ### Hosted player
 
@@ -48,7 +58,7 @@ The same player and engine run in the browser at https://aexer0e.dev/wod-replay-
 
 ## Leaderboard
 
-The Leaderboard tab replaces Region because servers are now mixed. It reads public Elo and World top-100 snapshots from `wod-nations-map.moreofdots.workers.dev`. The app reads only the username from the local game's compressed settings and highlights that player. If no saved login is available, enter an exact username once. The password is never returned to the UI or sent to the worker.
+The Leaderboard tab reads public Elo and World top-100 snapshots from `wod-nations-map.moreofdots.workers.dev`. The app reads only the username from the local game's compressed settings and highlights that player. If no saved login is available, enter an exact username once. The password is never returned to the UI or sent to the worker.
 
 Search runs locally. Compare up to ten players alongside your own rank and score over 24 hours, 7 days, 30 days, or all available history. The selected period is remembered across refreshes and restarts. Each player keeps a distinct color. The worker returns every two-minute observation where a selected player's rank or score changed and omits consecutive unchanged observations. Charts draw discrete steps at each change and extend the latest value to the end of the selected range. Axis ticks use uniform round intervals.
 
@@ -58,7 +68,7 @@ The app persists the latest snapshot and up to 12 history queries. It combines c
 
 Run `npm run dev` to prepare local examples and start the web UI at `http://127.0.0.1:5173`. Startup copies the newest 100 replays at most, filling any remaining slots from the app's replay backups and skipping duplicate content. It also copies recent editor maps, and map layouts from recent replays into ignored `build/dev-data`. It also saves fresh public Elo and World rankings with available change-only history. All three tabs are populated before Vite starts. Subsequent offline starts can reuse the last saved leaderboard snapshot.
 
-Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to `%APPDATA%\local.more-of-dots\replay-backups`; set `WOD_REPLAY_BACKUP_DIR` to use another backup folder. Only the username is read from game settings; credentials are never copied. Example edits and deletions last for the browser session and do not touch Steam files. Restarting creates fresh copies. Native playback is unavailable in the browser example workspace.
+Set `WOD_GAME_DIR` if Steam is installed elsewhere. Backups default to the app's data folder (`%APPDATA%\local.more-of-dots\replay-backups` on Windows, `~/Library/Application Support/local.more-of-dots/replay-backups` on macOS); set `WOD_REPLAY_BACKUP_DIR` to use another backup folder. Only the username is read from game settings; credentials are never copied. Example edits and deletions last for the browser session and do not touch Steam files. Restarting creates fresh copies. Native playback is unavailable in the browser example workspace.
 
 `npm run dev:web` runs the example workspace. `npm run dev:desktop` opens the native development app with the real backend, including replay conversion and playback.
 

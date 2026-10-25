@@ -256,6 +256,11 @@ impl ProcessJob {
     }
     pub(crate) fn terminate(&self) {}
 }
+/// The replay engine's file name among the player resources.
+pub(crate) fn engine_name() -> String {
+    format!("ReplaySim.Standalone{}", std::env::consts::EXE_SUFFIX)
+}
+
 pub(crate) fn resource(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     let bundled = app
         .path()
@@ -280,7 +285,7 @@ pub(crate) fn resource(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, St
     ))
 }
 fn start_renderer(app: &tauri::AppHandle, job: &ProcessJob) -> Result<RenderWorker, String> {
-    let executable = resource(app, "ReplaySim.Standalone.exe")?;
+    let executable = resource(app, &engine_name())?;
     let mut child = hidden(
         Command::new(&executable)
             .arg("--render-worker")
@@ -642,8 +647,9 @@ pub async fn open_replay(
             spawn_ingest(&index, &session, supplied);
         } else {
             // The simulator streams chunks; frames are playable as soon as one arrives.
-            let executable = resource(&app, "ReplaySim.Standalone.exe")?;
+            let executable = resource(&app, &engine_name())?;
             let game_dirs = crate::installed_game_dirs();
+            let replay_dirs = crate::layout_replay_dirs(&app);
             let log = tempfile::tempfile().map_err(|e| e.to_string())?;
             let mut child = hidden(
                 Command::new(&executable)
@@ -654,6 +660,7 @@ pub async fn open_replay(
                             .iter()
                             .flat_map(|root| [OsStr::new("--game-dir"), root.as_os_str()]),
                     )
+                    .args(replay_dirs.iter().flat_map(|dir| [OsStr::new("--replay-dir"), dir.as_os_str()]))
                     .current_dir(executable.parent().unwrap())
                     .stdout(Stdio::piped())
                     .stderr(log.try_clone().map_err(|e| e.to_string())?),
@@ -971,7 +978,8 @@ mod tests {
     fn real_engine_output_is_indexed() {
         let replay = PathBuf::from(std::env::var("WOD_REPLAY_FIXTURE").unwrap());
         let engine = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources/player/ReplaySim.Standalone.exe");
+            .join("resources/player")
+            .join(engine_name());
         let started = std::time::Instant::now();
         let mut child = Command::new(&engine)
             .arg(&replay)

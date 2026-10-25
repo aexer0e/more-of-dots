@@ -10,7 +10,7 @@ All code lives in this repository. The site repository holds a deploy workflow, 
 
 | Path | Role |
 |---|---|
-| `engine/web/ReplaySim.Web.csproj` | Compiles the `engine/repsim` sources for `browser-wasm`, without the SDL renderer, SDL text and video export |
+| `engine/web/ReplaySim.Web.csproj` | Compiles the `engine/repsim` sources for `browser-wasm`, without the Skia renderer, its text and video export |
 | `engine/web/Exports.cs` | `Open`, `AddMap` and `Run`, the entry points called from JavaScript |
 | `src/player/host.js` | Chooses the backend: Tauri commands on the desktop, `web-host.js` in a browser |
 | `src/player/web-host.js` | Answers `open_replay`, `replay_progress` and `replay_chunk` in the browser and keeps the engine's chunks in memory |
@@ -32,7 +32,7 @@ The engine sources carry three `#if BROWSER` guards in `Program.cs`. Everything 
 - **Simulation** runs in a worker. It is one long synchronous call, so opening another replay terminates the worker and starts a new one.
 - **Frames** arrive as compressed chunks, the same stream the desktop player reads from the engine's standard output ([replay frame chunks](replay-frames.md)). The page keeps them as they are and the render worker decompresses one chunk at a time.
 - **Official maps** are published under `maps/` and fetched only when a replay names one. Replays with an embedded map need nothing. The engine bundles 105 of them; the site repository adds the rest of the game's maps with `--maps`, laid out as in the game folder. `maps/index.json` lists every published map, so a replay card can show the map a replay names: by its image path, or by number in the Fahero, Zolamare and Eronion sets, as More of Dots looks them up in the game.
-- **Player names** are drawn on a canvas by `web-host.js`, because the desktop engine renders them with SDL_ttf. They can differ by a pixel from the desktop labels.
+- **Player names** are drawn on a canvas by `web-host.js`, because the desktop engine renders them with Skia. They can differ by a pixel from the desktop labels.
 - **Sound** is served from `audio/` in the site repository. A build without those files plays silently.
 - **Not available**: video export, reference snapshots and the QA capture options, which use the native renderer.
 

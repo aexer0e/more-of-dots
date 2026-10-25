@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
+import { nasmEnvironment } from "./nasm.mjs";
 
 export const STABLE_SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -129,6 +130,7 @@ function runTauri(args) {
   const targetArgs = tauriTargetArguments(args, process.env.CARGO_BUILD_TARGET);
   const result = spawnSync(process.execPath, [tauriCliPath, ...targetArgs, "--config", configPath], {
     cwd: rootDir,
+    env: nasmEnvironment(),
     stdio: "inherit",
   });
   if (result.error) throw result.error;

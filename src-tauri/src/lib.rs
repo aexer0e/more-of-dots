@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,23 +22,20 @@ use tauri::{
     WindowEvent,
 };
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
 mod audio;
+mod game;
 mod installed_maps;
 mod maps;
 mod export;
 mod player;
+mod region;
 mod video;
 mod storage;
 mod thumbnails;
 
 use installed_maps::{InstalledMaps, SurfaceDigest};
 
-const DEFAULT_STEAM_GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\War of Dots";
 const FPS: f64 = 30.0;
-const GAME_DIR_NAME: &str = "War of Dots";
 const DEFAULT_REPLAY_PAGE_SIZE: usize = 100;
 const MAX_REPLAY_PAGE_SIZE: usize = 100;
 const REPLAY_PLAYER_LABEL: &str = "replayPlayer";
@@ -53,7 +50,6 @@ const REPLAY_THUMBNAIL_CACHE: &str = "replay-thumbnails";
 // A listing prepared at startup is served to the window's first request.
 const WARM_LISTING_LIFETIME: Duration = Duration::from_secs(20);
 
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 
 #[derive(Default)]
@@ -248,6 +244,16 @@ fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = app_runtime_dir(app)?.join(REPLAY_BACKUP_DIR_NAME);
     fs::create_dir_all(&path).map_err(|error| error.to_string())?;
     Ok(path)
+}
+
+/// The player's replay folders and backups. The engine looks in them for the
+/// starting layout of a numbered map its own catalog lacks.
+pub(crate) fn layout_replay_dirs(app: &AppHandle) -> Vec<PathBuf> {
+    let mut dirs = discover_replay_dirs();
+    if let Ok(backups) = replay_backup_dir(app) {
+        push_unique_path(&mut dirs, backups);
+    }
+    dirs
 }
 
 fn replay_index_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -620,12 +626,6 @@ fn path_key_from_str(value: &str) -> String {
     value.replace('/', r"\").to_ascii_lowercase()
 }
 
-fn steam_game_dir() -> PathBuf {
-    env::var_os("WOD_STEAM_GAME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STEAM_GAME_DIR))
-}
-
 #[cfg(test)]
 fn png_data_url(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
@@ -681,41 +681,18 @@ fn cache_media_file(app: &AppHandle, category: &str, source: &Path) -> Result<Pa
 }
 
 fn discover_replay_dirs() -> Vec<PathBuf> {
-    let mut replay_dirs = discover_steamapps_dirs()
+    game::content_dirs()
         .into_iter()
-        .map(|steamapps| steamapps.join("common").join(GAME_DIR_NAME).join("replays"))
+        .map(|dir| dir.join("replays"))
         .filter(|path| path.is_dir())
-        .fold(Vec::new(), |mut replay_dirs, path| {
-            push_unique_path(&mut replay_dirs, path);
-            replay_dirs
-        });
-    let configured_replay_dir = steam_game_dir().join("replays");
-    if configured_replay_dir.is_dir() {
-        push_unique_path(&mut replay_dirs, configured_replay_dir);
-    }
-    replay_dirs
+        .collect()
 }
 
 fn primary_replay_dir() -> Result<PathBuf, String> {
     if let Some(path) = discover_replay_dirs().into_iter().next() {
         return Ok(path);
     }
-
-    let mut game_dirs = discover_steamapps_dirs()
-        .into_iter()
-        .map(|steamapps| steamapps.join("common").join(GAME_DIR_NAME))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    let configured_game_dir = steam_game_dir();
-    if configured_game_dir.is_dir()
-        && !game_dirs
-            .iter()
-            .any(|path| path_key(path) == path_key(&configured_game_dir))
-    {
-        game_dirs.push(configured_game_dir);
-    }
-
-    let game_dir = game_dirs
+    let game_dir = game::content_dirs()
         .into_iter()
         .next()
         .ok_or_else(|| "War of Dots installation folder was not found.".to_string())?;
@@ -730,24 +707,11 @@ fn primary_replay_dir() -> Result<PathBuf, String> {
 }
 
 fn discover_map_editor_dirs() -> Vec<PathBuf> {
-    let mut map_dirs = discover_steamapps_dirs()
+    game::content_dirs()
         .into_iter()
-        .map(|steamapps| {
-            steamapps
-                .join("common")
-                .join(GAME_DIR_NAME)
-                .join("map_editor")
-        })
+        .map(|dir| dir.join("map_editor"))
         .filter(|path| path.is_dir())
-        .fold(Vec::new(), |mut map_dirs, path| {
-            push_unique_path(&mut map_dirs, path);
-            map_dirs
-        });
-    let configured_map_dir = steam_game_dir().join("map_editor");
-    if configured_map_dir.is_dir() {
-        push_unique_path(&mut map_dirs, configured_map_dir);
-    }
-    map_dirs
+        .collect()
 }
 
 fn safe_map_file_name(file_name: &str) -> Result<String, String> {
@@ -916,154 +880,6 @@ fn validate_game_map_value(value: &Value) -> Result<(), String> {
         return Err("Map surface must be a base64 PNG image.".to_string());
     }
     Ok(())
-}
-
-fn discover_steamapps_dirs() -> Vec<PathBuf> {
-    let mut steam_roots = discover_steam_roots();
-    let mut steamapps_dirs = Vec::new();
-
-    for root in &steam_roots {
-        push_steamapps_candidate(&mut steamapps_dirs, root);
-    }
-
-    for root in steam_roots.drain(..) {
-        let library_config = root.join("steamapps").join("libraryfolders.vdf");
-        let Ok(config) = fs::read_to_string(library_config) else {
-            continue;
-        };
-
-        for library_root in parse_steam_library_paths(&config) {
-            push_steamapps_candidate(&mut steamapps_dirs, &library_root);
-        }
-    }
-
-    for drive in b'A'..=b'Z' {
-        let drive_root = format!("{}:\\", drive as char);
-        for candidate in [
-            PathBuf::from(&drive_root).join("Steam"),
-            PathBuf::from(&drive_root).join("SteamLibrary"),
-        ] {
-            push_steamapps_candidate(&mut steamapps_dirs, &candidate);
-        }
-    }
-
-    steamapps_dirs
-}
-
-fn discover_steam_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    #[cfg(windows)]
-    for root in registry_steam_roots() {
-        push_unique_path(&mut roots, root);
-    }
-
-    for var_name in ["STEAM_DIR", "STEAM_PATH", "SteamPath"] {
-        if let Some(path) = env::var_os(var_name) {
-            push_unique_path(&mut roots, PathBuf::from(path));
-        }
-    }
-
-    for var_name in ["ProgramFiles(x86)", "ProgramFiles"] {
-        if let Some(path) = env::var_os(var_name) {
-            push_unique_path(&mut roots, PathBuf::from(path).join("Steam"));
-        }
-    }
-
-    if let Some(system_drive) = env::var_os("SystemDrive") {
-        push_unique_path(&mut roots, PathBuf::from(system_drive).join("Steam"));
-    }
-
-    push_unique_path(&mut roots, PathBuf::from(r"C:\Steam"));
-    roots
-}
-
-#[cfg(windows)]
-fn registry_steam_roots() -> Vec<PathBuf> {
-    use winreg::{
-        enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
-        RegKey,
-    };
-
-    let mut roots = Vec::new();
-    let probes = [
-        (HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
-        (
-            HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\WOW6432Node\Valve\Steam",
-            "InstallPath",
-        ),
-        (HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
-    ];
-
-    for (hive, key_path, value_name) in probes {
-        let key = RegKey::predef(hive);
-        let Ok(steam_key) = key.open_subkey(key_path) else {
-            continue;
-        };
-        let Ok(value) = steam_key.get_value::<String, _>(value_name) else {
-            continue;
-        };
-
-        push_unique_path(&mut roots, PathBuf::from(value.replace('/', r"\")));
-    }
-
-    roots
-}
-
-fn push_steamapps_candidate(steamapps_dirs: &mut Vec<PathBuf>, candidate: &Path) {
-    if candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("steamapps"))
-        && candidate.is_dir()
-    {
-        push_unique_path(steamapps_dirs, candidate.to_path_buf());
-        return;
-    }
-
-    let steamapps = candidate.join("steamapps");
-    if steamapps.is_dir() {
-        push_unique_path(steamapps_dirs, steamapps);
-    }
-}
-
-fn parse_steam_library_paths(config: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    for line in config.lines() {
-        let quoted = quoted_vdf_values(line);
-        if quoted.len() < 2 {
-            continue;
-        }
-
-        let path = if quoted[0] == "path" {
-            Some(&quoted[1])
-        } else if quoted[0].parse::<usize>().is_ok() && looks_like_path(&quoted[1]) {
-            Some(&quoted[1])
-        } else {
-            None
-        };
-
-        if let Some(path) = path {
-            push_unique_path(&mut paths, PathBuf::from(path.replace('/', r"\")));
-        }
-    }
-
-    paths
-}
-
-fn quoted_vdf_values(line: &str) -> Vec<String> {
-    line.split('"')
-        .enumerate()
-        .filter_map(|(index, value)| {
-            (index % 2 == 1).then(|| value.replace(r"\\", r"\").replace(r#"\""#, r#"""#))
-        })
-        .collect()
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.contains(":\\") || value.contains(":/") || value.starts_with(r"\\")
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1315,14 +1131,10 @@ fn installed_map_catalog() -> InstalledMaps {
 }
 
 fn game_install_candidates() -> Vec<PathBuf> {
-    let mut roots = discover_steamapps_dirs().into_iter()
-        .map(|steamapps| steamapps.join("common").join(GAME_DIR_NAME))
-        .collect::<Vec<_>>();
-    push_unique_path(&mut roots, steam_game_dir());
-    roots
+    game::content_dirs()
 }
 
-/// Installed game folders, used only to read official map images for replay simulation.
+/// Installed game folders, used only to read official map images and sounds.
 pub(crate) fn installed_game_dirs() -> Vec<PathBuf> {
     game_install_candidates().into_iter().filter(|root| root.join("assets").is_dir()).collect()
 }
@@ -1659,16 +1471,9 @@ fn open_recording_output_directory(output_path: String) -> Result<bool, String> 
             output_path.display()
         ));
     }
-    let directory = output_path
-        .parent()
-        .ok_or_else(|| "Recorded video has no output folder.".to_string())?;
-    let mut command = Command::new("explorer.exe");
-    command.arg(directory);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .spawn()
-        .map_err(|error| format!("Could not open {}: {error}", directory.display()))?;
+    // Opens the folder in Explorer or Finder with the video selected.
+    tauri_plugin_opener::reveal_item_in_dir(&output_path)
+        .map_err(|error| format!("Could not open the folder of {}: {error}", output_path.display()))?;
     Ok(true)
 }
 
@@ -1978,74 +1783,27 @@ fn list_replays_locked(
     })
 }
 
-fn select_replay_download_path(default_file_name: &str) -> Result<Option<PathBuf>, String> {
-    let file_name = default_file_name.replace('\'', "''");
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.SaveFileDialog
-$dialog.AddExtension = $true
-$dialog.DefaultExt = 'rep'
-$dialog.FileName = '{file_name}'
-$dialog.Filter = 'War of Dots replay (*.rep)|*.rep'
-$dialog.OverwritePrompt = $true
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
-  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-  [Console]::Write($dialog.FileName)
-}}
-"#
-    );
-    let encoded_script = BASE64.encode(
-        script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("Could not open the Save As dialog: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Could not open the Save As dialog: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
+// The system's own save and folder dialogs, through the dialog plugin. Both block,
+// so they are only called from blocking tasks.
+fn select_replay_download_path(app: &AppHandle, default_file_name: &str) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .set_file_name(default_file_name)
+        .add_filter("War of Dots replay", &["rep"])
+        .blocking_save_file()
+        .map(|path| path.into_path().map_err(|error| format!("Could not use the chosen file: {error}")))
+        .transpose()
 }
 
-fn select_replay_download_directory() -> Result<Option<PathBuf>, String> {
-    let script = r#"
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = 'Choose where to save the selected War of Dots replays'
-$dialog.ShowNewFolderButton = $true
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-  [Console]::Write($dialog.SelectedPath)
-}
-"#;
-    let encoded_script = BASE64.encode(
-        script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-STA", "-EncodedCommand", &encoded_script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("Could not open the folder picker: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Could not open the folder picker: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
+fn select_replay_download_directory(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .set_title("Choose where to save the selected War of Dots replays")
+        .blocking_pick_folder()
+        .map(|path| path.into_path().map_err(|error| format!("Could not use the chosen folder: {error}")))
+        .transpose()
 }
 
 fn available_replay_download_path(directory: &Path, requested_name: &str) -> PathBuf {
@@ -2277,7 +2035,7 @@ async fn delete_replay(app: AppHandle, file_path: String) -> Result<usize, Strin
 }
 
 #[tauri::command]
-async fn download_replay(file_path: String, file_name: String) -> Result<bool, String> {
+async fn download_replay(app: AppHandle, file_path: String, file_name: String) -> Result<bool, String> {
     let source_path = PathBuf::from(file_path);
     if !source_path.is_file() || !is_replay_file(&source_path) {
         return Err(format!(
@@ -2287,7 +2045,7 @@ async fn download_replay(file_path: String, file_name: String) -> Result<bool, S
     }
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(mut destination_path) = select_replay_download_path(&file_name)? else {
+        let Some(mut destination_path) = select_replay_download_path(&app, &file_name)? else {
             return Ok(false);
         };
         if !destination_path
@@ -2317,7 +2075,7 @@ struct ReplayDownloadRequest {
 }
 
 #[tauri::command]
-async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, String> {
+async fn download_replays(app: AppHandle, replays: Vec<ReplayDownloadRequest>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if replays.is_empty() {
             return Ok(0);
@@ -2334,7 +2092,7 @@ async fn download_replays(replays: Vec<ReplayDownloadRequest>) -> Result<usize, 
             sources.push((source_path, replay.file_name));
         }
 
-        let Some(destination_dir) = select_replay_download_directory()? else {
+        let Some(destination_dir) = select_replay_download_directory(&app)? else {
             return Ok(0);
         };
         if !destination_dir.is_dir() {
@@ -2513,9 +2271,7 @@ fn delete_maps(app: AppHandle, file_names: Vec<String>) -> Result<Vec<String>, S
 
 #[tauri::command]
 fn leaderboard_identity() -> Option<String> {
-    let mut roots = vec![steam_game_dir()];
-    roots.extend(discover_steamapps_dirs().into_iter().map(|dir| dir.join("common").join(GAME_DIR_NAME)));
-    for root in roots {
+    for root in game::content_dirs() {
         // Read settings locally and return only the account name. Passwords never cross IPC.
         let Ok(file) = File::open(root.join("config.txt")) else { continue; };
         let mut text = String::new();
@@ -2735,7 +2491,9 @@ pub fn run() {
             player::game_audio,
             player::player_debug_options,
             player::save_player_snapshot,
-            player::save_player_diagnostics
+            player::save_player_diagnostics,
+            region::region_status,
+            region::select_region
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

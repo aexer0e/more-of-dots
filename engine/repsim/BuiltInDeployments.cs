@@ -38,17 +38,15 @@ internal static class BuiltInDeployments
             _ => null,
         };
         if (!int.TryParse(text?.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int number)) return false;
-        // Special modes need their saved layout. A multi-color match may use
-        // the classic catalog only when that roster has the requested colors.
-        string? profile = NormalizeMode(mode) switch
-        {
-            "" or "1v1" or "2v2" or "classic" or "experiment" or "avalanche" => RulesMode(mode),
-            "v3" or "v4" => "classic",
-            _ => null,
-        };
-        if (profile is null || !Catalog.Value.TryGetProperty(number.ToString(CultureInfo.InvariantCulture), out var entry)
-            || !(entry.TryGetProperty(profile, out map) || TryConvert(entry, profile, out map))) return false;
-        int requiredColors = NormalizeMode(mode) switch { "v3" => 3, "v4" => 4, _ => 0 };
+        // Every map plays in every match format, so the format only picks the rules:
+        // experimental and avalanche have their own layouts, everything else (1v1,
+        // 2v2, free-for-all and unfamiliar labels) uses the classic one. A format
+        // that names its number of colors still needs a map with that many.
+        string profile = RulesMode(mode);
+        bool known = Catalog.Value.TryGetProperty(number.ToString(CultureInfo.InvariantCulture), out var entry)
+            && (entry.TryGetProperty(profile, out map) || TryConvert(entry, profile, out map));
+        if (!known && !FromReplays(number, profile, out map)) return false;
+        int requiredColors = NormalizeMode(mode) switch { "v3" or "3pffa" or "3p ffa" => 3, "v4" or "4pffa" or "4p ffa" => 4, _ => 0 };
         if (requiredColors > 0 && (!map.TryGetProperty("infantry", out var infantry)
             || infantry.GetArrayLength() != requiredColors))
         {
@@ -56,6 +54,43 @@ internal static class BuiltInDeployments
             return false;
         }
         return true;
+    }
+
+    /// Folders of the player's own replays, searched for maps the catalog lacks.
+    internal static IReadOnlyList<string> ReplayDirectories { get; set; } = [];
+
+    // Every official map can be played in each mode, and a replay that carries its
+    // map carries the whole layout. So a map the catalog lacks, such as one added
+    // by a game update, takes its layout from the newest replay of it in any mode.
+    private static bool FromReplays(int number, string profile, out JsonElement map)
+    {
+        map = default;
+        string image = $"map{number.ToString(CultureInfo.InvariantCulture)}.png";
+        var files = ReplayDirectories.Where(Directory.Exists)
+            .SelectMany(directory => new DirectoryInfo(directory).EnumerateFiles())
+            .Where(file => file.Extension.Equals(".rep", StringComparison.OrdinalIgnoreCase) || file.Extension.Equals(".json", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(file => file.LastWriteTimeUtc);
+        foreach (var file in files)
+        {
+            try
+            {
+                using var stream = Replay.OpenDecoded(file.FullName);
+                using var document = JsonDocument.Parse(stream);
+                var root = document.RootElement;
+                if (!root.TryGetProperty("map", out var candidate) || candidate.ValueKind != JsonValueKind.Object
+                    || candidate.TryGetProperty("map_surface", out _) || !candidate.TryGetProperty("infantry", out _)
+                    || !candidate.TryGetProperty("path", out var path) || path.ValueKind != JsonValueKind.String
+                    || !path.GetString()!.Replace('\\', '/').EndsWith("/" + image, StringComparison.OrdinalIgnoreCase)) continue;
+                string recorded = root.TryGetProperty("mode", out var mode) && mode.ValueKind == JsonValueKind.String ? RulesMode(mode.GetString()) : "classic";
+                // Avalanche layouts are their own; they neither serve nor come from the others.
+                if ((recorded == "avalanche") != (profile == "avalanche")) continue;
+                if (recorded == profile) { map = candidate.Clone(); return true; }
+                var entry = JsonDocument.Parse(new JsonObject { [recorded] = JsonNode.Parse(candidate.GetRawText()) }.ToJsonString()).RootElement;
+                if (TryConvert(entry, profile, out map)) return true;
+            }
+            catch (Exception error) when (error is IOException or JsonException or InvalidDataException or UnauthorizedAccessException) { }
+        }
+        return false;
     }
 
     // Classic and experimental matches share one layout. Experimental turns every

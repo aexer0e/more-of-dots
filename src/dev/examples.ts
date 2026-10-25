@@ -29,6 +29,14 @@ function stressReplays<T extends { filePath: string }>(replays: T[]): T[] {
     return index < replays.length ? replay : { ...replay, filePath: `${replay.filePath}#${index}` };
   });
 }
+let exampleRegion: string | null = null;
+// The servers the game listed when this was written: one in Singapore, two in Frankfurt, one of them down.
+const EXAMPLE_SERVERS = [
+  { host: '13.212.239.74', cloudRegion: 'ap-southeast-1', region: 'ASIA', reachable: true, ms: 443 },
+  { host: '3.64.57.116', cloudRegion: 'eu-central-1', region: 'EU', reachable: false, ms: null },
+  { host: '3.122.195.131', cloudRegion: 'eu-central-1', region: 'EU', reachable: true, ms: 91 },
+];
+let exampleServers: typeof EXAMPLE_SERVERS | null = null;
 export async function exampleInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   const data = await examples();
   let result: unknown;
@@ -60,7 +68,20 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
       data.maps.unshift(map); result = map; break;
     }
     case 'delete_maps': data.maps = data.maps.filter((m) => !(args.fileNames as string[]).includes(m.id)); result = args.fileNames; break;
-    case 'delete_replay': data.replays = data.replays.filter((r) => r.filePath !== args.filePath); result = 1; break;
+    // A pretend running game; example mode never touches the real one.
+    case 'region_status': result = { gameRunning: true, selectedRegion: exampleRegion, selectedAt: exampleRegion ? Date.now() / 1000 : null, servers: exampleServers }; break;
+    case 'select_region': {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      exampleServers = EXAMPLE_SERVERS;
+      const available = EXAMPLE_SERVERS.some((server) => server.region === args.region && server.reachable);
+      if (available) exampleRegion = String(args.region);
+      result = {
+        gameRunning: true, selectedRegion: exampleRegion, selectedAt: Date.now() / 1000, servers: exampleServers,
+        unavailable: available ? null : 'War of Dots has no reachable North America server right now. Available: Asia, Europe.',
+      };
+      break;
+    }
+    case 'delete_replay':data.replays = data.replays.filter((r) => r.filePath !== args.filePath); result = 1; break;
     default: throw new Error('This action needs the desktop app. Example mode never launches the game or changes your Steam files.');
   }
   return structuredClone(result) as T;

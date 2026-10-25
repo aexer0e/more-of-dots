@@ -5,6 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- Trimming unused framework code shrinks the self-contained executable from
          about 68 MB to 14 MB. Partial mode keeps every type in this assembly, so the
          reflection-based JSON serialization of anonymous types still works. -->
@@ -14,6 +15,12 @@
     <NoWarn>$(NoWarn);IL2026</NoWarn>
     <TieredCompilation>true</TieredCompilation>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Video frames and reference snapshots are drawn with Skia on the CPU, the same on every platform. -->
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+    <!-- SkiaSharp brings its Windows and macOS libraries itself; Linux needs this one. -->
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="4.153.1" />
+  </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="maps\deployments.json" LogicalName="replay-deployments" />
     <InternalsVisibleTo Include="ReplaySim.Tests" />

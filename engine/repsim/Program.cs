@@ -24,6 +24,7 @@ internal static class Program
                 throw new ArgumentException("An input .rep file is required.");
 
             MapSurfaceImage.GameDirectories = options.GameDirectories;
+            BuiltInDeployments.ReplayDirectories = options.ReplayDirectories;
 #if !BROWSER
             if (options.ExportVideo) return VideoExport.Run(options);
 #endif
@@ -81,6 +82,8 @@ internal sealed class Options
     public string? ExportRegions { get; private set; }
     public bool RenderState { get; private set; }
     public List<string> GameDirectories { get; } = [];
+    /// The player's replay folders, searched for layouts of maps the catalog lacks.
+    public List<string> ReplayDirectories { get; } = [];
     public bool ExportVideo { get; private set; }
     public int Width { get; private set; } = 1920;
     public int Height { get; private set; } = 1080;
@@ -88,6 +91,8 @@ internal sealed class Options
     public HashSet<string> Layers { get; private set; } = ["orders", "health", "morale", "flags", "icons", "stats", "players"];
     public string? AssetsDirectory { get; private set; }
     public string? DumpDraws { get; private set; }
+    /// Video frames drawn at once. Rendering runs on the CPU, so a few cores keep up with the encoder.
+    public int RenderThreads { get; private set; } = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
 
     public static Options Parse(string[] args)
     {
@@ -120,6 +125,7 @@ internal sealed class Options
                     o.RenderState |= o.BinaryFrames;
                     break;
                 case "--game-dir": o.GameDirectories.Add(Next(args, ref i, arg)); break;
+                case "--replay-dir": o.ReplayDirectories.Add(Next(args, ref i, arg)); break;
                 case "--export-video": o.ExportVideo = true; o.RenderState = true; break;
                 case "--width": o.Width = int.Parse(Next(args, ref i, arg), CultureInfo.InvariantCulture); break;
                 case "--height": o.Height = int.Parse(Next(args, ref i, arg), CultureInfo.InvariantCulture); break;
@@ -127,6 +133,7 @@ internal sealed class Options
                 case "--layers": o.Layers = Next(args, ref i, arg).Split(',', StringSplitOptions.RemoveEmptyEntries).ToHashSet(); break;
                 case "--assets": o.AssetsDirectory = Next(args, ref i, arg); break;
                 case "--dump-draws": o.DumpDraws = Next(args, ref i, arg); break;
+                case "--render-threads": o.RenderThreads = int.Parse(Next(args, ref i, arg), CultureInfo.InvariantCulture); break;
                 default:
                     if (arg.StartsWith('-')) throw new ArgumentException($"Unknown option: {arg}");
                     if (o.Input != null) throw new ArgumentException("Only one input replay may be supplied.");
@@ -137,6 +144,7 @@ internal sealed class Options
         if (o.MaxFrame is < 0) throw new ArgumentException("--max-frame must be non-negative.");
         if (o.SampleEvery < 1) throw new ArgumentException("--sample-every must be positive.");
         if (o.Step < 1) throw new ArgumentException("--step must be positive.");
+        if (o.RenderThreads is < 1 or > 64) throw new ArgumentException("--render-threads must be between 1 and 64.");
         if (o.Width is < 2 or > 3840 || o.Height is < 2 or > 2160 || o.Width % 2 != 0 || o.Height % 2 != 0)
             throw new ArgumentException("Video size must be even and at most 3840x2160.");
         return o;
@@ -149,8 +157,8 @@ internal sealed class Options
         ReplaySim Standalone - offline War of Dots replay simulator
 
         Usage:
-          ReplaySim.Standalone.exe input.rep [-o output.repsim]
-          ReplaySim.Standalone.exe input.rep --render-state -o -   (stream to stdout)
+          ReplaySim.Standalone input.rep [-o output.repsim]
+          ReplaySim.Standalone input.rep --render-state -o -   (stream to stdout)
 
         Options:
           --max-frame N       stop after frame N (development/parity probes)
@@ -159,11 +167,13 @@ internal sealed class Options
           --format F          jsonl (default) or binary: compact playback chunks with
                               render state (docs/replay-frames.md)
           --game-dir DIR      installed game folder for official maps (repeatable)
+          --replay-dir DIR    replay folder with layouts for maps the catalog lacks (repeatable)
           --export-video      write raw RGB24 video frames to stdout, progress to stderr
             --width W --height H   frame size (default 1920x1080)
             --step N               draw every Nth simulated frame (playback speed)
             --layers a,b,...       orders,health,morale,flags,stats,icons,produce,players
             --assets DIR           unit artwork folder (default: player-assets)
+            --render-threads N     frames drawn at once (default: half the cores, at most 4)
           -h, --help          show this help
 
         The tool reads gzip or plain JSON .rep files and does not launch or require
@@ -227,7 +237,7 @@ internal sealed class Replay
                 _ => "",
             };
             throw new FormatException(id.Length > 0
-                ? $"This replay records map number ({id}), but the player has no layout of starting units and cities for this map and mode yet. A matching replay with a full map can provide that layout."
+                ? $"This replay records map number ({id}), but the player has no layout of starting units and cities for this map and mode yet. Any replay of this map that records its full layout, such as one from experiment mode, provides it once it is among your replays."
                 : "This replay does not record its map, so it cannot be played back.");
         }
         string versionName = Text(root, "version") ?? "unknown";
@@ -346,7 +356,7 @@ internal sealed class Replay
         return names.Count == 0 ? ["blue", "red"] : names.ToArray();
     }
 
-    private static Stream OpenDecoded(string path)
+    internal static Stream OpenDecoded(string path)
     {
         var file = File.OpenRead(path);
         Span<byte> header = stackalloc byte[2];
@@ -550,31 +560,49 @@ internal sealed class MapSurfaceImage
         string fileName = Path.GetFileName(normalized);
         string supplied = Path.IsPathRooted(replayPath) ? replayPath : Path.Combine(replayDirectory, normalized.Replace('/', Path.DirectorySeparatorChar));
         if (File.Exists(supplied)) return supplied;
-        string companion = Path.Combine(replayDirectory, "maps", fileName);
-        if (File.Exists(companion)) return companion;
+        if (!Path.IsPathRooted(replayPath) && FindFile(replayDirectory, normalized) is { } matched) return matched;
+        if (FindFile(replayDirectory, "maps/" + fileName) is { } companion) return companion;
         // Official maps (fahero, zolamare, eronion) come from the installed game when it is available.
         if (normalized.StartsWith("assets/", StringComparison.OrdinalIgnoreCase) && !normalized.Contains(".."))
         {
             foreach (string directory in GameDirectories)
             {
-                string installed = Path.Combine(directory, normalized.Replace('/', Path.DirectorySeparatorChar));
-                if (File.Exists(installed)) return installed;
+                if (FindFile(directory, normalized) is { } installed) return installed;
             }
             // Keep each author's asset directory. Their numbered PNG filenames
             // can collide even though the native catalog paths differ.
-            string bundledAsset = Path.Combine(AppContext.BaseDirectory, "maps", normalized.Replace('/', Path.DirectorySeparatorChar));
-            if (File.Exists(bundledAsset)) return bundledAsset;
+            if (FindFile(Path.Combine(AppContext.BaseDirectory, "maps"), normalized) is { } bundledAsset) return bundledAsset;
         }
         if (normalized.Equals(fileName, StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("assets/fahero_maps/", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("assets/zolamare_maps/", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("assets/eronion_maps/", StringComparison.OrdinalIgnoreCase))
         {
-            string bundled = Path.Combine(AppContext.BaseDirectory, "maps", fileName);
-            if (File.Exists(bundled)) return bundled;
+            if (FindFile(Path.Combine(AppContext.BaseDirectory, "maps"), fileName) is { } bundled) return bundled;
         }
         Unresolved = normalized;
         return null;
+    }
+
+    /// A file under `root` named by a relative path, matching each part without
+    /// regard to case as Windows and macOS do, so Linux finds the same files.
+    private static string? FindFile(string root, string relative)
+    {
+        var parts = relative.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0 || parts.Any(part => part is "." or "..")) return null;
+        string exact = Path.Combine([root, .. parts]);
+        if (File.Exists(exact)) return exact;
+        string current = root;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (!Directory.Exists(current)) return null;
+            bool last = i == parts.Length - 1;
+            var entries = last ? Directory.EnumerateFiles(current) : Directory.EnumerateDirectories(current);
+            string? match = entries.FirstOrDefault(entry => Path.GetFileName(entry).Equals(parts[i], StringComparison.OrdinalIgnoreCase));
+            if (match is null) return null;
+            current = match;
+        }
+        return current;
     }
 
     private static MapSurfaceImage? DecodeBytes(byte[] png)

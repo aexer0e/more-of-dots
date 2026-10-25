@@ -1,4 +1,4 @@
-import { invoke, exampleMode } from "./platform";
+import { invoke, exampleMode, regionSupported } from "./platform";
 import { exportBusy, openExportSetup } from "./replays/export";
 import { getVersion } from "@tauri-apps/api/app";
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
@@ -10,6 +10,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { LeaderboardApp } from "./leaderboard/App";
 import { cached, leaderboardRankIndex, retrieve, type Snapshot } from "./leaderboard/client";
 import MapEditorApp from "./map-editor/App";
+import { mountRegionPage, unmountRegionPage } from "./region/page";
 import "./styles.css";
 import "./replays/styles.css";
 import { MATCH_TYPES, REPLAY_VARIANTS, matchesReplay, matchupTitle, replaySuggestions, toggleMatchType, type PlayerSuggestion, type ReplayVariant, type ReplayFilterRecord, type ReplayFilters, type ReplaySuggestion } from "./replays/filters";
@@ -64,7 +65,7 @@ type ReplayIndexProgress = {
 
 type BrowserFilterState = ReplayFilters;
 type ThumbnailVariant = "small" | "full";
-type BrowserPage = "replays" | "leaderboard" | "mapEditor";
+type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";
 type AppUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "current" | "error";
 type AppUpdateSnooze = {
   version: string;
@@ -1355,6 +1356,9 @@ function renderBrowserNav(): string {
     <nav class="browser-nav" aria-label="Main navigation">
       <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
       <button class="browser-nav-button ${browserPage === "leaderboard" ? "is-active" : ""}" type="button" data-browser-page="leaderboard">Leaderboard</button>
+      ${regionSupported
+        ? `<button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>`
+        : `<button class="browser-nav-button is-unavailable" type="button" aria-disabled="true" title="Region selection is only available on Windows">Region</button>`}
       <button class="browser-nav-button ${browserPage === "mapEditor" ? "is-active" : ""}" type="button" data-browser-page="mapEditor">Map Editor</button>
       <button class="app-version-button" type="button" data-app-version aria-label="Check for updates">${escapeHtml(appVersionLabel())}</button>
     </nav>
@@ -1655,6 +1659,18 @@ function renderReplayBrowser() {
     return;
   }
   unmountMapEditor();
+  if (browserPage !== "region") unmountRegionPage();
+  if (browserPage === "region") {
+    appRoot.innerHTML = `
+      <main class="replay-browser" aria-label="War of Dots region">
+        ${renderBrowserNav()}${exampleMode ? `<div class="example-banner">Example workspace <span>Latest copied data · up to 100 replays · edits stay in this session</span></div>` : ""}
+        <div id="regionRoot" class="region-host"></div>
+      </main>
+    `;
+    bindBrowserEvents();
+    mountRegionPage(document.querySelector<HTMLElement>("#regionRoot")!);
+    return;
+  }
   if (browserPage === "leaderboard") {
     if (!leaderboardRoot) {
       appRoot.innerHTML = `<main class="replay-browser" aria-label="War of Dots leaderboard">${renderBrowserNav()}${exampleMode ? `<div class="example-banner">Example workspace <span>Latest copied data · up to 100 replays · edits stay in this session</span></div>` : ""}<div id="leaderboardRoot" style="display:flex;flex:1;min-height:0;overflow:hidden"></div></main>`;
@@ -1876,7 +1892,7 @@ function bindBrowserEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const page = button.dataset.browserPage;
-      const nextPage: BrowserPage = page === "leaderboard" ? "leaderboard" : page === "mapEditor" ? "mapEditor" : "replays";
+      const nextPage: BrowserPage = page === "leaderboard" || (page === "region" && regionSupported) || page === "mapEditor" ? page : "replays";
       void switchBrowserPage(nextPage);
     });
   });

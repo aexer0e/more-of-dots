@@ -126,8 +126,9 @@ pub async fn export_replay_videos(
     }
     let events = app.clone();
     let context = Arc::new(Context {
-        executable: resource(&app, "ReplaySim.Standalone.exe")?,
+        executable: resource(&app, &crate::player::engine_name())?,
         game_dirs,
+        replay_dirs: crate::layout_replay_dirs(&app),
         job: ProcessJob::new()?,
         cancel,
         options,
@@ -189,6 +190,7 @@ enum Outcome {
 struct Context {
     executable: PathBuf,
     game_dirs: Vec<PathBuf>,
+    replay_dirs: Vec<PathBuf>,
     job: ProcessJob,
     cancel: Arc<AtomicBool>,
     options: ExportOptions,
@@ -238,6 +240,13 @@ impl Context {
         Mixer::new(sounds, self.options.music_volume, self.options.sfx_volume, self.options.playback_speed).map(Some)
     }
 
+    /// Frames are drawn on the CPU, so videos converting at once share the cores:
+    /// each takes a share, up to four, and the encoder keeps one of its own.
+    fn render_threads(&self) -> usize {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        (cores / self.options.concurrency.clamp(1, 8)).saturating_sub(1).clamp(1, 4)
+    }
+
     fn convert(&self, item: &ExportItem) -> Result<PathBuf, String> {
         let height = self.options.resolution_height;
         // 16:9, rounded to an even width for H.264 (854×480).
@@ -256,7 +265,9 @@ impl Context {
                 .args(["--width", &width.to_string(), "--height", &height.to_string()])
                 .args(["--step", &self.options.playback_speed.to_string()])
                 .args(["--layers", &self.options.layers.join(",")])
+                .args(["--render-threads", &self.render_threads().to_string()])
                 .args(self.game_dirs.iter().flat_map(|root| [OsStr::new("--game-dir"), root.as_os_str()]))
+                .args(self.replay_dirs.iter().flat_map(|dir| [OsStr::new("--replay-dir"), dir.as_os_str()]))
                 .current_dir(self.executable.parent().unwrap())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
@@ -419,6 +430,7 @@ mod throughput {
         let context = Context {
             executable: PathBuf::from(exe),
             game_dirs: crate::installed_game_dirs(),
+            replay_dirs: Vec::new(),
             job: ProcessJob::new().unwrap(),
             cancel: Arc::new(AtomicBool::new(false)),
             options: ExportOptions {
@@ -469,10 +481,17 @@ mod throughput {
         let height: u32 = std::env::var("MOD_EXPORT_HEIGHT").ok().and_then(|h| h.parse().ok()).unwrap_or(1080);
         let width = (height * 16 / 9 + 1) & !1;
         let output = std::env::var("MOD_EXPORT_OUTPUT").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("mod-export-test.mp4"));
+        // MOD_EXPORT_STEP and MOD_EXPORT_MAX_FRAME time a faster or shorter conversion.
+        let limits: Vec<String> = [("MOD_EXPORT_STEP", "--step"), ("MOD_EXPORT_MAX_FRAME", "--max-frame")]
+            .into_iter()
+            .filter_map(|(name, flag)| std::env::var(name).ok().map(|value| [flag.to_string(), value]))
+            .flatten()
+            .collect();
         let started = Instant::now();
         let mut child = Command::new(&exe)
             .arg(&replay)
             .args(["--export-video", "--width", &width.to_string(), "--height", &height.to_string()])
+            .args(&limits)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

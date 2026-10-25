@@ -1,6 +1,6 @@
-//! H.264/AAC MP4 encoding with Windows Media Foundation, which ships with Windows.
-//! A dedicated thread owns the COM objects, so rendering and encoding overlap
-//! and the encoder never crosses threads.
+//! H.264/AAC MP4 encoding with OpenH264 and FDK AAC, compiled into the app so
+//! every platform encodes the same way. A dedicated thread owns the encoders,
+//! so rendering and encoding overlap.
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -107,8 +107,8 @@ impl Drop for VideoEncoder {
 }
 
 /// Moves the MP4 index (`moov`) in front of the media (`mdat`) so a video can
-/// start playing before it has fully downloaded. Media Foundation writes the
-/// index last; its own option for this produced unreadable files.
+/// start playing before it has fully downloaded. The MP4 writer puts the index
+/// last, once every sample is known.
 pub fn faststart(path: &Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Seek, SeekFrom, Write};
     let mut file = std::fs::File::open(path)?;
@@ -210,24 +210,26 @@ fn join(worker: JoinHandle<Result<u64, String>>) -> Result<u64, String> {
         .unwrap_or_else(|_| Err("The video encoder stopped unexpectedly.".into()))
 }
 
-/// Converts top-down RGB24 to NV12 with BT.709 limited-range coefficients,
+/// Converts top-down RGB24 to planar I420 with BT.709 limited-range coefficients,
 /// averaging each 2×2 block for chroma. Bands of rows convert in parallel.
-pub fn rgb_to_nv12(rgb: &[u8], width: usize, height: usize, nv12: &mut [u8]) {
+pub fn rgb_to_i420(rgb: &[u8], width: usize, height: usize, i420: &mut [u8]) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
     let rows = (height / 2).div_ceil(threads).max(1) * 2;
-    let (luma, chroma) = nv12.split_at_mut(width * height);
+    let (luma, chroma) = i420.split_at_mut(width * height);
+    let (blue, red) = chroma.split_at_mut(width * height / 4);
     std::thread::scope(|scope| {
-        for ((rgb, luma), chroma) in rgb
+        for (((rgb, luma), blue), red) in rgb
             .chunks(rows * width * 3)
             .zip(luma.chunks_mut(rows * width))
-            .zip(chroma.chunks_mut(rows / 2 * width))
+            .zip(blue.chunks_mut(rows / 2 * width / 2))
+            .zip(red.chunks_mut(rows / 2 * width / 2))
         {
-            scope.spawn(move || convert_band(rgb, width, luma, chroma));
+            scope.spawn(move || convert_band(rgb, width, luma, blue, red));
         }
     });
 }
 
-fn convert_band(rgb: &[u8], width: usize, luma: &mut [u8], chroma: &mut [u8]) {
+fn convert_band(rgb: &[u8], width: usize, luma: &mut [u8], blue: &mut [u8], red: &mut [u8]) {
     let height = luma.len() / width;
     for y in 0..height {
         let row = &rgb[y * width * 3..(y + 1) * width * 3];
@@ -237,20 +239,191 @@ fn convert_band(rgb: &[u8], width: usize, luma: &mut [u8], chroma: &mut [u8]) {
             out[x] = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16) as u8;
         }
     }
+    let half = width / 2;
     for y in (0..height).step_by(2) {
         let (top, bottom) = (&rgb[y * width * 3..], &rgb[(y + 1) * width * 3..]);
-        let out = &mut chroma[(y / 2) * width..(y / 2 + 1) * width];
-        for x in (0..width).step_by(2) {
-            let (a, c) = (x * 3, x * 3);
-            let sum = |k: usize| top[a + k] as i32 + top[a + 3 + k] as i32 + bottom[c + k] as i32 + bottom[c + 3 + k] as i32;
+        let (u, v) = (&mut blue[(y / 2) * half..(y / 2 + 1) * half], &mut red[(y / 2) * half..(y / 2 + 1) * half]);
+        for x in 0..half {
+            let a = x * 6;
+            let sum = |k: usize| top[a + k] as i32 + top[a + 3 + k] as i32 + bottom[a + k] as i32 + bottom[a + 3 + k] as i32;
             let (r, g, b) = ((sum(0) + 2) / 4, (sum(1) + 2) / 4, (sum(2) + 2) / 4);
-            out[x] = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
-            out[x + 1] = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+            u[x] = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+            v[x] = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
         }
     }
 }
 
-#[cfg(windows)]
+/// Video sample times count thousandths of a frame.
+const VIDEO_TIMESCALE: u32 = FRAME_RATE as u32 * 1000;
+/// A keyframe every five seconds keeps seeking quick in players.
+const KEYFRAME_INTERVAL: u32 = FRAME_RATE as u32 * 5;
+const AUDIO_BITRATE: u32 = 192_000;
+const AAC_FRAME: usize = 1024;
+
+type Mp4File = mp4::Mp4Writer<std::io::BufWriter<std::fs::File>>;
+
+/// The MP4 file opens once the first frame gives the H.264 parameter sets its
+/// header needs; soundtrack frames encoded before then wait in `queued`.
+struct Muxer {
+    file: Option<Mp4File>,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    audio: bool,
+    queued: Vec<Vec<u8>>,
+}
+
+impl Muxer {
+    fn open(&mut self, sps: &[u8], pps: &[u8]) -> Result<(), String> {
+        use mp4::{AacConfig, AvcConfig, ChannelConfig, MediaConfig, Mp4Config, SampleFreqIndex, TrackConfig, TrackType};
+        let failed = |e: mp4::Error| format!("Could not start the video file: {e}");
+        let output = std::fs::File::create(&self.path).map_err(|e| format!("Could not start the video file: {e}"))?;
+        let brand = |name: &str| name.parse().expect("a four-letter brand");
+        let mut file = mp4::Mp4Writer::write_start(
+            std::io::BufWriter::with_capacity(1 << 20, output),
+            &Mp4Config {
+                major_brand: brand("isom"),
+                minor_version: 512,
+                compatible_brands: vec![brand("isom"), brand("iso2"), brand("avc1"), brand("mp41")],
+                timescale: 1000,
+            },
+        )
+        .map_err(failed)?;
+        file.add_track(&TrackConfig {
+            track_type: TrackType::Video,
+            timescale: VIDEO_TIMESCALE,
+            language: "und".into(),
+            media_conf: MediaConfig::AvcConfig(AvcConfig {
+                width: self.width as u16,
+                height: self.height as u16,
+                seq_param_set: sps.to_vec(),
+                pic_param_set: pps.to_vec(),
+            }),
+        })
+        .map_err(failed)?;
+        if self.audio {
+            file.add_track(&TrackConfig {
+                track_type: TrackType::Audio,
+                timescale: AUDIO_RATE as u32,
+                language: "und".into(),
+                media_conf: MediaConfig::AacConfig(AacConfig {
+                    bitrate: AUDIO_BITRATE,
+                    profile: mp4::AudioObjectType::AacLowComplexity,
+                    freq_index: SampleFreqIndex::Freq48000,
+                    chan_conf: ChannelConfig::Stereo,
+                }),
+            })
+            .map_err(failed)?;
+        }
+        self.file = Some(file);
+        for frame in std::mem::take(&mut self.queued) {
+            self.audio_frame(frame)?;
+        }
+        Ok(())
+    }
+
+    fn sample(&mut self, track: u32, bytes: Vec<u8>, duration: u32, is_sync: bool) -> Result<(), String> {
+        let file = self.file.as_mut().ok_or("The video file is not open.")?;
+        file.write_sample(track, &mp4::Mp4Sample { start_time: 0, duration, rendering_offset: 0, is_sync, bytes: bytes.into() })
+            .map_err(|e| format!("Could not write the video: {e}"))
+    }
+
+    fn audio_frame(&mut self, frame: Vec<u8>) -> Result<(), String> {
+        if self.file.is_none() {
+            self.queued.push(frame);
+            return Ok(());
+        }
+        self.sample(2, frame, AAC_FRAME as u32, true)
+    }
+}
+
+/// AAC-LC at 192 kbit/s in 1024-sample frames. The encoder's priming frames are
+/// dropped so the soundtrack starts with the first video frame.
+struct Soundtrack {
+    encoder: fdk_aac::enc::Encoder,
+    pcm: Vec<i16>,
+    output: Vec<u8>,
+    skip: usize,
+    delay: usize,
+}
+
+impl Soundtrack {
+    fn new() -> Result<Self, String> {
+        use fdk_aac::enc::{AudioObjectType, BitRate, ChannelMode, Encoder, EncoderParams, Transport};
+        let encoder = Encoder::new(EncoderParams {
+            bit_rate: BitRate::Cbr(AUDIO_BITRATE),
+            sample_rate: AUDIO_RATE as u32,
+            transport: Transport::Raw,
+            channels: ChannelMode::Stereo,
+            audio_object_type: AudioObjectType::Mpeg4LowComplexity,
+        })
+        .map_err(|e| format!("Could not start the AAC encoder: {e:?}"))?;
+        let info = encoder.info().map_err(|e| format!("Could not start the AAC encoder: {e:?}"))?;
+        let delay = info.nDelay as usize;
+        Ok(Self { encoder, pcm: Vec::new(), output: vec![0; (info.maxOutBufBytes as usize).max(8192)], skip: (delay + AAC_FRAME / 2) / AAC_FRAME, delay })
+    }
+
+    /// Encodes whole frames of interleaved stereo and hands each one to `emit`.
+    fn push(&mut self, samples: &[i16], emit: &mut impl FnMut(Vec<u8>) -> Result<(), String>) -> Result<(), String> {
+        self.pcm.extend_from_slice(samples);
+        let frame = AAC_FRAME * 2;
+        let mut start = 0;
+        while self.pcm.len() - start >= frame {
+            let info = self
+                .encoder
+                .encode(&self.pcm[start..start + frame], &mut self.output)
+                .map_err(|e| format!("Audio encoding failed: {e:?}"))?;
+            if info.input_consumed == 0 && info.output_size == 0 {
+                return Err("The AAC encoder stopped accepting audio.".into());
+            }
+            start += info.input_consumed;
+            if info.output_size > 0 {
+                if self.skip > 0 {
+                    self.skip -= 1;
+                } else {
+                    emit(self.output[..info.output_size].to_vec())?;
+                }
+            }
+        }
+        self.pcm.drain(..start);
+        Ok(())
+    }
+
+    /// Pads the soundtrack with silence until the encoder has returned every sample.
+    fn finish(&mut self, emit: &mut impl FnMut(Vec<u8>) -> Result<(), String>) -> Result<(), String> {
+        let frames = (self.pcm.len() / 2).div_ceil(AAC_FRAME) + self.delay.div_ceil(AAC_FRAME);
+        let padding = frames * AAC_FRAME * 2 - self.pcm.len();
+        self.push(&vec![0; padding], emit)
+    }
+}
+
+/// Splits Annex B output into NAL units without their start codes.
+fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let ends: Vec<usize> = starts
+        .iter()
+        .skip(1)
+        .map(|&next| {
+            let mut end = next - 3;
+            while end > 0 && data[end - 1] == 0 {
+                end -= 1;
+            }
+            end
+        })
+        .chain(std::iter::once(data.len()))
+        .collect();
+    starts.into_iter().zip(ends).map(move |(start, end)| &data[start..end.max(start)])
+}
+
 fn encode(
     path: PathBuf,
     width: u32,
@@ -260,170 +433,131 @@ fn encode(
     packets: Receiver<Packet>,
     ready: Sender<Result<(), String>>,
 ) -> Result<u64, String> {
-    use windows::Win32::Media::MediaFoundation::*;
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile, RateControlMode, UsageType, VuiConfig};
+    use openh264::OpenH264API;
 
-    unsafe {
-        let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        if let Err(error) = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) {
-            let message = format!(
-                "Windows video encoding is unavailable ({error}). On Windows N editions, install the Media Feature Pack."
-            );
+    let config = EncoderConfig::new()
+        .bitrate(BitRate::from_bps(bitrate))
+        .max_frame_rate(FrameRate::from_hz(FRAME_RATE as f32))
+        // OpenH264 rejects its non-real-time usages; this one still encodes every frame.
+        .usage_type(UsageType::CameraVideoRealTime)
+        .rate_control_mode(RateControlMode::Bitrate)
+        .profile(Profile::High)
+        .complexity(Complexity::Medium)
+        .intra_frame_period(IntraFramePeriod::from_num_frames(KEYFRAME_INTERVAL))
+        .skip_frames(false)
+        // One thread per video is fastest; several videos convert at once instead.
+        .num_threads(1)
+        .vui(VuiConfig::bt709());
+    let started = Encoder::with_api_config(OpenH264API::from_source(), config)
+        .map_err(|e| format!("Could not start the H.264 encoder: {e}"))
+        .and_then(|encoder| Ok((encoder, if audio { Some(Soundtrack::new()?) } else { None })));
+    let (mut encoder, mut soundtrack) = match started {
+        Ok(started) => started,
+        Err(message) => {
             let _ = ready.send(Err(message.clone()));
-            if com {
-                CoUninitialize();
-            }
             return Err(message);
         }
-        let result = (|| {
-            let writer = match open_writer(&path, width, height, bitrate, audio) {
-                Ok(writer) => writer,
-                Err(error) => {
-                    let message = format!("Could not start the H.264 encoder: {error}");
-                    let _ = ready.send(Err(message.clone()));
-                    return Err(message);
-                }
-            };
-            let _ = ready.send(Ok(()));
-            let (w, h) = (width as usize, height as usize);
-            let mut nv12 = vec![0u8; w * h * 3 / 2];
-            let (mut count, mut audio_frames) = (0u64, 0u64);
-            for packet in packets {
-                match packet {
-                    Packet::Video(rgb) => {
-                        if rgb.len() != w * h * 3 {
-                            return Err("A recorded frame has the wrong size.".to_string());
-                        }
-                        rgb_to_nv12(&rgb, w, h, &mut nv12);
-                        let (start, end) = (count * 10_000_000 / FRAME_RATE, (count + 1) * 10_000_000 / FRAME_RATE);
-                        write_sample(&writer, 0, &nv12, start, end).map_err(|e| format!("Video encoding failed: {e}"))?;
-                        count += 1;
-                    }
-                    Packet::Audio(samples) if audio && !samples.is_empty() => {
-                        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-                        let start = audio_frames * 10_000_000 / AUDIO_RATE;
-                        audio_frames += samples.len() as u64 / 2;
-                        let end = audio_frames * 10_000_000 / AUDIO_RATE;
-                        write_sample(&writer, 1, &bytes, start, end).map_err(|e| format!("Audio encoding failed: {e}"))?;
-                    }
-                    Packet::Audio(_) => {}
-                }
-            }
-            if count > 0 {
-                writer.Finalize().map_err(|e| format!("Could not finish the video: {e}"))?;
-            }
-            Ok(count)
-        })();
-        let _ = MFShutdown();
-        if com {
-            CoUninitialize();
-        }
-        result
-    }
-}
-
-#[cfg(windows)]
-unsafe fn open_writer(
-    path: &Path,
-    width: u32,
-    height: u32,
-    bitrate: u32,
-    audio: bool,
-) -> windows::core::Result<windows::Win32::Media::MediaFoundation::IMFSinkWriter> {
-    use windows::core::HSTRING;
-    use windows::Win32::Media::MediaFoundation::*;
-
-    let size = ((width as u64) << 32) | height as u64;
-    let rate = (FRAME_RATE << 32) | 1;
-    let video_type = |subtype: &windows::core::GUID| -> windows::core::Result<IMFMediaType> {
-        let media = MFCreateMediaType()?;
-        media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        media.SetGUID(&MF_MT_SUBTYPE, subtype)?;
-        media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        media.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
-        media.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
-        media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1 << 32) | 1)?;
-        media.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
-        media.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
-        media.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-        media.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
-        Ok(media)
     };
-    let output = video_type(&MFVideoFormat_H264)?;
-    output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
-    output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
-    let input = video_type(&MFVideoFormat_NV12)?;
-    input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
+    let _ = ready.send(Ok(()));
 
-    let mut attributes = None;
-    MFCreateAttributes(&mut attributes, 2)?;
-    let attributes = attributes.ok_or_else(windows::core::Error::empty)?;
-    attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-    // Offline encoding: write as fast as frames arrive rather than in real time.
-    attributes.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
-    let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attributes)?;
-    let stream = writer.AddStream(&output)?;
-    writer.SetInputMediaType(stream, &input, None)?;
-    if audio {
-        let audio_type = |subtype: &windows::core::GUID| -> windows::core::Result<IMFMediaType> {
-            let media = MFCreateMediaType()?;
-            media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            media.SetGUID(&MF_MT_SUBTYPE, subtype)?;
-            media.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-            media.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE as u32)?;
-            media.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-            Ok(media)
-        };
-        // 192 kbit/s, the highest rate the Windows AAC encoder offers.
-        let output = audio_type(&MFAudioFormat_AAC)?;
-        output.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
-        let input = audio_type(&MFAudioFormat_PCM)?;
-        input.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
-        input.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_RATE as u32 * 4)?;
-        let stream = writer.AddStream(&output)?;
-        writer.SetInputMediaType(stream, &input, None)?;
-    }
-    writer.BeginWriting()?;
-    Ok(writer)
+    let (w, h) = (width as usize, height as usize);
+    // Colour conversion runs on its own thread, so the encoder never waits for it.
+    // Video packets leave it as I420; spare buffers come back for reuse.
+    let (converted, frames) = mpsc::sync_channel::<Packet>(2);
+    let (recycle, spare) = mpsc::channel::<Vec<u8>>();
+    let converter = std::thread::spawn(move || -> Result<(), String> {
+        for packet in packets {
+            let packet = match packet {
+                Packet::Video(rgb) => {
+                    if rgb.len() != w * h * 3 {
+                        return Err("A recorded frame has the wrong size.".to_string());
+                    }
+                    let mut i420 = spare.try_recv().unwrap_or_else(|_| vec![0u8; w * h * 3 / 2]);
+                    rgb_to_i420(&rgb, w, h, &mut i420);
+                    Packet::Video(i420)
+                }
+                audio => audio,
+            };
+            if converted.send(packet).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+    let encoded = encode_packets(&mut encoder, soundtrack.as_mut(), frames, recycle, Muxer { file: None, path, width, height, audio, queued: Vec::new() });
+    // An encoder error stops the converter at its next frame.
+    let conversion = converter.join().unwrap_or_else(|_| Err("The video converter stopped unexpectedly.".into()));
+    let count = encoded?;
+    conversion?;
+    Ok(count)
 }
 
-#[cfg(windows)]
-// Times are in Media Foundation's 100 ns units.
-unsafe fn write_sample(
-    writer: &windows::Win32::Media::MediaFoundation::IMFSinkWriter,
-    stream: u32,
-    bytes: &[u8],
-    start: u64,
-    end: u64,
-) -> windows::core::Result<()> {
-    use windows::Win32::Media::MediaFoundation::*;
-
-    let buffer = MFCreateMemoryBuffer(bytes.len() as u32)?;
-    let mut data = std::ptr::null_mut();
-    buffer.Lock(&mut data, None, None)?;
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-    buffer.Unlock()?;
-    buffer.SetCurrentLength(bytes.len() as u32)?;
-    let sample = MFCreateSample()?;
-    sample.AddBuffer(&buffer)?;
-    sample.SetSampleTime(start as i64)?;
-    sample.SetSampleDuration((end - start) as i64)?;
-    writer.WriteSample(stream, &sample)
-}
-
-#[cfg(not(windows))]
-fn encode(
-    _: PathBuf,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: bool,
-    _: Receiver<Packet>,
-    ready: Sender<Result<(), String>>,
+fn encode_packets(
+    encoder: &mut openh264::encoder::Encoder,
+    mut soundtrack: Option<&mut Soundtrack>,
+    frames: Receiver<Packet>,
+    recycle: Sender<Vec<u8>>,
+    mut muxer: Muxer,
 ) -> Result<u64, String> {
-    let message = "Video recording requires Windows.".to_string();
-    let _ = ready.send(Err(message.clone()));
-    Err(message)
+    use openh264::formats::YUVSlices;
+    let (w, h) = (muxer.width as usize, muxer.height as usize);
+    let (mut count, mut carried) = (0u64, 0u32);
+    for packet in frames {
+        match packet {
+            Packet::Video(i420) => {
+                let (luma, chroma) = i420.split_at(w * h);
+                let (blue, red) = chroma.split_at(w * h / 4);
+                let yuv = YUVSlices::new((luma, blue, red), (w, h), (w, w / 2, w / 2));
+                let stream = encoder.encode(&yuv).map_err(|e| format!("Video encoding failed: {e}"))?;
+                let is_sync = matches!(stream.frame_type(), openh264::encoder::FrameType::IDR);
+                let (mut sps, mut pps, mut sample) = (None, None, Vec::new());
+                for layer in (0..stream.num_layers()).filter_map(|i| stream.layer(i)) {
+                    for unit in (0..layer.nal_count()).filter_map(|i| layer.nal_unit(i)).flat_map(nal_units) {
+                        match unit.first().map(|byte| byte & 0x1f) {
+                            Some(7) => sps = Some(unit.to_vec()),
+                            Some(8) => pps = Some(unit.to_vec()),
+                            Some(_) => {
+                                sample.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+                                sample.extend_from_slice(unit);
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                let _ = recycle.send(i420);
+                if muxer.file.is_none() {
+                    let (Some(sps), Some(pps)) = (sps, pps) else {
+                        return Err("The H.264 encoder did not describe its first frame.".to_string());
+                    };
+                    muxer.open(&sps, &pps)?;
+                }
+                // A frame the encoder dropped lengthens the next one, so later frames keep their time.
+                carried += 1000;
+                if !sample.is_empty() {
+                    muxer.sample(1, sample, carried, is_sync)?;
+                    carried = 0;
+                }
+                count += 1;
+            }
+            Packet::Audio(samples) => {
+                if let Some(soundtrack) = soundtrack.as_mut() {
+                    soundtrack.push(&samples, &mut |frame| muxer.audio_frame(frame))?;
+                }
+            }
+        }
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    if let Some(soundtrack) = soundtrack.as_mut() {
+        soundtrack.finish(&mut |frame| muxer.audio_frame(frame))?;
+    }
+    let mut file = muxer.file.take().ok_or("The video file is not open.")?;
+    file.write_end().map_err(|e| format!("Could not finish the video: {e}"))?;
+    use std::io::Write;
+    file.into_writer().flush().map_err(|e| format!("Could not finish the video: {e}"))?;
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -431,7 +565,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nv12_uses_bt709_limited_range() {
+    fn i420_uses_bt709_limited_range() {
         // Two rows of white, black, red and blue pixel pairs.
         let mut rgb = Vec::new();
         for _ in 0..2 {
@@ -440,11 +574,12 @@ mod tests {
                 rgb.extend(color);
             }
         }
-        let mut nv12 = vec![0; 8 * 2 * 3 / 2];
-        rgb_to_nv12(&rgb, 8, 2, &mut nv12);
-        assert_eq!(&nv12[..8], &[235, 235, 16, 16, 63, 63, 32, 32]);
+        let mut i420 = vec![0; 8 * 2 * 3 / 2];
+        rgb_to_i420(&rgb, 8, 2, &mut i420);
+        assert_eq!(&i420[..8], &[235, 235, 16, 16, 63, 63, 32, 32]);
         // White and black have neutral chroma; red is high Cr, blue high Cb.
-        assert_eq!(&nv12[16..], &[128, 128, 128, 128, 102, 240, 240, 118]);
+        assert_eq!(&i420[16..20], &[128, 128, 102, 240]);
+        assert_eq!(&i420[20..], &[128, 128, 240, 118]);
     }
 
     #[test]

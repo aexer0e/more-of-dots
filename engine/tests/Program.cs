@@ -93,6 +93,57 @@ var tests = new (string, Action)[] {
         }
         Check(both == 33, $"Expected 33 maps in both modes, found {both}");
     }),
+    ("every official map plays in every match format", () => {
+        using var catalog = JsonDocument.Parse(File.ReadAllText("engine/repsim/maps/deployments.json"));
+        int opened = 0;
+        foreach (var entry in catalog.RootElement.EnumerateObject())
+        {
+            var layout = entry.Value.EnumerateObject().First(mode => mode.Name != "avalanche").Value;
+            int colors = layout.GetProperty("infantry").GetArrayLength();
+            var formats = colors == 2 ? new[] { "1v1", "2v2", "experiment" } : new[] { colors == 3 ? "v3" : "v4", "ffa", "experiment" };
+            int? units = null;
+            foreach (string format in formats)
+            {
+                var root = Fixture(); root["map"] = int.Parse(entry.Name); root["mode"] = format; root["version"] = "1.4.1";
+                Replay replay;
+                try { replay = Read(root); }
+                // Images outside the bundled set come from the installed game.
+                catch (FormatException error) when (error.Message.StartsWith("Cannot decode terrain map")) { break; }
+                Check(replay.Experimental == (format == "experiment"), $"Map {entry.Name} in {format} used the wrong rules");
+                Check(units is null || replay.Units.Count == units, $"Map {entry.Name} has a different army in {format}");
+                units = replay.Units.Count;
+                opened++;
+            }
+        }
+        Check(opened >= 60, $"Only {opened} map and format combinations opened");
+    }),
+    ("a map the catalog lacks takes its layout from a replay of it in another mode", () => {
+        string folder = Directory.CreateTempSubdirectory("repsim-layouts-").FullName;
+        var games = MapSurfaceImage.GameDirectories;
+        try {
+            Directory.CreateDirectory(Path.Combine(folder, "assets", "fahero_maps"));
+            File.Copy("engine/repsim/maps/map1.png", Path.Combine(folder, "assets", "fahero_maps", "map999.png"));
+            int[][] Units(int x) => Enumerable.Range(0, 5).Select(i => new[] { x, 100 + 50 * i }).ToArray();
+            var source = Fixture(); source["mode"] = "experiment"; source["version"] = "1.4.1";
+            source["map"] = JsonNode.Parse(JsonSerializer.Serialize(new {
+                path = "assets/fahero_maps/map999.png", infantry = new[] { Units(100), Units(1500) },
+                motorised = new[] { new[] { new[] { 150, 400 } }, new[] { new[] { 1450, 400 } } },
+                cities = new[] { new[] { 200, 450 }, new[] { 1400, 450 } }, capitals = new[] { 0, 1 },
+            }));
+            File.WriteAllText(Path.Combine(folder, "source.rep"), source.ToJsonString());
+            MapSurfaceImage.GameDirectories = [folder];
+            BuiltInDeployments.ReplayDirectories = [folder];
+            foreach (string mode in new[] { "1v1", "2v2", "experiment" }) {
+                var root = Fixture(); root["map"] = 999; root["mode"] = mode; root["version"] = "1.4.1";
+                var replay = Read(root);
+                Check(replay.Units.Count == 12 && replay.Experimental == (mode == "experiment"), $"Map 999 in {mode} did not take the recorded layout");
+            }
+        } finally {
+            BuiltInDeployments.ReplayDirectories = [];
+            MapSurfaceImage.GameDirectories = games;
+            Directory.Delete(folder, true);
+        }
+    }),
     ("maps known in one mode play in the other", () => {
         foreach (int id in new[] { 29, 46, 47, 49, 50 }) {
             var root = Fixture(); root["map"] = id; root["mode"] = "1v1"; root["version"] = "1.4.1";

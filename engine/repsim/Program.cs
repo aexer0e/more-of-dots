@@ -555,31 +555,49 @@ internal sealed class MapSurfaceImage
         string fileName = Path.GetFileName(normalized);
         string supplied = Path.IsPathRooted(replayPath) ? replayPath : Path.Combine(replayDirectory, normalized.Replace('/', Path.DirectorySeparatorChar));
         if (File.Exists(supplied)) return supplied;
-        string companion = Path.Combine(replayDirectory, "maps", fileName);
-        if (File.Exists(companion)) return companion;
+        if (!Path.IsPathRooted(replayPath) && FindFile(replayDirectory, normalized) is { } matched) return matched;
+        if (FindFile(replayDirectory, "maps/" + fileName) is { } companion) return companion;
         // Official maps (fahero, zolamare, eronion) come from the installed game when it is available.
         if (normalized.StartsWith("assets/", StringComparison.OrdinalIgnoreCase) && !normalized.Contains(".."))
         {
             foreach (string directory in GameDirectories)
             {
-                string installed = Path.Combine(directory, normalized.Replace('/', Path.DirectorySeparatorChar));
-                if (File.Exists(installed)) return installed;
+                if (FindFile(directory, normalized) is { } installed) return installed;
             }
             // Keep each author's asset directory. Their numbered PNG filenames
             // can collide even though the native catalog paths differ.
-            string bundledAsset = Path.Combine(AppContext.BaseDirectory, "maps", normalized.Replace('/', Path.DirectorySeparatorChar));
-            if (File.Exists(bundledAsset)) return bundledAsset;
+            if (FindFile(Path.Combine(AppContext.BaseDirectory, "maps"), normalized) is { } bundledAsset) return bundledAsset;
         }
         if (normalized.Equals(fileName, StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("assets/fahero_maps/", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("assets/zolamare_maps/", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("assets/eronion_maps/", StringComparison.OrdinalIgnoreCase))
         {
-            string bundled = Path.Combine(AppContext.BaseDirectory, "maps", fileName);
-            if (File.Exists(bundled)) return bundled;
+            if (FindFile(Path.Combine(AppContext.BaseDirectory, "maps"), fileName) is { } bundled) return bundled;
         }
         Unresolved = normalized;
         return null;
+    }
+
+    /// A file under `root` named by a relative path, matching each part without
+    /// regard to case as Windows and macOS do, so Linux finds the same files.
+    private static string? FindFile(string root, string relative)
+    {
+        var parts = relative.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0 || parts.Any(part => part is "." or "..")) return null;
+        string exact = Path.Combine([root, .. parts]);
+        if (File.Exists(exact)) return exact;
+        string current = root;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (!Directory.Exists(current)) return null;
+            bool last = i == parts.Length - 1;
+            var entries = last ? Directory.EnumerateFiles(current) : Directory.EnumerateDirectories(current);
+            string? match = entries.FirstOrDefault(entry => Path.GetFileName(entry).Equals(parts[i], StringComparison.OrdinalIgnoreCase));
+            if (match is null) return null;
+            current = match;
+        }
+        return current;
     }
 
     private static MapSurfaceImage? DecodeBytes(byte[] png)

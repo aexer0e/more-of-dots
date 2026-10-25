@@ -28,7 +28,10 @@ if (run("git", ["status", "--porcelain", "--untracked-files=no"])) console.warn(
 const pushed = spawnSync("git", ["rev-parse", `origin/${branch}`], { cwd: root, encoding: "utf8" }).stdout.trim();
 if (pushed !== commit) throw new Error(`Push ${branch} first: CI builds the pushed commit, and origin/${branch} is not ${commit.slice(0, 7)}.`);
 
-let build = runsFor(branch, commit).find((item) => item.conclusion === "success") ?? runsFor(branch, commit).find((item) => item.status !== "completed");
+// A finished build is reused, even one where a platform failed: the others still have installers.
+const runs = runsFor(branch, commit);
+let build = runs.find((item) => item.conclusion === "success") ?? runs.find((item) => item.status !== "completed")
+  ?? runs.find((item) => item.conclusion === "failure");
 if (!build) {
   console.log(`Starting a build of ${branch} at ${commit.slice(0, 7)}.`);
   run("gh", ["workflow", "run", WORKFLOW, "--ref", branch]);
@@ -40,12 +43,16 @@ if (!build) {
 }
 if (build.status !== "completed") {
   console.log(`Waiting for ${build.url} (about half an hour).`);
-  if (!watch(build.databaseId)) throw new Error(`The build failed: ${build.url}`);
+  watch(build.databaseId);
 }
+const failed = JSON.parse(run("gh", ["run", "view", String(build.databaseId), "--json", "jobs"], { quiet: true })).jobs
+  .filter((job) => job.conclusion !== "success").map((job) => job.name);
+if (failed.length) console.warn(`No installer from ${failed.join(", ")}: the build failed there. See ${build.url}`);
 
 const destination = path.join(root, "build", "installers", commit.slice(0, 7));
 fs.rmSync(destination, { recursive: true, force: true });
-run("gh", ["run", "download", String(build.databaseId), "--dir", destination]);
+const downloaded = spawnSync("gh", ["run", "download", String(build.databaseId), "--dir", destination], { cwd: root, stdio: "inherit" });
+if (downloaded.status !== 0 || !fs.existsSync(destination)) throw new Error(`The build has no installers to download: ${build.url}`);
 console.log(`Installers for ${commit.slice(0, 7)}:`);
 for (const entry of fs.readdirSync(destination, { recursive: true, withFileTypes: true })) {
   if (entry.isFile()) console.log(`  ${path.relative(root, path.join(entry.parentPath, entry.name))}`);

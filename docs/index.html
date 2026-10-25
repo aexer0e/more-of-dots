@@ -220,59 +220,6 @@
       margin-top: 10px;
     }
 
-    /* ---- features ---- */
-
-    section.features-section {
-      padding-top: 64px;
-    }
-
-    h2 {
-      font-size: 1.45rem;
-      margin-bottom: 26px;
-      text-align: center;
-    }
-
-    .features {
-      list-style: none;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 26px 40px;
-    }
-
-    @media (max-width: 640px) {
-      .features { grid-template-columns: 1fr; }
-    }
-
-    .features li {
-      display: grid;
-      grid-template-columns: 26px 1fr;
-      gap: 14px;
-      align-items: start;
-    }
-
-    .features .dot {
-      width: 17px;
-      height: 17px;
-      margin-top: 5px;
-      border-radius: 50%;
-      border: 2.5px solid var(--line);
-    }
-
-    .features li:nth-child(4n+1) .dot { background: var(--blue); }
-    .features li:nth-child(4n+2) .dot { background: var(--red); }
-    .features li:nth-child(4n+3) .dot { background: var(--red); }
-    .features li:nth-child(4n+4) .dot { background: var(--blue); }
-
-    .features strong {
-      display: block;
-      font-size: 1.05rem;
-    }
-
-    .features p {
-      color: var(--muted);
-      font-size: 0.95rem;
-    }
-
     /* ---- dots divider ---- */
 
     .dots {
@@ -357,60 +304,12 @@
   </svg>
 
   <div class="container">
-    <section class="features-section">
-      <h2>Features</h2>
-      <ul class="features">
-        <li>
-          <span class="dot" aria-hidden="true"></span>
-          <div>
-            <strong>Replay player</strong>
-            <p>Open any replay in its own window. Seek, change speed and toggle layers, with the game's own music and sounds.</p>
-          </div>
-        </li>
-        <li>
-          <span class="dot" aria-hidden="true"></span>
-          <div>
-            <strong>Video export</strong>
-            <p>Turn replays into MP4 videos with sound, up to 1080p and much faster than real time.</p>
-          </div>
-        </li>
-        <li>
-          <span class="dot" aria-hidden="true"></span>
-          <div>
-            <strong>Region selection</strong>
-            <p>Choose the server region the game matches you on, while it runs. Available on Windows.</p>
-          </div>
-        </li>
-        <li>
-          <span class="dot" aria-hidden="true"></span>
-          <div>
-            <strong>Replay browser</strong>
-            <p>Search by player, filter by mode and map, and keep a backup of every replay.</p>
-          </div>
-        </li>
-        <li>
-          <span class="dot" aria-hidden="true"></span>
-          <div>
-            <strong>Leaderboards</strong>
-            <p>Track your rank and compare your progress with up to 10 other players.</p>
-          </div>
-        </li>
-        <li>
-          <span class="dot" aria-hidden="true"></span>
-          <div>
-            <strong>Map editor</strong>
-            <p>Paint terrain, place units, and save custom maps to the game.</p>
-          </div>
-        </li>
-      </ul>
-    </section>
-
     <div class="shot-pair">
       <figure class="tilt-r">
         <div class="shot">
           <img src="screenshots/player.png" alt="The replay player showing a 2v2 match on Zolamare 51, with front lines, units, player names, casualty and troop counts, and the playback bar" width="1280" height="720" loading="lazy">
         </div>
-        <figcaption><span class="cap-dot red"></span>Replay player, 2v2 on Zolamare 51</figcaption>
+        <figcaption><span class="cap-dot red"></span>Replay player</figcaption>
       </figure>
       <figure class="tilt-l">
         <div class="shot">

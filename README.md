@@ -10,7 +10,7 @@ Version 2.0.0 includes an independent replay player and video exporter in the de
 - Follow global leaderboards, track your progress, and compare players
 - Create and edit custom maps, including motorised infantry
 
-More of Dots runs on Windows and on macOS with Apple silicon. Region selection is available on Windows only; on macOS its tab is shown but cannot be opened.
+More of Dots runs on Windows and on macOS with Apple silicon. A Linux AppImage is also built, for playing the game through Steam's Proton; it is less tested. Region selection is available on Windows only; elsewhere its tab is shown but cannot be opened.
 
 ## Custom maps
 
@@ -40,11 +40,13 @@ Simulated replays are not written to disk. On Windows, disposable WebView2 cache
 
 ### Developing the desktop app
 
-Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. On Windows also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. Set `NASM` if it is not on `PATH`. Apple silicon builds need no extra tools.
+Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. On Windows and Linux also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. Set `NASM` if it is not on `PATH`. Apple silicon builds need no extra tools.
 
 `npm run prepare:player` (run by `dev:desktop` and `build`) publishes the engine in `engine/repsim` for the current platform, stages the unit artwork and third-party notices, and writes a SHA-256 manifest for the staged resources. On Windows it also builds the Region probe. The installed app does not need the .NET SDK.
 
-`npm run check` checks the web modules. `npm run check:native` runs the Rust tests; on Windows it supplies the manifest that native dialog imports need in the test executable. `npm run check:engine` runs the engine tests. `npm run build` packages the app for the current platform. The draft release workflow builds the Windows installer and the macOS app and disk image into one draft release.
+`npm run check` checks the web modules. `npm run check:native` runs the Rust tests; on Windows it supplies the manifest that native dialog imports need in the test executable. `npm run check:engine` runs the engine tests. `npm run build` packages the app for the current platform: the NSIS installer on Windows, the app and disk image on macOS, and the AppImage on Linux. The draft release workflow builds all three into one draft release.
+
+macOS and Linux installers cannot be built on Windows. To send them to testers before a release, push the branch and run `npm run installers`. It downloads the installers the Build workflow made for the current commit into `build/installers`, starting a build and waiting for it if there is none yet. It needs the GitHub CLI, signed in.
 
 macOS builds are signed ad hoc, not notarized. The first time the app is opened, macOS asks to confirm it under **System Settings > Privacy & Security > Open Anyway**. Before a release, follow the [macOS test checklist](docs/macos-testing.md).
 

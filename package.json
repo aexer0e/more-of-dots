@@ -24,6 +24,7 @@
     "prepare:player": "node scripts/prepare-player.mjs",
     "check:native": "node scripts/check-native.mjs",
     "check:player": "node --test scripts/player-scheduling.test.mjs scripts/player-sound.test.mjs scripts/player-view.test.mjs scripts/player-frames.test.mjs",
+    "installers": "node scripts/download-installers.mjs",
     "check:engine": "dotnet run --project engine/tests/ReplaySim.Tests.csproj -c Release"
   },
   "dependencies": {

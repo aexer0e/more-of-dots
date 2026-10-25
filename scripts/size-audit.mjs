@@ -48,9 +48,9 @@ const entries = [
   entry("replay-engine", path.join(root, "src-tauri", "resources", "player", `ReplaySim.Standalone${executable}`)),
   entry("tauri-exe", app),
   entry("nsis-installer", newest(path.join(bundle, "nsis"), (name) => name.includes(version) && name.endsWith(".exe"))),
-  entry("msi-installer", newest(path.join(bundle, "msi"), (name) => name.includes(version) && name.endsWith(".msi"))),
   entry("macos-app", newest(path.join(bundle, "macos"), (name) => name.endsWith(".app"))),
   entry("dmg", newest(path.join(bundle, "dmg"), (name) => name.includes(version) && name.endsWith(".dmg"))),
+  entry("appimage", newest(path.join(bundle, "appimage"), (name) => name.includes(version) && name.endsWith(".AppImage"))),
 ].filter((item) => item.exists || item.kind === "replay-engine" || item.kind === "tauri-exe");
 
 const auditPath = path.join(root, "build", "size-audit.json");

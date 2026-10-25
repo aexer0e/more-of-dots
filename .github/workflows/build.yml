@@ -1,8 +1,8 @@
 name: Build
 
 # Builds and tests the app on every platform it ships for, so a change that
-# only breaks the macOS build is caught before release. The macOS app is kept
-# as an artifact for testing on a Mac.
+# only breaks one platform's build is caught before release. The installers
+# are kept as artifacts; `npm run installers` downloads them.
 on:
   pull_request:
   workflow_dispatch:
@@ -30,6 +30,10 @@ jobs:
           - name: macOS
             runner: macos-latest
             bundles: app,dmg
+          # The oldest supported Ubuntu, so the AppImage runs on older systems too.
+          - name: Linux
+            runner: ubuntu-22.04
+            bundles: appimage
 
     steps:
       - name: Check out repository
@@ -54,6 +58,13 @@ jobs:
         run: |
           choco install nasm --no-progress -y
           "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      # Tauri's WebKitGTK build dependencies, the AppImage tools, and NASM for OpenH264.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file nasm
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -82,3 +93,4 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/appimage/*.AppImage

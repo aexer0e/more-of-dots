@@ -88,6 +88,8 @@ internal sealed class Options
     public HashSet<string> Layers { get; private set; } = ["orders", "health", "morale", "flags", "icons", "stats", "players"];
     public string? AssetsDirectory { get; private set; }
     public string? DumpDraws { get; private set; }
+    /// Video frames drawn at once. Rendering runs on the CPU, so a few cores keep up with the encoder.
+    public int RenderThreads { get; private set; } = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
 
     public static Options Parse(string[] args)
     {
@@ -127,6 +129,7 @@ internal sealed class Options
                 case "--layers": o.Layers = Next(args, ref i, arg).Split(',', StringSplitOptions.RemoveEmptyEntries).ToHashSet(); break;
                 case "--assets": o.AssetsDirectory = Next(args, ref i, arg); break;
                 case "--dump-draws": o.DumpDraws = Next(args, ref i, arg); break;
+                case "--render-threads": o.RenderThreads = int.Parse(Next(args, ref i, arg), CultureInfo.InvariantCulture); break;
                 default:
                     if (arg.StartsWith('-')) throw new ArgumentException($"Unknown option: {arg}");
                     if (o.Input != null) throw new ArgumentException("Only one input replay may be supplied.");
@@ -137,6 +140,7 @@ internal sealed class Options
         if (o.MaxFrame is < 0) throw new ArgumentException("--max-frame must be non-negative.");
         if (o.SampleEvery < 1) throw new ArgumentException("--sample-every must be positive.");
         if (o.Step < 1) throw new ArgumentException("--step must be positive.");
+        if (o.RenderThreads is < 1 or > 64) throw new ArgumentException("--render-threads must be between 1 and 64.");
         if (o.Width is < 2 or > 3840 || o.Height is < 2 or > 2160 || o.Width % 2 != 0 || o.Height % 2 != 0)
             throw new ArgumentException("Video size must be even and at most 3840x2160.");
         return o;
@@ -149,8 +153,8 @@ internal sealed class Options
         ReplaySim Standalone - offline War of Dots replay simulator
 
         Usage:
-          ReplaySim.Standalone.exe input.rep [-o output.repsim]
-          ReplaySim.Standalone.exe input.rep --render-state -o -   (stream to stdout)
+          ReplaySim.Standalone input.rep [-o output.repsim]
+          ReplaySim.Standalone input.rep --render-state -o -   (stream to stdout)
 
         Options:
           --max-frame N       stop after frame N (development/parity probes)
@@ -164,6 +168,7 @@ internal sealed class Options
             --step N               draw every Nth simulated frame (playback speed)
             --layers a,b,...       orders,health,morale,flags,stats,icons,produce,players
             --assets DIR           unit artwork folder (default: player-assets)
+            --render-threads N     frames drawn at once (default: half the cores, at most 4)
           -h, --help          show this help
 
         The tool reads gzip or plain JSON .rep files and does not launch or require

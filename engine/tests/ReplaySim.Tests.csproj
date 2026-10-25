@@ -7,7 +7,5 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../repsim/ReplaySim.Standalone.csproj" />
-    <!-- Render state draws player labels with SDL_ttf. -->
-    <None Include="../native/*.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

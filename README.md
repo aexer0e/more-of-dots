@@ -40,7 +40,7 @@ Simulated replays are not written to disk. On Windows, disposable WebView2 cache
 
 ### Developing the desktop app
 
-Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. On Windows and Linux also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. Set `NASM` if it is not on `PATH`. Apple silicon builds need no extra tools.
+Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. On Windows and Linux also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. The build scripts find it on `PATH` or in its installer's default folder (`C:\Program Files\NASM`); set `NASM` to its path if it is elsewhere. Apple silicon builds need no extra tools.
 
 `npm run prepare:player` (run by `dev:desktop` and `build`) publishes the engine in `engine/repsim` for the current platform, stages the unit artwork and third-party notices, and writes a SHA-256 manifest for the staged resources. On Windows it also builds the Region probe. The installed app does not need the .NET SDK.
 

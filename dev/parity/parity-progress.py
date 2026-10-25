@@ -6,7 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-REPO=Path(__file__).resolve().parents[1]
+REPO=Path(__file__).resolve().parents[2]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--root',type=Path,default=REPO/'build/game-parity')
 p.add_argument('--engine',type=Path)
@@ -16,7 +16,7 @@ inventory=json.loads((a.root/'inventory.json').read_text(encoding='utf-8'))
 expected={row['sha256'] for row in inventory['files'] if row['qualifies']}
 fingerprint=None
 if a.engine:
-    spec=importlib.util.spec_from_file_location('parity_runner',REPO/'scripts/run-game-parity.py')
+    spec=importlib.util.spec_from_file_location('parity_runner',REPO/'dev/parity/run-game-parity.py')
     runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
     fingerprint=runner.engine_fingerprint(a.engine.resolve())
 receipts=[]

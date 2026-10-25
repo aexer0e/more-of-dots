@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import shutil
 
-REPO=Path(__file__).resolve().parents[1]
+REPO=Path(__file__).resolve().parents[2]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--root',type=Path,default=REPO/'build/game-parity')
 p.add_argument('--catalog',type=Path,required=True)

@@ -3,7 +3,7 @@ import runpy
 from pathlib import Path
 import unittest
 
-recover = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/recover-replay-deployments.py"))["recover_infantry"]
+recover = runpy.run_path(str(Path(__file__).resolve().parents[3] / "dev/parity/recover-replay-deployments.py"))["recover_infantry"]
 
 
 class DeploymentRecoveryTests(unittest.TestCase):

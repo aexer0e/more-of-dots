@@ -21,8 +21,8 @@ import struct
 import time
 import uuid
 
-REPO=Path(__file__).resolve().parents[1]
-spec=importlib.util.spec_from_file_location('strict_parity',REPO/'scripts/compare-parity-traces.py')
+REPO=Path(__file__).resolve().parents[2]
+spec=importlib.util.spec_from_file_location('strict_parity',REPO/'dev/parity/compare-parity-traces.py')
 strict=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strict)
 
@@ -196,7 +196,7 @@ def main():
     engine_hash=engine_fingerprint(engine) if engine.exists() else None
     if engine_hash and not args.native_only:
         engine=snapshot_engine(engine,root,engine_hash)
-    capture_hash=digest(REPO/'scripts/parity-native-capture.py')
+    capture_hash=digest(REPO/'dev/parity/parity-native-capture.py')
     flags=getattr(subprocess,'CREATE_NO_WINDOW',0)
     native_env=dict(os.environ,OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1')
 
@@ -243,9 +243,9 @@ def main():
                         # terminating a progressing capture at one fixed hour.
                         capture_timeout=max(3600,(end+14)//15+300)
                         receipt['native_timeout_seconds']=capture_timeout
-                        command=['pwsh','-NoProfile','-File',str(REPO/'scripts/invoke-parity-probe.ps1'),
+                        command=['pwsh','-NoProfile','-File',str(REPO/'dev/parity/invoke-parity-probe.ps1'),
                             '-GameDirectory',str(game),'-WorkDirectory',str(root/args.runtime_set/build),
-                            '-Payload',str(REPO/'scripts/parity-native-capture.py'),'-Configuration',str(config),
+                            '-Payload',str(REPO/'dev/parity/parity-native-capture.py'),'-Configuration',str(config),
                             '-StartupWaitSeconds',str(args.startup_wait_seconds),
                             '-TimeoutSeconds',str(capture_timeout)]
                         result=subprocess.run(command,capture_output=True,

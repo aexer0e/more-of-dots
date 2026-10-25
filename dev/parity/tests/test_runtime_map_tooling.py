@@ -5,22 +5,22 @@ from pathlib import Path
 import runpy
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_runtime_probe_and_snapshot_helpers_are_valid_python() -> None:
     for relative in (
-        "tools/runtime-map/runtime_probe.py",
-        "tools/runtime-map/summarize_snapshot.py",
-        "tools/runtime-map/inventory_artifacts.py",
-        "tools/runtime-map/reconstruct_source.py",
+        "dev/parity/runtime-map/runtime_probe.py",
+        "dev/parity/runtime-map/summarize_snapshot.py",
+        "dev/parity/runtime-map/inventory_artifacts.py",
+        "dev/parity/runtime-map/reconstruct_source.py",
     ):
         ast.parse((ROOT / relative).read_text(encoding="utf-8"), filename=relative)
 
 
 def test_runtime_capture_is_read_only_and_versioned() -> None:
-    probe = (ROOT / "tools/runtime-map/runtime_probe.py").read_text(encoding="utf-8")
-    launcher = (ROOT / "scripts/capture-runtime-map.ps1").read_text(encoding="utf-8")
+    probe = (ROOT / "dev/parity/runtime-map/runtime_probe.py").read_text(encoding="utf-8")
+    launcher = (ROOT / "dev/parity/capture-runtime-map.ps1").read_text(encoding="utf-8")
 
     assert "FORMAT_VERSION = 1" in probe
     assert "inspect.signature" in probe
@@ -66,7 +66,7 @@ def test_canonical_runtime_snapshot_redacts_sensitive_instance_fields() -> None:
 
 
 def test_reconstructed_source_is_importable_and_preserves_recovered_api() -> None:
-    tooling = runpy.run_path(str(ROOT / "tools/runtime-map/reconstruct_source.py"))
+    tooling = runpy.run_path(str(ROOT / "dev/parity/runtime-map/reconstruct_source.py"))
     runtime_paths = [
         ROOT / "docs/runtime-map/snapshots/20260812-062438-pid2888/runtime.json",
         ROOT / "docs/runtime-map/snapshots/20260812-062236-pid2888/runtime.json",

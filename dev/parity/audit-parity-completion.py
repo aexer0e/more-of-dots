@@ -11,8 +11,8 @@ import importlib.util
 import json
 from pathlib import Path
 
-REPO=Path(__file__).resolve().parents[1]
-spec=importlib.util.spec_from_file_location('parity_runner',REPO/'scripts/run-game-parity.py')
+REPO=Path(__file__).resolve().parents[2]
+spec=importlib.util.spec_from_file_location('parity_runner',REPO/'dev/parity/run-game-parity.py')
 runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 
 

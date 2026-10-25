@@ -11,13 +11,13 @@ import importlib.util
 import json
 from pathlib import Path
 
-REPO=Path(__file__).resolve().parents[1]
+REPO=Path(__file__).resolve().parents[2]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--root',type=Path,default=REPO/'build/game-parity')
 p.add_argument('--write',action='store_true')
 p.add_argument('--capture-script-sha',help='Supply only when the exact generation script hash is known')
 a=p.parse_args()
-spec=importlib.util.spec_from_file_location('strict_parity',REPO/'scripts/compare-parity-traces.py')
+spec=importlib.util.spec_from_file_location('strict_parity',REPO/'dev/parity/compare-parity-traces.py')
 strict=importlib.util.module_from_spec(spec);spec.loader.exec_module(strict)
 inventory=json.loads((a.root/'inventory.json').read_text())
 rows={r['sha256']:r for r in inventory['files'] if r['qualifies']}

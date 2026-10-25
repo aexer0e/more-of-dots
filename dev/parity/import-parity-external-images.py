@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 import shutil
 
-REPO=Path(__file__).resolve().parents[1];root=REPO/'build/game-parity'
-spec=importlib.util.spec_from_file_location('runner',REPO/'scripts/run-game-parity.py')
+REPO=Path(__file__).resolve().parents[2];root=REPO/'build/game-parity'
+spec=importlib.util.spec_from_file_location('runner',REPO/'dev/parity/run-game-parity.py')
 runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 plan=json.loads((root/'build-plan.json').read_text())['builds']
 records=json.loads((root/'inventory.json').read_text())['files']

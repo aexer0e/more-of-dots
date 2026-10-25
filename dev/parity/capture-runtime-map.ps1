@@ -6,10 +6,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$templatePath = Join-Path $repoRoot 'tools\runtime-map\runtime_probe.py'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$templatePath = Join-Path $repoRoot 'dev\parity\runtime-map\runtime_probe.py'
 $probeSource = Join-Path $repoRoot 'tools\python-probe-dll\target\release\wod_python_probe.dll'
-$injector = Join-Path $repoRoot 'scripts\invoke-python-probe.ps1'
+$injector = Join-Path $repoRoot 'dev\parity\invoke-python-probe.ps1'
 
 if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) { throw "Runtime probe template not found: $templatePath" }
 if (-not (Test-Path -LiteralPath $probeSource -PathType Leaf)) { throw "Build the Python probe DLL first: $probeSource" }
@@ -67,13 +67,13 @@ if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
     throw "Runtime probe did not produce runtime.json ($status)"
 }
 $summaryPath = Join-Path $snapshotRoot 'summary.json'
-$summarizer = Join-Path $repoRoot 'tools\runtime-map\summarize_snapshot.py'
+$summarizer = Join-Path $repoRoot 'dev\parity\runtime-map\summarize_snapshot.py'
 $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
 if ($null -eq $pythonCommand) { throw 'python.exe is required to summarize the case-sensitive runtime archive.' }
 $metricsText = & $pythonCommand.Source $summarizer $runtimePath $summaryPath
 if ($LASTEXITCODE -ne 0) { throw 'Runtime snapshot summarization failed.' }
 $metrics = $metricsText | ConvertFrom-Json
-$artifactInventory = Join-Path $repoRoot 'tools\runtime-map\inventory_artifacts.py'
+$artifactInventory = Join-Path $repoRoot 'dev\parity\runtime-map\inventory_artifacts.py'
 & $pythonCommand.Source $artifactInventory $gameRoot (Join-Path $snapshotRoot 'artifacts.json')
 if ($LASTEXITCODE -ne 0) { throw 'Game artifact inventory failed.' }
 

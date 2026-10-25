@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-spec = importlib.util.spec_from_file_location('strict_parity', Path(__file__).resolve().parents[1] / 'scripts/compare-parity-traces.py')
+spec = importlib.util.spec_from_file_location('strict_parity', Path(__file__).resolve().parents[3] / 'dev/parity/compare-parity-traces.py')
 parity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(parity)
 

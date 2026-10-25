@@ -2,7 +2,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-spec=importlib.util.spec_from_file_location('parity_audit',Path(__file__).resolve().parents[1]/'scripts/audit-parity-completion.py')
+spec=importlib.util.spec_from_file_location('parity_audit',Path(__file__).resolve().parents[3]/'dev/parity/audit-parity-completion.py')
 audit=importlib.util.module_from_spec(spec);spec.loader.exec_module(audit)
 
 

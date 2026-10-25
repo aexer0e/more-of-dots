@@ -9,7 +9,7 @@ param(
     [int]$TimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path -Parent $PSScriptRoot
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $source = (Resolve-Path -LiteralPath $GameDirectory).Path
 $work = [IO.Path]::GetFullPath($WorkDirectory)
 New-Item -ItemType Directory -Force -Path $work | Out-Null

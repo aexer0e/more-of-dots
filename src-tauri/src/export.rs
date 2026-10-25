@@ -128,6 +128,7 @@ pub async fn export_replay_videos(
     let context = Arc::new(Context {
         executable: resource(&app, &crate::player::engine_name())?,
         game_dirs,
+        replay_dirs: crate::layout_replay_dirs(&app),
         job: ProcessJob::new()?,
         cancel,
         options,
@@ -189,6 +190,7 @@ enum Outcome {
 struct Context {
     executable: PathBuf,
     game_dirs: Vec<PathBuf>,
+    replay_dirs: Vec<PathBuf>,
     job: ProcessJob,
     cancel: Arc<AtomicBool>,
     options: ExportOptions,
@@ -265,6 +267,7 @@ impl Context {
                 .args(["--layers", &self.options.layers.join(",")])
                 .args(["--render-threads", &self.render_threads().to_string()])
                 .args(self.game_dirs.iter().flat_map(|root| [OsStr::new("--game-dir"), root.as_os_str()]))
+                .args(self.replay_dirs.iter().flat_map(|dir| [OsStr::new("--replay-dir"), dir.as_os_str()]))
                 .current_dir(self.executable.parent().unwrap())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
@@ -427,6 +430,7 @@ mod throughput {
         let context = Context {
             executable: PathBuf::from(exe),
             game_dirs: crate::installed_game_dirs(),
+            replay_dirs: Vec::new(),
             job: ProcessJob::new().unwrap(),
             cancel: Arc::new(AtomicBool::new(false)),
             options: ExportOptions {

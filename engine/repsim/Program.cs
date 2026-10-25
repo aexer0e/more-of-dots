@@ -24,6 +24,7 @@ internal static class Program
                 throw new ArgumentException("An input .rep file is required.");
 
             MapSurfaceImage.GameDirectories = options.GameDirectories;
+            BuiltInDeployments.ReplayDirectories = options.ReplayDirectories;
 #if !BROWSER
             if (options.ExportVideo) return VideoExport.Run(options);
 #endif
@@ -81,6 +82,8 @@ internal sealed class Options
     public string? ExportRegions { get; private set; }
     public bool RenderState { get; private set; }
     public List<string> GameDirectories { get; } = [];
+    /// The player's replay folders, searched for layouts of maps the catalog lacks.
+    public List<string> ReplayDirectories { get; } = [];
     public bool ExportVideo { get; private set; }
     public int Width { get; private set; } = 1920;
     public int Height { get; private set; } = 1080;
@@ -122,6 +125,7 @@ internal sealed class Options
                     o.RenderState |= o.BinaryFrames;
                     break;
                 case "--game-dir": o.GameDirectories.Add(Next(args, ref i, arg)); break;
+                case "--replay-dir": o.ReplayDirectories.Add(Next(args, ref i, arg)); break;
                 case "--export-video": o.ExportVideo = true; o.RenderState = true; break;
                 case "--width": o.Width = int.Parse(Next(args, ref i, arg), CultureInfo.InvariantCulture); break;
                 case "--height": o.Height = int.Parse(Next(args, ref i, arg), CultureInfo.InvariantCulture); break;
@@ -163,6 +167,7 @@ internal sealed class Options
           --format F          jsonl (default) or binary: compact playback chunks with
                               render state (docs/replay-frames.md)
           --game-dir DIR      installed game folder for official maps (repeatable)
+          --replay-dir DIR    replay folder with layouts for maps the catalog lacks (repeatable)
           --export-video      write raw RGB24 video frames to stdout, progress to stderr
             --width W --height H   frame size (default 1920x1080)
             --step N               draw every Nth simulated frame (playback speed)
@@ -232,7 +237,7 @@ internal sealed class Replay
                 _ => "",
             };
             throw new FormatException(id.Length > 0
-                ? $"This replay records map number ({id}), but the player has no layout of starting units and cities for this map and mode yet. A matching replay with a full map can provide that layout."
+                ? $"This replay records map number ({id}), but the player has no layout of starting units and cities for this map and mode yet. Any replay of this map that records its full layout, such as one from experiment mode, provides it once it is among your replays."
                 : "This replay does not record its map, so it cannot be played back.");
         }
         string versionName = Text(root, "version") ?? "unknown";
@@ -351,7 +356,7 @@ internal sealed class Replay
         return names.Count == 0 ? ["blue", "red"] : names.ToArray();
     }
 
-    private static Stream OpenDecoded(string path)
+    internal static Stream OpenDecoded(string path)
     {
         var file = File.OpenRead(path);
         Span<byte> header = stackalloc byte[2];

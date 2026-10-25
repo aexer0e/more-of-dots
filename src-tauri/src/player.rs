@@ -649,6 +649,7 @@ pub async fn open_replay(
             // The simulator streams chunks; frames are playable as soon as one arrives.
             let executable = resource(&app, &engine_name())?;
             let game_dirs = crate::installed_game_dirs();
+            let replay_dirs = crate::layout_replay_dirs(&app);
             let log = tempfile::tempfile().map_err(|e| e.to_string())?;
             let mut child = hidden(
                 Command::new(&executable)
@@ -659,6 +660,7 @@ pub async fn open_replay(
                             .iter()
                             .flat_map(|root| [OsStr::new("--game-dir"), root.as_os_str()]),
                     )
+                    .args(replay_dirs.iter().flat_map(|dir| [OsStr::new("--replay-dir"), dir.as_os_str()]))
                     .current_dir(executable.parent().unwrap())
                     .stdout(Stdio::piped())
                     .stderr(log.try_clone().map_err(|e| e.to_string())?),

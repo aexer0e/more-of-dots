@@ -246,6 +246,16 @@ fn replay_backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The player's replay folders and backups. The engine looks in them for the
+/// starting layout of a numbered map its own catalog lacks.
+pub(crate) fn layout_replay_dirs(app: &AppHandle) -> Vec<PathBuf> {
+    let mut dirs = discover_replay_dirs();
+    if let Ok(backups) = replay_backup_dir(app) {
+        push_unique_path(&mut dirs, backups);
+    }
+    dirs
+}
+
 fn replay_index_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_runtime_dir(app)?.join(REPLAY_INDEX_FILE_NAME))
 }

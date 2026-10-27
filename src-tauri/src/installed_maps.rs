@@ -10,6 +10,11 @@ use sha2::{Digest, Sha256};
 
 // These are the game's official asset folders, not a list of individual maps.
 const MAP_FOLDERS: [&str; 3] = ["fahero_maps", "zolamare_maps", "eronion_maps"];
+/// Where a bare map number from an older replay is looked up, in order. Numbers
+/// 33, 37, 38 and 39 are in both Fahero and Zolamare, and the game's numbered map
+/// table gives them to Zolamare, so it is checked first. Every other number is in
+/// only one folder.
+pub(crate) const NUMBERED_MAP_FOLDERS: [&str; 3] = ["zolamare_maps", "fahero_maps", "eronion_maps"];
 
 #[derive(Default)]
 pub(crate) struct InstalledMaps {
@@ -51,7 +56,7 @@ impl InstalledMaps {
         } else if let Some(id) = map_id {
             // Numeric IDs are the legacy built-in map format.
             if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
-                return MAP_FOLDERS.iter().map(|folder| format!("assets/{folder}/map{id}.png"))
+                return NUMBERED_MAP_FOLDERS.iter().map(|folder| format!("assets/{folder}/map{id}.png"))
                     .find(|path| self.paths.contains_key(path)).or_else(|| Some(format!("legacy:{id}")));
             }
             let normalized = id.replace('\\', "/");
@@ -176,6 +181,22 @@ mod tests {
         assert_eq!(first.1.len(), 11);
         assert_ne!(maps.identity(None, Some(&BASE64.encode(b"different image"))), Some(first));
         assert_eq!(maps.identity(None, None), None);
+    }
+
+    #[test]
+    fn bare_numbers_both_sets_use_name_the_zolamare_map() {
+        let root = tempfile::tempdir().unwrap();
+        for folder in ["fahero_maps", "zolamare_maps"] {
+            let directory = root.path().join("assets").join(folder);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("map37.png"), folder).unwrap();
+        }
+        let maps = InstalledMaps::read([root.path().to_path_buf()]);
+        let zolamare = Some(("vanilla:assets/zolamare_maps/map37.png".into(), "Zolamare 37".into()));
+        assert_eq!(maps.identity(Some("37"), None), zolamare);
+        // Newer replays name the image, so Fahero 37 is still found by its path.
+        let fahero = Some(("vanilla:assets/fahero_maps/map37.png".into(), "Fahero 37".into()));
+        assert_eq!(maps.identity(Some("assets/fahero_maps/map37.png"), None), fahero);
     }
 
     #[test]

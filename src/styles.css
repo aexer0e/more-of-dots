@@ -1670,20 +1670,196 @@ p {
   opacity: 0;
   padding: 7px 14px;
   pointer-events: none;
-  position: absolute;
-  left: calc(12px * var(--card-scale));
-  bottom: calc(10px * var(--card-scale));
   transition: opacity 140ms ease, transform 140ms ease;
+}
+
+/* Play and the share button, on the card's bottom-left corner. */
+.replay-card-actions {
+  align-items: center;
+  bottom: calc(10px * var(--card-scale));
+  display: flex;
+  gap: 6px;
+  left: calc(12px * var(--card-scale));
+  position: absolute;
   z-index: 3;
 }
 
 /* The blur applies only while the button shows: a backdrop filter on every
    card's hidden button made each card a separate compositing surface. */
 .replay-card:hover .replay-play-button,
-.replay-card:focus-within .replay-play-button {
+.replay-card:focus-within .replay-play-button,
+.replay-card:hover .replay-share-button,
+.replay-card:focus-within .replay-share-button {
   backdrop-filter: blur(3px);
   opacity: 1;
   pointer-events: auto;
+}
+
+/* Icon only, the same glass as Play. A replay that was shared keeps it green. */
+.replay-share-button {
+  align-items: center;
+  background: rgba(8, 18, 15, 0.45);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  box-shadow: 0 3px 16px #0004;
+  color: white;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  height: 34px;
+  justify-content: center;
+  min-width: 34px;
+  opacity: 0;
+  padding: 0;
+  pointer-events: none;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.replay-share-button svg {
+  fill: none;
+  flex: 0 0 auto;
+  height: 16px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  width: 16px;
+}
+
+.replay-share-button:hover {
+  background: rgba(8, 18, 15, 0.65);
+  border-color: white;
+}
+
+.replay-share-button:focus-visible {
+  outline: 3px solid #83bdf0;
+  outline-offset: 5px;
+}
+
+.replay-share-button .share-icon-busy,
+.replay-share-button .share-icon-copied,
+.replay-share-button.is-busy .share-icon-link,
+.replay-share-button.is-copied .share-icon-link {
+  display: none;
+}
+
+.replay-share-button.is-busy .share-icon-busy,
+.replay-share-button.is-copied .share-icon-copied {
+  display: inline;
+}
+
+.replay-share-button.is-busy {
+  cursor: progress;
+}
+
+.replay-share-button.is-busy .share-icon-busy {
+  animation: refresh-spin 760ms linear infinite;
+}
+
+.replay-share-button.is-busy .share-icon-busy circle {
+  stroke: rgba(238, 244, 240, 0.18);
+}
+
+.replay-share-button.is-shared {
+  border-color: rgba(53, 192, 162, 0.75);
+  color: var(--success);
+}
+
+.replay-share-button.is-shared:hover {
+  border-color: var(--success);
+}
+
+.replay-share-button.is-copied {
+  background: rgba(27, 103, 57, 0.86);
+  border-color: var(--success);
+}
+
+.replay-share-button.is-copied .share-icon-copied {
+  color: var(--success);
+  stroke-width: 2.4;
+}
+
+.replay-share {
+  display: inline-flex;
+  position: relative;
+}
+
+/* Points at the share button after a copy, with a way to open the link. */
+.replay-share-bubble {
+  animation: replay-selection-actions-in 160ms ease-out;
+  background: rgba(22, 26, 25, 0.94);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  bottom: calc(100% + 9px);
+  box-shadow: 0 6px 20px #0006;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  left: -6px;
+  padding: 7px 11px 8px;
+  position: absolute;
+  white-space: nowrap;
+}
+
+.replay-share-bubble[hidden] {
+  display: none;
+}
+
+.replay-share-bubble::after {
+  background: inherit;
+  border: solid var(--line-strong);
+  border-width: 0 1px 1px 0;
+  bottom: -5px;
+  content: "";
+  height: 8px;
+  left: 18px;
+  position: absolute;
+  transform: rotate(45deg);
+  width: 8px;
+}
+
+.replay-share-bubble strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: var(--fw-medium);
+}
+
+.replay-share-bubble button {
+  align-items: center;
+  background: none;
+  border: 0;
+  color: #83bdf0;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 12px;
+  gap: 4px;
+  padding: 0;
+}
+
+.replay-share-bubble button:hover {
+  text-decoration: underline;
+}
+
+.replay-share-bubble button:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid #83bdf0;
+  outline-offset: 2px;
+}
+
+.replay-share-bubble svg {
+  fill: none;
+  height: 12px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  width: 12px;
+}
+
+.replay-share-button.is-failed {
+  border-color: rgba(239, 71, 111, 0.7);
+  color: var(--danger);
 }
 
 .replay-play-button:hover {
@@ -3005,6 +3181,7 @@ p {
 
 @media (hover: none) {
   .replay-play-button { backdrop-filter: blur(3px); opacity: 1; pointer-events: auto; min-height: 44px; }
+  .replay-share-button { backdrop-filter: blur(3px); opacity: 1; pointer-events: auto; height: 44px; min-width: 44px; }
   .replay-card.can-play .replay-age { visibility: hidden; }
 }
 
@@ -3627,5 +3804,6 @@ mark {
 .custom-map-toggle { width:auto; padding:0 8px; gap:5px; font-size:11px; }
 
 @media (prefers-reduced-motion: reduce) {
-  .replay-play-button, .replay-meta { transition: none; }
+  .replay-play-button, .replay-share-button, .replay-meta { transition: none; }
+  .replay-share-button.is-busy .share-icon-busy, .replay-share-bubble, .add-replays-results .is-working svg { animation: none; }
 }

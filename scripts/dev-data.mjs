@@ -112,7 +112,8 @@ export async function seedExamples() {
       if (candidate) return fs.readFile(candidate).catch(() => null);
     }
     if (/^\d+$/.test(String(map))) {
-      for (const relative of [`assets/fahero_maps/map${map}.png`, `assets/zolamare_maps/map${map}.png`, `assets/eronion_maps/map${map}.png`, `map_editor/generated_map${map}.png`]) {
+      // Zolamare first: the game gives it the numbers both official sets use.
+      for (const relative of [`assets/zolamare_maps/map${map}.png`, `assets/fahero_maps/map${map}.png`, `assets/eronion_maps/map${map}.png`, `map_editor/generated_map${map}.png`]) {
         try { return await fs.readFile(path.join(game, relative)); } catch { /* Try the next vanilla folder. */ }
       }
     }
@@ -138,7 +139,7 @@ export async function seedExamples() {
       const png = await mapImage(raw);
       const vanilla = await catalog.isVanilla(raw);
       const mapIdentity = await catalog.identity(raw);
-      replays.push({ ...mapIdentity, fileName: file.name, filePath: '/__examples/replays/' + file.name, version: raw.version, mode: raw.mode ?? null, teamSize: Math.max(1, ...(raw.player_usernames ?? []).map(side => Array.isArray(side) ? side.length : 1)), players: players.map((p) => ({ ...p, winner: winner === p.teamIndex })).sort((a, b) => Number(b.teamIndex === perspective) - Number(a.teamIndex === perspective) || Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
+      replays.push({ ...mapIdentity, fileName: file.name, filePath: '/__examples/replays/' + file.name, hash: hash(bytes), version: raw.version, mode: raw.mode ?? null, teamSize: Math.max(1, ...(raw.player_usernames ?? []).map(side => Array.isArray(side) ? side.length : 1)), players: players.map((p) => ({ ...p, winner: winner === p.teamIndex })).sort((a, b) => Number(b.teamIndex === perspective) - Number(a.teamIndex === perspective) || Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
       // Recent replay layouts include the new maps and Shock units for editor testing.
       if (png && typeof raw.map === 'object' && maps.length < 12) {
         const data = { ...raw.map, map_surface: png.toString('base64'), mode: raw.map.mode ?? (sides === 4 ? 'v4' : sides === 3 ? 'v3' : '1v1'), motorised: raw.map.motorised ?? Array.from({ length: sides }, () => []) };

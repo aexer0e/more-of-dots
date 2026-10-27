@@ -44,6 +44,10 @@ test('installed map discovery refreshes after updates and excludes user map fold
     assert.equal(await missing.isVanilla(replay), false);
     assert.equal(await missing.isVanilla({ map: 35 }), true);
     assert.equal(await catalog.isVanilla({}), false);
+    // A bare number both sets use names the Zolamare map, as in the game.
+    await fs.mkdir(path.join(root, 'assets/fahero_maps'), { recursive: true });
+    for (const folder of ['fahero_maps', 'zolamare_maps']) await fs.writeFile(path.join(root, `assets/${folder}/map37.png`), folder);
+    assert.deepEqual(await (await readInstalledMaps(root)).identity({ map: '37' }), { mapKey: 'vanilla:assets/zolamare_maps/map37.png', mapLabel: 'Zolamare 37' });
   } finally {
     assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep));
     await fs.rm(root, { recursive: true });

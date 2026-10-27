@@ -81,3 +81,44 @@ button.winner-name { font-weight: var(--fw-bold); }
   .suggestion-primary { display: grid; grid-template-columns: minmax(0, 1fr); }
   .suggestion-meta { white-space: normal; }
 }
+
+/* Add replays: choose files or paste a link, with how each one went. */
+.add-replays-backdrop { position: fixed; inset: 0; z-index: 120; display: flex; align-items: center; justify-content: center; padding: var(--s-5); background: rgba(3, 6, 5, 0.72); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); overflow-y: auto; }
+.add-replays-dialog { display: flex; flex-direction: column; gap: var(--s-4); width: 100%; max-width: 560px; margin: auto 0; padding: 20px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: var(--shadow); animation: replay-delete-dialog-in 160ms ease-out; }
+.add-replays-header { display: flex; align-items: center; justify-content: space-between; }
+.add-replays-header h2 { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-bold); }
+.add-replays-dropzone { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 32px 24px; text-align: center; border: 1.5px dashed rgba(90, 146, 196, 0.6); border-radius: 12px; background: rgba(90, 146, 196, 0.06); }
+.add-replays-dropzone > svg { width: 44px; height: 44px; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.add-replays-dropzone strong { font-size: 20px; font-weight: var(--fw-bold); letter-spacing: -0.01em; }
+.add-replays-dropzone small { color: var(--muted); font-size: var(--fs-sm); }
+.add-replays-choose { height: 38px; padding: 0 18px; border: 1px solid var(--accent); border-radius: var(--r-md); background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: var(--fw-medium); cursor: pointer; }
+.add-replays-choose:hover, .add-replays-choose:focus-visible { box-shadow: 0 0 0 2px var(--accent-line); outline: none; }
+.add-replays-link { display: flex; gap: var(--s-2); }
+.add-replays-link-field { flex: 1; min-width: 0; display: flex; align-items: center; gap: var(--s-2); height: 34px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--bg); color: var(--muted); }
+.add-replays-link-field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.add-replays-link-field svg { width: 15px; height: 15px; flex: 0 0 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.add-replays-link-field input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; }
+.add-replays-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.add-replays-results { margin: 0; padding: 0; list-style: none; max-height: 220px; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
+.add-replays-results[hidden] { display: none; }
+.add-replays-results li { display: flex; align-items: center; gap: 10px; padding: 9px 12px; font-size: var(--fs-md); }
+.add-replays-results li + li { border-top: 1px solid var(--line); }
+.add-replays-results svg { width: 15px; height: 15px; flex: 0 0 15px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.add-replays-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-replays-detail { flex: 0 1 auto; max-width: 55%; color: var(--muted); font-size: var(--fs-sm); text-align: right; }
+.add-replays-results .is-added svg, .add-replays-results .is-added .add-replays-detail { color: var(--success); }
+.add-replays-results .is-present svg { color: var(--muted); }
+.add-replays-results .is-failed svg, .add-replays-results .is-failed .add-replays-detail { color: var(--danger); }
+.add-replays-results .is-working svg { color: var(--text); animation: refresh-spin 760ms linear infinite; }
+.add-replays-results .is-working circle { stroke: rgba(238, 244, 240, 0.18); }
+.add-replays-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--s-3); }
+.add-replays-summary { color: var(--muted); font-size: var(--fs-sm); }
+.add-replays-footer[hidden] { display: none; }
+
+/* Shown while files are dragged over the library. */
+.add-replays-drop { position: fixed; inset: 16px; z-index: 130; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center; pointer-events: none; border: 2px dashed var(--accent); border-radius: 14px; background: rgba(14, 17, 16, 0.86); box-shadow: 0 0 0 16px rgba(14, 17, 16, 0.86); }
+.add-replays-drop > svg { width: 56px; height: 56px; fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.add-replays-drop strong { font-size: 30px; font-weight: var(--fw-bold); letter-spacing: -0.02em; }
+.add-replays-drop small { color: var(--muted); font-size: var(--fs-md); }
+.add-replays-drop.is-empty { border-color: var(--line-strong); }
+.add-replays-drop.is-empty > svg { stroke: var(--muted); }

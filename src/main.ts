@@ -1,5 +1,8 @@
 import { invoke, exampleMode, regionSupported } from "./platform";
+import { installReplayDrop, openAddReplays } from "./replays/add";
 import { exportBusy, openExportSetup } from "./replays/export";
+import { addCard, copyText, isShared, shareId, shareLink, uploadReplay } from "./replays/share";
+import type { CardDetails } from "./site/card.js";
 import { getVersion } from "@tauri-apps/api/app";
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -45,6 +48,8 @@ type ReplayBrowserItem = {
   eventLabel?: string | null;
   mapKey?: string | null;
   mapLabel?: string | null;
+  // The file's SHA-256, which names it on the share service.
+  hash?: string | null;
 };
 
 type ReplayThumbnailPath = {
@@ -123,8 +128,6 @@ const FALLBACK_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(`
 </svg>`)}`;
 let browserReplays: ReplayBrowserItem[] = [];
 let browserLoading = false;
-let browserUploading = false;
-let browserUploadLabel = "Upload";
 let browserSelectedReplayPaths = new Set<string>();
 let browserSelectionAnchorPath: string | null = null;
 let browserDeleteCandidates: ReplayBrowserItem[] = [];
@@ -160,6 +163,10 @@ const browserThumbnailPending = new Set<string>();
 const browserThumbnailInFlight = new Set<string>();
 let browserIndexProgress: ReplayIndexProgress | null = null;
 let browserOpeningPaths = new Set<string>();
+// Share buttons that are uploading, just copied a link, or failed, by file path.
+const browserShareStates = new Map<string, { state: "busy" | "copied" | "failed"; message?: string }>();
+// Share ids of replays shared without a listed hash, by file path.
+const browserSharedIds = new Map<string, string>();
 let browserGridCapped = loadBrowserGridCapped();
 let browserGridCardSize = loadBrowserGridCardSize();
 let browserReplaySignature = "";
@@ -894,6 +901,143 @@ function clearBrowserSearch() {
   searchInput?.focus();
 }
 
+const SHARE_ICONS = `
+  <svg class="share-icon-link" aria-hidden="true" viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2" /><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2" /></svg>
+  <svg class="share-icon-busy" aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><path d="M12 4a8 8 0 0 1 8 8" /></svg>
+  <svg class="share-icon-copied" aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5" /></svg>`;
+const OPEN_ICON = `<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M14 4h6v6" /><path d="M20 4l-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg>`;
+
+function replayShareId(replay: ReplayBrowserItem): string | null {
+  return shareId(replay.hash) ?? browserSharedIds.get(replay.filePath) ?? null;
+}
+
+// The share button's look and label for a replay's current state.
+function replayShareView(replay: ReplayBrowserItem, label: string) {
+  const current = browserShareStates.get(replay.filePath);
+  const shared = isShared(replayShareId(replay));
+  if (current?.state === "busy") return { className: "is-busy", title: "Uploading replay...", ariaLabel: `Uploading ${label}` };
+  if (current?.state === "copied") return { className: "is-copied is-shared", title: "Link copied", ariaLabel: `Link copied: ${label}` };
+  if (current?.state === "failed") {
+    const message = current.message || "Could not share this replay.";
+    return { className: `is-failed${shared ? " is-shared" : ""}`, title: `${message} Click to try again.`, ariaLabel: `${message} Try again: ${label}` };
+  }
+  if (shared) return { className: "is-shared", title: "Copy link", ariaLabel: `Copy share link: ${label}` };
+  return { className: "", title: "Copy share link", ariaLabel: `Share and copy link: ${label}` };
+}
+
+// The button, and the bubble above it that confirms the copy and opens the link.
+function renderReplayShareButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
+  const view = replayShareView(replay, label);
+  return `
+    <span class="replay-share">
+      <button class="replay-share-button ${view.className}" type="button" data-replay-share-index="${replayIndex}" aria-label="${escapeHtml(view.ariaLabel)}" title="${escapeHtml(view.title)}">
+        ${SHARE_ICONS}
+      </button>
+      <span class="replay-share-bubble" role="status" ${browserShareStates.get(replay.filePath)?.state === "copied" ? "" : "hidden"}>
+        <strong>Link copied</strong>
+        <button type="button" data-replay-share-open-index="${replayIndex}">Open in browser${OPEN_ICON}</button>
+      </span>
+    </span>
+  `;
+}
+
+function updateReplayShareButton(card: HTMLElement, replay: ReplayBrowserItem) {
+  const button = card.querySelector<HTMLButtonElement>("[data-replay-share-index]");
+  if (!button) return;
+  const view = replayShareView(replay, matchupTitle(replay.players, " versus ", " and "));
+  const className = `replay-share-button ${view.className}`.trim();
+  if (button.className !== className) button.className = className;
+  setAttribute(button, "title", view.title);
+  setAttribute(button, "aria-label", view.ariaLabel);
+  const bubble = card.querySelector<HTMLElement>(".replay-share-bubble");
+  const copied = browserShareStates.get(replay.filePath)?.state === "copied";
+  if (bubble && bubble.hidden === copied) bubble.hidden = !copied;
+}
+
+function setReplayShareState(replay: ReplayBrowserItem, state: "busy" | "copied" | "failed" | null, message?: string) {
+  if (state) browserShareStates.set(replay.filePath, { state, message });
+  else browserShareStates.delete(replay.filePath);
+  browserGrid?.refresh();
+}
+
+// What the shared replay's link preview shows: one name per side, its length,
+// version, and the card's full-size map picture.
+async function replayCardDetails(replay: ReplayBrowserItem): Promise<CardDetails> {
+  const sides = new Map<number, string[]>();
+  [...replay.players]
+    .sort((a, b) => a.teamIndex - b.teamIndex)
+    .forEach((player) => sides.set(player.teamIndex, [...(sides.get(player.teamIndex) ?? []), player.name]));
+  let picture = replay.thumbnailDataUrl ?? null;
+  if (replay.thumbnailKey) {
+    const paths = await invoke<ReplayThumbnailPath[]>("replay_thumbnail_paths", { thumbnailKeys: [replay.thumbnailKey], variant: "full" }).catch(() => []);
+    picture = paths[0]?.dataUrl ?? picture;
+  }
+  return {
+    players: [...sides.values()].map((names) => names.join(" & ")),
+    frames: replay.durationSeconds * 30,
+    version: replay.version ?? null,
+    picture,
+  };
+}
+
+// Uploads a replay the first time it is shared, then copies its link. The share
+// service keeps one copy of each file, so a replay shared before gets its link.
+async function shareBrowserReplay(replay: ReplayBrowserItem, card: HTMLElement | null) {
+  if (browserShareStates.get(replay.filePath)?.state === "busy") return;
+  const known = replayShareId(replay);
+  const sharedBefore = known !== null && isShared(known);
+  if (!sharedBefore) setReplayShareState(replay, "busy");
+  const id = sharedBefore
+    ? Promise.resolve(known)
+    : invoke<string>("read_replay_file", { filePath: replay.filePath })
+        .then((data) => uploadReplay(base64ToBytes(data)))
+        .then((id) => {
+          browserSharedIds.set(replay.filePath, id);
+          return id;
+        });
+  try {
+    await copyText(id.then(shareLink));
+    setReplayShareState(replay, "copied");
+    window.setTimeout(() => whenCardLeft(card, () => {
+      if (browserShareStates.get(replay.filePath)?.state === "copied") setReplayShareState(replay, null);
+    }), 2500);
+  } catch {
+    const failed = await id.then(() => null, (reason: unknown) => reason);
+    const message = failed ? (failed instanceof Error ? failed.message : String(failed)) : "Could not copy the link.";
+    setReplayShareState(replay, "failed", message);
+  }
+  void id.then((value) => addCard(value, () => replayCardDetails(replay)), () => {});
+}
+
+// Runs once the pointer and keyboard focus have left the card, so its bubble stays while in use.
+function whenCardLeft(card: HTMLElement | null, done: () => void) {
+  const check = () => {
+    if (card?.isConnected && (card.matches(":hover") || card.querySelector(":focus-visible"))) return;
+    card?.removeEventListener("mouseleave", later);
+    card?.removeEventListener("focusout", later);
+    done();
+  };
+  const later = () => window.setTimeout(check);
+  card?.addEventListener("mouseleave", later);
+  card?.addEventListener("focusout", later);
+  check();
+}
+
+async function openShareLink(replay: ReplayBrowserItem) {
+  const id = replayShareId(replay);
+  if (!id) return;
+  const url = shareLink(id);
+  if (!isTauri()) {
+    window.open(url, "_blank", "noopener");
+    return;
+  }
+  await invoke("open_share_link", { url }).catch((error) => window.alert(String(error)));
+}
+
+function renderReplayCardActions(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
+  return `<div class="replay-card-actions">${renderReplayPlayButton(replay, label, replayIndex)}${renderReplayShareButton(replay, label, replayIndex)}</div>`;
+}
+
 function renderReplayPlayButton(replay: ReplayBrowserItem, label: string, replayIndex: number): string {
   if (!BROWSER_REPLAY_PLAYBACK_ENABLED) return "";
   // Let the engine resolve maps and report failures. Library metadata, including
@@ -1090,7 +1234,7 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
         <button type="button" class="replay-label replay-filter-label match-type" data-filter-kind="mode" data-filter-value="${escapeHtml(matchType)}" aria-label="Filter by mode ${escapeHtml(matchType)}" aria-pressed="${browserSelectedTypes.size === 1 && browserSelectedTypes.has(matchType)}"><span>${escapeHtml(matchType)}</span></button>
       </div>
       <div class="replay-score-label">${scoreDeltaLabel}</div>
-      ${renderReplayPlayButton(replay, label, replayIndex)}
+      ${renderReplayCardActions(replay, label, replayIndex)}
       ${renderReplaySelectButton(replay, label, replayIndex)}
       <time class="replay-age" data-replay-modified="${replay.modified}" datetime="${new Date(replay.modified * 1000).toISOString()}" aria-label="${escapeHtml(`${replayAge}, ${replayDate}`)}" title="${escapeHtml(`${replayAge} · ${replayDate}`)}" aria-live="off">
         <span class="replay-age-relative" data-replay-age>${replayAge}</span>
@@ -1258,15 +1402,14 @@ function renderReplayUploadDockContent(animateSelection = false): string {
   const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight;
   if (!selectedCount) {
     return `
-      <input id="replayUploadInput" type="file" accept=".rep" multiple hidden>
       <div class="replay-action-group">
-        <button id="uploadReplays" class="refresh-button upload-button ${browserUploading ? "is-loading" : ""}" type="button" aria-label="Upload replays" title="Upload replays to War of Dots" ${browserUploading || browserLoading ? "disabled" : ""}>
+        <button id="uploadReplays" class="refresh-button upload-button" type="button" aria-haspopup="dialog" title="Add replays to War of Dots">
           <svg aria-hidden="true" viewBox="0 0 24 24">
             <path d="M12 16V4" />
             <path d="m7.5 8.5 4.5-4.5 4.5 4.5" />
             <path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
           </svg>
-          <span aria-live="polite">${escapeHtml(browserUploadLabel)}</span>
+          <span>Upload</span>
         </button>
       </div>
     `;
@@ -1519,6 +1662,7 @@ function updateReplayCard(card: HTMLElement, replayIndex: number, now = Date.now
     playButton.disabled = opening;
     setText(playButton.querySelector("span:last-child"), opening ? "Opening..." : "Play");
   }
+  updateReplayShareButton(card, replay);
 
   const image = card.querySelector<HTMLImageElement>("img.replay-thumb");
   if (image && replay.thumbnailKey) {
@@ -1858,15 +2002,7 @@ function clearBrowserReplaySelection() {
 }
 
 function bindReplayUploadDockEvents() {
-  const replayUploadInput = document.querySelector<HTMLInputElement>("#replayUploadInput");
-  document.querySelector<HTMLButtonElement>("#uploadReplays")?.addEventListener("click", () => {
-    replayUploadInput?.click();
-  });
-  replayUploadInput?.addEventListener("change", () => {
-    const files = Array.from(replayUploadInput.files ?? []);
-    replayUploadInput.value = "";
-    if (files.length) void uploadBrowserReplays(files);
-  });
+  document.querySelector<HTMLButtonElement>("#uploadReplays")?.addEventListener("click", openAddReplays);
   document.querySelector<HTMLButtonElement>("#unselectAllReplays")?.addEventListener("click", clearBrowserReplaySelection);
   document.querySelector<HTMLButtonElement>("#downloadSelectedReplays")?.addEventListener("click", () => {
     void downloadSelectedReplays();
@@ -2106,6 +2242,20 @@ function bindReplayGridEvents() {
       return;
     }
 
+    const openButton = target.closest<HTMLButtonElement>("[data-replay-share-open-index]");
+    if (openButton) {
+      const replay = browserReplays[Number(openButton.dataset.replayShareOpenIndex)];
+      if (replay) void openShareLink(replay);
+      return;
+    }
+
+    const shareButton = target.closest<HTMLButtonElement>("[data-replay-share-index]");
+    if (shareButton) {
+      const replay = browserReplays[Number(shareButton.dataset.replayShareIndex)];
+      if (replay) void shareBrowserReplay(replay, shareButton.closest<HTMLElement>(".replay-card"));
+      return;
+    }
+
     const selectButton = target.closest<HTMLButtonElement>("[data-replay-select-index]");
     if (selectButton) {
       const replay = browserReplays[Number(selectButton.dataset.replaySelectIndex)];
@@ -2259,38 +2409,6 @@ function recordSelectedReplays() {
   void openExportSetup(selectedBrowserReplays());
 }
 
-async function uploadBrowserReplays(files: File[]) {
-  if (browserUploading || !files.length) return;
-  browserUploading = true;
-  browserUploadLabel = files.length === 1 ? "Uploading..." : `Uploading 1/${files.length}`;
-  renderReplayUploadDock();
-
-  const failures: string[] = [];
-  for (const [index, file] of files.entries()) {
-    browserUploadLabel = files.length === 1 ? "Uploading..." : `Uploading ${index + 1}/${files.length}`;
-    const label = document.querySelector<HTMLElement>("#uploadReplays span");
-    if (label) label.textContent = browserUploadLabel;
-    try {
-      const buffer = await file.arrayBuffer();
-      await invoke("upload_replay", {
-        fileName: file.name,
-        replayBase64: bytesToBase64(new Uint8Array(buffer)),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error || "Upload failed.");
-      failures.push(`${file.name}: ${message}`);
-    }
-  }
-
-  browserUploading = false;
-  browserUploadLabel = "Upload";
-  renderReplayUploadDock();
-  await loadBrowserReplays(true);
-  if (failures.length) {
-    window.alert(`Could not upload ${failures.length} ${failures.length === 1 ? "replay" : "replays"}.\n\n${failures.join("\n\n")}`);
-  }
-}
-
 function replayListSignature(replays: ReplayBrowserItem[]): string {
   return replays
     .map((replay) =>
@@ -2396,13 +2514,11 @@ function startBrowserRelativeTimeUpdates() {
   browserRelativeTimeTimer = window.setInterval(updateReplayAgeLabels, 15_000);
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  }
-  return btoa(binary);
+function base64ToBytes(data: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
 }
 
   renderReplayBrowser();
@@ -2411,6 +2527,7 @@ function bytesToBase64(bytes: Uint8Array): string {
   void watchReplayIndexProgress();
   void loadBrowserReplays();
   void loadBrowserLeaderboardRanks();
+  installReplayDrop({ active: () => browserPage === "replays", added: () => void loadBrowserReplays(true) });
   startBrowserRelativeTimeUpdates();
   window.addEventListener("keydown", (event) => {
     const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f";

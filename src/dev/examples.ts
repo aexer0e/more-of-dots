@@ -85,6 +85,17 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
       break;
     }
     case 'delete_replay':data.replays = data.replays.filter((r) => r.filePath !== args.filePath); result = 1; break;
+    // Sharing reads the copied replay; adding one only reports success, so nothing leaves this session.
+    case 'read_replay_file': {
+      const response = await fetch(String(args.filePath));
+      if (!response.ok) throw new Error('Replay file is not readable.');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let binary = '';
+      for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+      result = btoa(binary);
+      break;
+    }
+    case 'upload_replay': result = { fileName: args.fileName, alreadyAdded: data.replays.some((r) => r.filePath.endsWith(`/${String(args.fileName)}`)) }; break;
     default: throw new Error('This action needs the desktop app. Example mode never launches the game or changes your Steam files.');
   }
   return structuredClone(result) as T;

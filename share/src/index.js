@@ -1,5 +1,5 @@
-// Keeps the replays visitors of the hosted player choose to share, so a link can
-// open them on any device. A replay is stored under the first 16 hex characters of
+// Keeps the replays visitors of the hosted player and users of the desktop app
+// choose to share, so a link can open them on any device. A replay is stored under the first 16 hex characters of
 // its SHA-256, the same id the site's library gives it.
 //   POST   /replays      body: the .rep file   → { id, token }  (no token if it was already shared)
 //   GET    /replays/<id>                       → the .rep file
@@ -14,7 +14,9 @@ import { details, isReplay, MAX_SIZE, replayText } from "./replay.js";
 import { site, SITE } from "./site.js";
 
 const MAX_CARD = 512 << 10;
-const ORIGINS = /^(https:\/\/aexer0e\.dev|http:\/\/(localhost|127\.0\.0\.1)(:\d+)?)$/;
+// The site, local development, and the desktop app's window (tauri.localhost on
+// Windows, tauri://localhost on macOS).
+const ORIGINS = /^(https:\/\/aexer0e\.dev|http:\/\/(localhost|127\.0\.0\.1)(:\d+)?|https?:\/\/tauri\.localhost|tauri:\/\/localhost)$/;
 const ID = /^[0-9a-f]{16}$/;
 const DISCORD = /^(cdn\.discordapp\.com|media\.discordapp\.net)$/;
 

@@ -127,6 +127,10 @@ struct ReplaySummary {
     map_key: Option<String>,
     #[serde(default)]
     map_label: Option<String>,
+    // The SHA-256 of the file, set when listing. Its first 16 characters are the
+    // replay's id on the share service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -216,6 +220,8 @@ struct ReplayUploadResult {
     file_name: String,
     replay_path: String,
     backup_path: String,
+    // The game's replay folder already held this replay.
+    already_added: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1073,6 +1079,7 @@ fn parse_replay(path: &Path) -> Result<ParsedReplay, String> {
             event_label: None,
             map_key: None,
             map_label: None,
+            hash: None,
         },
         result,
         map_id: replay_map_id(&raw),
@@ -1475,6 +1482,17 @@ fn open_recording_output_directory(output_path: String) -> Result<bool, String> 
     Ok(true)
 }
 
+#[tauri::command]
+fn open_share_link(url: String) -> Result<bool, String> {
+    // Only the replay player's own links, so the page cannot open anything else.
+    if !url.starts_with("https://aexer0e.dev/wod-replay-player/") {
+        return Err("That is not a replay link.".to_string());
+    }
+    tauri_plugin_opener::open_url(&url, None::<&str>)
+        .map_err(|error| format!("Could not open the link: {error}"))?;
+    Ok(true)
+}
+
 /// Runs `work` over `items` on a few threads, keeping the order of results.
 fn parallel_map<T: Sync, R: Send>(
     items: &[T],
@@ -1727,6 +1745,7 @@ fn list_replays_locked(
         parsed.summary.score_delta = None;
         parsed.summary.thumbnail_data_url = None;
         parsed.summary.thumbnail_key = None;
+        parsed.summary.hash = candidate.known_hash.clone();
         if let Some(replay_dir) = candidate.thumbnail_replay_dir.as_deref() {
             let thumbnail = match (parsed.custom_map.is_none(), parsed.map_id.as_ref()) {
                 (true, Some(map_id)) => map_thumbnails
@@ -1875,15 +1894,14 @@ fn replay_upload_destination(
     ))
 }
 
-fn upload_replay_impl(
+/// Saves a replay to the game's replay folder and backs it up, unless the folder
+/// already holds the same file.
+fn add_replay_bytes(
     app: &AppHandle,
-    file_name: String,
-    replay_base64: String,
+    file_name: &str,
+    bytes: Vec<u8>,
 ) -> Result<ReplayUploadResult, String> {
-    let file_name = safe_replay_file_name(&file_name)?;
-    let bytes = BASE64
-        .decode(replay_base64.as_bytes())
-        .map_err(|error| format!("Replay payload is not valid base64: {error}"))?;
+    let file_name = safe_replay_file_name(file_name)?;
     if bytes.is_empty() {
         return Err("Replay file is empty.".to_string());
     }
@@ -1905,7 +1923,8 @@ fn upload_replay_impl(
         let backup_path = backup_replay_file(&upload_path, &hash, &replay_backup_dir(app)?, None)?;
         let replay_dir = primary_replay_dir()?;
         let replay_path = replay_upload_destination(&replay_dir, &file_name, &hash)?;
-        if !replay_path.exists() {
+        let already_added = replay_path.exists();
+        if !already_added {
             fs::copy(&upload_path, &replay_path).map_err(|error| {
                 format!(
                     "Could not save replay to {}: {error}",
@@ -1918,11 +1937,23 @@ fn upload_replay_impl(
             file_name: candidate_file_name(&replay_path),
             replay_path: replay_path.to_string_lossy().to_string(),
             backup_path: backup_path.to_string_lossy().to_string(),
+            already_added,
         })
     })();
     let _ = fs::remove_file(&upload_path);
     discard_warm_listing(app);
     result
+}
+
+fn upload_replay_impl(
+    app: &AppHandle,
+    file_name: String,
+    replay_base64: String,
+) -> Result<ReplayUploadResult, String> {
+    let bytes = BASE64
+        .decode(replay_base64.as_bytes())
+        .map_err(|error| format!("Replay payload is not valid base64: {error}"))?;
+    add_replay_bytes(app, &file_name, bytes)
 }
 
 #[tauri::command]
@@ -1934,6 +1965,43 @@ async fn upload_replay(
     tauri::async_runtime::spawn_blocking(move || upload_replay_impl(&app, file_name, replay_base64))
         .await
         .map_err(|error| format!("Replay upload task failed: {error}"))?
+}
+
+/// Adds a replay file dropped on the window.
+fn add_replay_file_impl(app: &AppHandle, file_path: String) -> Result<ReplayUploadResult, String> {
+    let path = PathBuf::from(&file_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Replay filename must be a valid .rep filename.".to_string())?;
+    if !path.is_file() {
+        return Err(format!("{file_name} is not a file."));
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("Could not read {file_name}: {error}"))?;
+    add_replay_bytes(app, file_name, bytes)
+}
+
+#[tauri::command]
+async fn add_replay_file(app: AppHandle, file_path: String) -> Result<ReplayUploadResult, String> {
+    tauri::async_runtime::spawn_blocking(move || add_replay_file_impl(&app, file_path))
+        .await
+        .map_err(|error| format!("Replay upload task failed: {error}"))?
+}
+
+/// A replay in the library as base64, for sharing it.
+#[tauri::command]
+async fn read_replay_file(file_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&file_path);
+        if !path.is_file() || !is_replay_file(&path) {
+            return Err(format!("Replay file is not readable: {}", path.display()));
+        }
+        fs::read(&path)
+            .map(|bytes| BASE64.encode(bytes))
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))
+    })
+    .await
+    .map_err(|error| format!("Replay read task failed: {error}"))?
 }
 
 fn delete_replay_impl(app: &AppHandle, file_path: String) -> Result<usize, String> {
@@ -2464,10 +2532,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             recording_default_directory,
             open_recording_output_directory,
+            open_share_link,
             list_replays,
             replay_thumbnail_paths,
             replay_index_progress,
             upload_replay,
+            add_replay_file,
+            read_replay_file,
             delete_replay,
             download_replay,
             download_replays,
@@ -2618,6 +2689,7 @@ mod tests {
                 event_label: None,
                 map_key: None,
                 map_label: None,
+                hash: None,
             },
             result: None,
             map_id: None,
@@ -2892,6 +2964,7 @@ mod tests {
                 event_label: None,
                 map_key: None,
                 map_label: None,
+                hash: None,
             },
             result: None,
             map_id: None,

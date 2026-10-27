@@ -112,7 +112,8 @@ export async function seedExamples() {
       if (candidate) return fs.readFile(candidate).catch(() => null);
     }
     if (/^\d+$/.test(String(map))) {
-      for (const relative of [`assets/fahero_maps/map${map}.png`, `assets/zolamare_maps/map${map}.png`, `assets/eronion_maps/map${map}.png`, `map_editor/generated_map${map}.png`]) {
+      // Zolamare first: the game gives it the numbers both official sets use.
+      for (const relative of [`assets/zolamare_maps/map${map}.png`, `assets/fahero_maps/map${map}.png`, `assets/eronion_maps/map${map}.png`, `map_editor/generated_map${map}.png`]) {
         try { return await fs.readFile(path.join(game, relative)); } catch { /* Try the next vanilla folder. */ }
       }
     }

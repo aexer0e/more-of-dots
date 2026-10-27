@@ -1414,11 +1414,9 @@ fn map_image_path(game_root: &Path, map_id: &str) -> Option<PathBuf> {
     if normalized.is_empty() || !normalized.chars().all(|c| c.is_ascii_digit()) { return None; }
     let file_name = format!("map{normalized}.png");
     let assets = game_root.join("assets");
-    [assets.join("fahero_maps").join(&file_name),
-     assets.join("zolamare_maps").join(&file_name),
-     assets.join("eronion_maps").join(&file_name),
-     game_root.join("map_editor").join(format!("generated_map{normalized}.png"))]
-        .into_iter().find(|path| path.is_file())
+    installed_maps::NUMBERED_MAP_FOLDERS.iter().map(|folder| assets.join(folder).join(&file_name))
+        .chain([game_root.join("map_editor").join(format!("generated_map{normalized}.png"))])
+        .find(|path| path.is_file())
 }
 
 #[cfg(test)]
@@ -2986,6 +2984,12 @@ mod tests {
         let data_url = map_image_data_url(&root, "33").unwrap();
 
         assert!(data_url.starts_with("data:image/png;base64,"));
+
+        // With both sets installed, the number still names the Zolamare image.
+        let fahero = root.join("assets").join("fahero_maps");
+        fs::create_dir_all(&fahero).unwrap();
+        fs::write(fahero.join("map33.png"), b"fahero").unwrap();
+        assert_eq!(map_image_path(&root, "33"), Some(map_dir.join("map33.png")));
 
         let _ = fs::remove_dir_all(&root);
     }

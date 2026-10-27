@@ -377,11 +377,12 @@ const publishedMaps = () =>
   (mapIndex ??= fetch(`${base}maps/index.json`, revalidate).then((r) => (r.ok ? r.json() : [])).catch(() => []).then((list) => new Set(list)));
 /// The picture of an official map a replay names, found the way More of Dots
 /// finds it in the game: by its image path, or by number in each map set.
+/// Zolamare comes first because the game gives it the numbers both sets use.
 function mapPicture(ref, maps) {
   if (!ref) return null;
   const name = ref.replaceAll("\\", "/").toLowerCase();
   const candidates = /^\d+$/.test(name)
-    ? ["fahero", "zolamare", "eronion"].map((set) => `assets/${set}_maps/map${name}.png`).concat(`map${name}.png`)
+    ? ["zolamare", "fahero", "eronion"].map((set) => `assets/${set}_maps/map${name}.png`).concat(`map${name}.png`)
     : [name, name.split("/").pop()];
   const found = candidates.find((candidate) => maps.has(candidate));
   return found ? `${base}maps/${found}` : null;

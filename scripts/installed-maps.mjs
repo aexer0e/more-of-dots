@@ -4,6 +4,9 @@ import { createHash } from 'node:crypto';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const mapFolders = ['fahero_maps', 'zolamare_maps', 'eronion_maps'];
+// Bare numbers from older replays: 33, 37, 38 and 39 are in both Fahero and
+// Zolamare, and the game's numbered map table gives them to Zolamare.
+const numberedMapFolders = ['zolamare_maps', 'fahero_maps', 'eronion_maps'];
 
 export async function readInstalledMaps(game) {
   const paths = new Map();
@@ -37,7 +40,7 @@ export async function readInstalledMaps(game) {
         return (await hashes).get(hash(Buffer.from(payload, 'base64'))) ?? null;
       }
       const id = String(raw.map?.path ?? raw.map ?? '').trim().replaceAll('\\', '/');
-      if (/^\d+$/.test(id)) return mapFolders.map(folder => `assets/${folder}/map${id}.png`).find(id => paths.has(id)) ?? `legacy:${id}`;
+      if (/^\d+$/.test(id)) return numberedMapFolders.map(folder => `assets/${folder}/map${id}.png`).find(id => paths.has(id)) ?? `legacy:${id}`;
       return paths.has(id) ? id : null;
   };
   return {

@@ -258,7 +258,7 @@ impl ProcessJob {
 }
 /// The replay engine's file name among the player resources.
 pub(crate) fn engine_name() -> String {
-    format!("ReplaySim.Standalone{}", std::env::consts::EXE_SUFFIX)
+    format!("replay-sim{}", std::env::consts::EXE_SUFFIX)
 }
 
 pub(crate) fn resource(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {

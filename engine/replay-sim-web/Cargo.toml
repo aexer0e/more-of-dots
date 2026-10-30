@@ -1,0 +1,13 @@
+[package]
+name = "replay-sim-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The replay simulator for the hosted player, as a WebAssembly module"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+replay-sim = { path = "../replay-sim", default-features = false }
+serde_json = "1"

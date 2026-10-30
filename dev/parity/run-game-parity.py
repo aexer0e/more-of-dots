@@ -139,7 +139,7 @@ def selected_build(record, root, plan):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root',type=Path,default=REPO/'build/game-parity')
-    p.add_argument('--engine',type=Path,default=REPO/'src-tauri/resources/player/ReplaySim.Standalone.exe')
+    p.add_argument('--engine',type=Path,default=REPO/'src-tauri/resources/player/replay-sim.exe')
     p.add_argument('--version',action='append')
     p.add_argument('--build',help='Explicit native build override for a selected replay/candidate check')
     p.add_argument('--selected-build',action='append',help='Filter selected native builds without overriding timestamp selection')

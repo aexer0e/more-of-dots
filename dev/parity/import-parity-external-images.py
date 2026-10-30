@@ -10,7 +10,7 @@ spec=importlib.util.spec_from_file_location('runner',REPO/'dev/parity/run-game-p
 runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 plan=json.loads((root/'build-plan.json').read_text())['builds']
 records=json.loads((root/'inventory.json').read_text())['files']
-destroot=(REPO/'engine/repsim/maps').resolve();imports={};builds={}
+destroot=(REPO/'engine/maps').resolve();imports={};builds={}
 for record in records:
     if not record['qualifies']:continue
     raw=Path(record['input']).read_bytes()

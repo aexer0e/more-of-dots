@@ -1,4 +1,4 @@
-ReferenceContours.cs uses a C# translation of the contour assembly algorithm
+src/contours.rs uses a Rust translation of the contour assembly algorithm
 from scikit-image 0.25.2, skimage/measure/_find_contours.py and
 skimage/measure/_find_contours_cy.pyx. The upstream notices and licenses follow.
 

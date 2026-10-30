@@ -45,7 +45,7 @@ if (!app) throw new Error("The build produced no More of Dots executable to audi
 const bundle = path.join(path.dirname(app), "bundle");
 
 const entries = [
-  entry("replay-engine", path.join(root, "src-tauri", "resources", "player", `ReplaySim.Standalone${executable}`)),
+  entry("replay-engine", path.join(root, "src-tauri", "resources", "player", `replay-sim${executable}`)),
   entry("tauri-exe", app),
   entry("nsis-installer", newest(path.join(bundle, "nsis"), (name) => name.includes(version) && name.endsWith(".exe"))),
   entry("macos-app", newest(path.join(bundle, "macos"), (name) => name.endsWith(".app"))),

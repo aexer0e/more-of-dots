@@ -1,5 +1,5 @@
 // Builds the hosted replay player into build/site: the player page, the
-// WebAssembly engine compiled from engine/repsim, and the official maps.
+// WebAssembly engine compiled from engine/replay-sim-web, and the official maps.
 //   node scripts/build-site.mjs [--audio <folder>] [--maps <folder>] [--tournaments <folder>] [--skip-engine]
 // --audio copies the site's sound files, --maps the game's official map images
 // (laid out as in the game, e.g. assets/zolamare_maps/map56.png) and --tournaments
@@ -20,24 +20,21 @@ const gameMaps = folder('--maps');
 const tournaments = folder('--tournaments');
 const run = (command, parameters) => execFileSync(command, parameters, { cwd: project, stdio: 'inherit' });
 
-const engine = at('build/wasm-engine');
-if (!args.includes('--skip-engine')) {
-  fs.rmSync(engine, { recursive: true, force: true });
-  run(process.env.DOTNET || 'dotnet', ['publish', at('engine/web/ReplaySim.Web.csproj'), '-c', 'Release', '-o', engine]);
-}
+// The engine needs Rust's wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown).
+const engine = at('engine/target/wasm32-unknown-unknown/release/replay_sim_web.wasm');
+if (!args.includes('--skip-engine'))
+  run('cargo', ['build', '--release', '--manifest-path', at('engine/Cargo.toml'), '-p', 'replay-sim-web', '--target', 'wasm32-unknown-unknown']);
 
 const site = at('build/site');
 run(process.execPath, [at('node_modules/vite/bin/vite.js'), 'build', '--config', 'vite.site.config.ts']);
 fs.renameSync(path.join(site, 'site.html'), path.join(site, 'index.html'));
 
-// GitHub Pages compresses responses itself.
-fs.cpSync(path.join(engine, 'wwwroot/_framework'), path.join(site, 'engine/_framework'), {
-  recursive: true, filter: source => !/\.(br|gz)$/.test(source),
-});
+fs.mkdirSync(path.join(site, 'engine'), { recursive: true });
+fs.copyFileSync(engine, path.join(site, 'engine/replay-sim.wasm'));
 // Web addresses are case-sensitive; replays name maps in lower case. The game's
 // own images, when given, replace the engine's copies of the same maps.
 const published = new Set();
-for (const maps of [at('engine/repsim/maps'), gameMaps].filter(Boolean))
+for (const maps of [at('engine/maps'), gameMaps].filter(Boolean))
   for (const file of fs.readdirSync(maps, { recursive: true }).filter(name => name.endsWith('.png'))) {
     const name = file.replaceAll('\\', '/').toLowerCase();
     const target = path.join(site, 'maps', name);

@@ -1,0 +1,31 @@
+[package]
+name = "replay-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Offline War of Dots replay simulator, renderer and video frame source"
+
+[lib]
+name = "replay_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay-sim"
+path = "src/main.rs"
+
+[dependencies]
+# preserve_order keeps replay commands in file order; float_roundtrip parses numbers exactly.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+sha2 = "0.10"
+base64 = "0.22"
+num-bigint = "0.4"
+num-traits = "0.2"
+ryu = "1"
+tiny-skia = { version = "0.11", optional = true }
+ttf-parser = { version = "0.25", optional = true }
+
+[features]
+default = ["render"]
+# The renderer, render worker and video export; the browser build leaves them out.
+render = ["dep:tiny-skia", "dep:ttf-parser"]

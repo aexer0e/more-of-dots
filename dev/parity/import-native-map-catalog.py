@@ -28,7 +28,7 @@ for row in inventory['files']:
     value=replay.get('map')
     if isinstance(value,(str,int)) and str(value).strip().isdigit() and not isinstance(replay.get('custom_map'),dict):
         needed.add(str(int(str(value).strip())))
-path=REPO/'engine/repsim/maps/deployments.json'
+path=REPO/'engine/maps/deployments.json'
 catalog=json.loads(path.read_text())
 imports=[]
 for number in sorted(needed,key=int):
@@ -43,7 +43,7 @@ for number in sorted(needed,key=int):
     if not source.is_relative_to(game):raise RuntimeError('Native map image escaped its build directory')
     image_hash=hashlib.sha256(source.read_bytes()).hexdigest()
     if image_hash!=file['sha256']:raise RuntimeError(f'Native map {number} image changed after verification')
-    destination=REPO/'engine/repsim/maps'/relative
+    destination=REPO/'engine/maps'/relative
     if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest()!=image_hash:
         raise RuntimeError(f'Bundled map image collision for {number}; preserve/version it before importing')
     imports.append({'number':number,'layout':layout,'layout_added':layout_added,'source':source,'destination':destination,'image_sha256':image_hash})

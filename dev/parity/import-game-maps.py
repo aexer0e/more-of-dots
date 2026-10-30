@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-CATALOG = REPO / 'engine/repsim/maps/deployments.json'
+CATALOG = REPO / 'engine/maps/deployments.json'
 FIELDS = ['bridges', 'capitals', 'cities', 'infantry', 'tanks']
 
 

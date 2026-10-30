@@ -25,7 +25,7 @@
     "check:native": "node scripts/check-native.mjs",
     "check:player": "node --test scripts/player-scheduling.test.mjs scripts/player-sound.test.mjs scripts/player-view.test.mjs scripts/player-frames.test.mjs",
     "installers": "node scripts/download-installers.mjs",
-    "check:engine": "dotnet run --project engine/tests/ReplaySim.Tests.csproj -c Release"
+    "check:engine": "cargo test --release --manifest-path engine/Cargo.toml"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

@@ -2,6 +2,7 @@
 // chunks (docs/replay-frames.md). The simulation is one long synchronous call, so a
 // replay is cancelled by terminating this worker.
 import { RecordReader, jsonChunk } from "./frames.js";
+import { loadEngine } from "./wasm-engine.js";
 
 const post = {
   static: (record) => postMessage({ kind: "static", record }),
@@ -9,13 +10,12 @@ const post = {
 };
 
 async function simulate(bytes, base) {
-  const { dotnet } = await import(/* @vite-ignore */ `${base}engine/_framework/dotnet.js`);
-  const { setModuleImports, getAssemblyExports, getConfig } = await dotnet.create();
   const reader = new RecordReader(post);
-  setModuleImports("replay-host", { write: (view) => reader.push(view.slice()) });
-  const engine = (await getAssemblyExports(getConfig().mainAssemblyName)).ReplaySim.Standalone.WebEngine;
+  const wasm = await fetch(`${base}engine/replay-sim.wasm`);
+  if (!wasm.ok) throw new Error("The replay engine could not be loaded.");
+  const engine = await loadEngine(await wasm.arrayBuffer(), (bytes) => reader.push(bytes));
   // Official maps are hosted beside the page and fetched only when a replay names one.
-  for (let missing, last; (missing = engine.Open(bytes)) !== null; last = missing) {
+  for (let missing, last; (missing = engine.open(bytes)) !== null; last = missing) {
     const name = missing.toLowerCase();
     let map = null;
     if (missing !== last && /^[\w./-]+\.png$/.test(name) && !name.includes(".."))
@@ -27,9 +27,9 @@ async function simulate(bytes, base) {
         if (response.ok) { map = new Uint8Array(await response.arrayBuffer()); break; }
       }
     if (!map) throw new Error(`This replay uses a map that is not available here (${missing}).`);
-    engine.AddMap(missing, map);
+    engine.addMap(missing, map);
   }
-  engine.Run();
+  engine.run();
   reader.finish();
 }
 
@@ -98,7 +98,6 @@ async function read(file) {
   await flush();
 }
 
-// The .NET runtime never finishes starting in a worker that has `onmessage` set.
 self.addEventListener("message", async ({ data }) => {
   try {
     if (data.simulated) await read(data.file);

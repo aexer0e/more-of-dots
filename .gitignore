@@ -28,12 +28,7 @@ src-tauri/target/
 src-tauri/binaries/*.exe
 src-tauri/gen/
 src-tauri/resources/player/
-engine/repsim/bin/
-engine/repsim/obj/
-engine/tests/bin/
-engine/tests/obj/
-engine/web/bin/
-engine/web/obj/
+engine/target/
 wod-replay-server.spec
 more-of-dots-recorder.spec
 tools/python-probe-dll/target/

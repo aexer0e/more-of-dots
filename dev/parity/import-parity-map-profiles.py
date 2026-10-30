@@ -12,7 +12,7 @@ spec=importlib.util.spec_from_file_location('runner',REPO/'dev/parity/run-game-p
 runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 inventory=json.loads((ROOT/'inventory.json').read_text())
 plan=json.loads((ROOT/'build-plan.json').read_text())['builds']
-catalog_path=REPO/'engine/repsim/maps/deployments.json'
+catalog_path=REPO/'engine/maps/deployments.json'
 catalog=json.loads(catalog_path.read_text())
 imports=[];verified_builds={}
 for record in inventory['files']:
@@ -52,7 +52,7 @@ for record in inventory['files']:
     image=(directory/relative).resolve()
     if not image.is_relative_to(directory.resolve()) or not asset or runner.digest(image)!=asset['sha256']:
         raise RuntimeError('Native terrain asset provenance differs')
-    destination=REPO/'engine/repsim/maps'/relative
+    destination=REPO/'engine/maps'/relative
     if destination.exists() and runner.digest(destination)!=asset['sha256']:raise RuntimeError('Bundled image collision')
     destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(image,destination)
     catalog.setdefault(number,{})[profile]=layout

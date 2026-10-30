@@ -30,7 +30,7 @@ Replays sound like the game: its match music, the fighting loop that swells with
 
 To export videos, select replays and choose **Record**. Pick the export folder, playback speed (1–30×), bitrate, resolution (480p, 720p or 1080p), how many videos to convert at once, which layers to show, and the music and SFX volumes. Videos are converted in the background, without opening a player, much faster than real time: about 120–150 frames per second at 1080p, so a 10-minute game at 1× takes roughly two minutes, and less at higher speeds. A floating panel shows progress; **Stop** cancels unfinished videos and removes their partial files. Videos are H.264 MP4 with the game's sounds as AAC audio (set both volumes to 0 for a silent video), encoded by OpenH264 and FDK AAC inside the app, so every platform encodes the same way. The bitrate is an upper limit; simple scenes use less. With audio, the last frame stays on screen for two seconds while the end sound plays.
 
-Its internal C# engine simulates replays for playback and renders video exports with the same drawing rules as the player, drawing frames with Skia on the CPU on several cores. Playback draws decoded map and unit images in a worker-owned canvas, with frame parsing and read-ahead outside the UI thread. No game executable is launched or loaded. Each player window has its own renderer and keeps its replay's frames in memory, in independently compressed chunks of 60 frames, so seeking decompresses only the chunk it needs. See [replay frame chunks](docs/replay-frames.md).
+Its internal engine, written in Rust, simulates replays for playback and renders video exports with the same drawing rules as the player, drawing frames with tiny-skia on the CPU on several cores. Playback draws decoded map and unit images in a worker-owned canvas, with frame parsing and read-ahead outside the UI thread. No game executable is launched or loaded. Each player window has its own renderer and keeps its replay's frames in memory, in independently compressed chunks of 60 frames, so seeking decompresses only the chunk it needs. See [replay frame chunks](docs/replay-frames.md).
 
 The fast preview uses browser text and antialiasing, which can look slightly different from the maintained native renderer. Video exports and reference snapshots use the native drawing path. Simulation states are shared by both.
 
@@ -40,11 +40,11 @@ Simulated replays are not written to disk. On Windows, disposable WebView2 cache
 
 ### Developing the desktop app
 
-Install Node, Rust and .NET SDK 9, then run `npm ci` and `npm run dev:desktop`. On Windows and Linux also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. The build scripts find it on `PATH` or in its installer's default folder (`C:\Program Files\NASM`); set `NASM` to its path if it is elsewhere. Apple silicon builds need no extra tools.
+Install Node and Rust, then run `npm ci` and `npm run dev:desktop`. On Windows and Linux also install [NASM](https://www.nasm.us/), which OpenH264 needs for its x86 assembly; release builds stop without it, and development builds warn and export slowly. The build scripts find it on `PATH` or in its installer's default folder (`C:\Program Files\NASM`); set `NASM` to its path if it is elsewhere. Apple silicon builds need no extra tools.
 
-`npm run prepare:player` (run by `dev:desktop` and `build`) publishes the engine in `engine/repsim` for the current platform, stages the unit artwork and third-party notices, and writes a SHA-256 manifest for the staged resources. On Windows it also builds the Region probe. The installed app does not need the .NET SDK.
+`npm run prepare:player` (run by `dev:desktop` and `build`) builds the engine in `engine/replay-sim` for the current platform, stages it with the bundled maps, the unit artwork and third-party notices, and writes a SHA-256 manifest for the staged resources. On Windows it also builds the Region probe.
 
-`npm run check` checks the web modules. `npm run check:native` runs the Rust tests; on Windows it supplies the manifest that native dialog imports need in the test executable. `npm run check:engine` runs the engine tests. `npm run build` packages the app for the current platform: the NSIS installer on Windows, the app and disk image on macOS, and the AppImage on Linux. The draft release workflow builds all three into one draft release.
+`npm run check` checks the web modules. `npm run check:native` runs the Rust tests; on Windows it supplies the manifest that native dialog imports need in the test executable. `npm run check:engine` runs the engine tests, including checks pinned to values recorded from the original game builds. `npm run build` packages the app for the current platform: the NSIS installer on Windows, the app and disk image on macOS, and the AppImage on Linux. The draft release workflow builds all three into one draft release.
 
 macOS and Linux installers cannot be built on Windows. To send them to testers before a release, push the branch and run `npm run installers`. It downloads the installers the Build workflow made for the current commit into `build/installers`, starting a build and waiting for it if there is none yet. It needs the GitHub CLI, signed in.
 
@@ -54,7 +54,7 @@ The parity and research tools that verified the engine against the original game
 
 ### Hosted player
 
-The same player and engine run in the browser at https://aexer0e.dev/wod-replay-player/. `npm run build:site` compiles the engine to WebAssembly and builds the site into `build/site`; it needs the .NET `wasm-tools` workload. The site is published from `aexer0e/wod-replay-player`, which rebuilds from this repository when `VERSION` changes. See [hosted player notes](docs/web-player.md).
+The same player and engine run in the browser at https://aexer0e.dev/wod-replay-player/. `npm run build:site` compiles the engine to WebAssembly and builds the site into `build/site`; it needs Rust's `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`). The site is published from `aexer0e/wod-replay-player`, which rebuilds from this repository when `VERSION` changes. See [hosted player notes](docs/web-player.md).
 
 ## Leaderboard
 

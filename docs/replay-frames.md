@@ -1,12 +1,12 @@
 # Replay frame chunks
 
-The player reads simulated frames in chunks. The engine writes them with `--format binary` (the desktop app) or `WebEngine.Run` (the hosted player). Both hosts keep the chunks in memory exactly as written and pass one to the player when asked. Nothing is written to disk.
+The player reads simulated frames in chunks. The engine writes them with `--format binary` (the desktop app) or the WebAssembly module's `run` (the hosted player). Both hosts keep the chunks in memory exactly as written and pass one to the player when asked. Nothing is written to disk.
 
 JSONL output (`--render-state`, the default format) is unchanged. It is used by the parity tools, and the player still opens `.repsim` and `.jsonl` files: their hosts group the records into chunks of JSON lines.
 
 | Part | Reads and writes it |
 |---|---|
-| `engine/repsim/FrameChunks.cs` | Writes the stream |
+| `engine/replay-sim/src/output.rs` | Writes the stream |
 | `src-tauri/src/player.rs` | Desktop host: reads the stream, or a JSONL file |
 | `src/player/web-engine.js`, `src/player/web-host.js` | Browser host: the same |
 | `src/player/frames.js` | Reads the stream and the chunk header, decodes frames |

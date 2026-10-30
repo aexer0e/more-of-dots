@@ -1,0 +1,11 @@
+[workspace]
+members = ["replay-sim", "replay-sim-web"]
+# The browser module is built for wasm32-unknown-unknown by scripts/build-site.mjs.
+default-members = ["replay-sim"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Never enable fast-math style flags: the simulation relies on strict IEEE-754 semantics.

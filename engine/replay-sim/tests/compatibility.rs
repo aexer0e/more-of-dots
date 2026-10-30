@@ -821,6 +821,26 @@ fn missing_unit_orders_defer_latest_order_wins_no_invented_unit() {
 }
 
 #[test]
+fn troops_output_samples_each_side_once_a_second() {
+    let mut root = fixture();
+    root["end"] = json!(125);
+    let mut sim = Simulator::new(read(&root));
+    let sides = sim.replay.side_count();
+    let mut bytes = Vec::new();
+    let options = RunOptions { max_frame: None, sample_every: 30, no_combat: false, render_state: false };
+    let samples = output::write_troops(&mut sim, &options, &mut bytes).unwrap();
+    let record: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(record["frames"], json!(125));
+    assert_eq!(record["every"], json!(30));
+    let strength = record["strength"].as_array().unwrap();
+    assert_eq!(strength.len(), sides, "One series per side");
+    // Frames 30, 60, 90, 120 and the last, 125.
+    assert_eq!(samples, 5);
+    assert!(strength.iter().all(|side| side.as_array().unwrap().len() == 5));
+    assert_eq!(strength.iter().map(|side| side[4].as_i64().unwrap()).collect::<Vec<_>>(), sim.strength.iter().map(|&value| value as i64).collect::<Vec<_>>());
+}
+
+#[test]
 fn binary_chunks_send_the_first_frame_alone_then_up_to_60_frames_from_a_complete_one() {
     let mut root = fixture();
     root["end"] = json!(125);

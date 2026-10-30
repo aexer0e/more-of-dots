@@ -29,6 +29,15 @@ function stressReplays<T extends { filePath: string }>(replays: T[]): T[] {
     return index < replays.length ? replay : { ...replay, filePath: `${replay.filePath}#${index}` };
   });
 }
+// Two armies wearing down, varied by replay, for the troop lines on cards.
+function exampleTroops(seed: string) {
+  let state = [...seed].reduce((hash, character) => (Math.imul(hash, 31) + character.charCodeAt(0)) | 0, 7);
+  const next = () => (state = (Math.imul(state, 1664525) + 1013904223) | 0) >>> 16 & 0xff;
+  return [0, 1].map(() => {
+    let troops = 2600;
+    return Array.from({ length: 30 }, () => (troops = Math.max(100, troops - 90 + next() / 2 - 20)) | 0);
+  });
+}
 let exampleRegion: string | null = null;
 // The servers the game listed when this was written: one in Singapore, two in Frankfurt, one of them down.
 const EXAMPLE_SERVERS = [
@@ -44,6 +53,8 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
     case 'leaderboard_identity': result = data.identity; break;
     case 'list_replays': result = { replays: stressReplays(data.replays.slice(0, 100)) }; break;
     case 'replay_thumbnail_paths': result = []; break;
+    case 'replay_troop_store': result = new URLSearchParams(location.search).has('notroops') ? '' : data.replays.slice(0, 100).map((replay) => JSON.stringify({ h: (replay as { hash?: string }).hash ?? replay.filePath, s: exampleTroops(replay.filePath) })).join('\n'); break;
+    case 'replay_troop_lines': result = (args.filePaths as string[]).map((filePath) => ({ filePath, sides: new URLSearchParams(location.search).has('notroops') ? [] : exampleTroops(filePath) })); break;
     // The export dialog asks for a default folder and the game's sounds; examples never write videos.
     case 'recording_default_directory': result = 'C:\\Users\\Player\\Videos'; break;
     case 'game_audio': result = { files: {}, music: 0.3, sfx: 0.3 }; break;

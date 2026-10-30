@@ -348,6 +348,26 @@ pub fn write_jsonl(sim: &mut Simulator, options: &RunOptions, labels: &LabelRend
     Ok(frames)
 }
 
+/// Each side's troops, in hundreds, at every sampled frame after the first, as
+/// one JSON object: `{"frames":end,"every":n,"strength":[[side 0...],...]}`.
+pub fn write_troops(sim: &mut Simulator, options: &RunOptions, output: &mut dyn Write) -> io::Result<u64> {
+    let mut strength = vec![Vec::new(); sim.replay.side_count()];
+    let mut last = 0;
+    sim.run(options, |sim, frame| {
+        if frame > 0 {
+            for (side, values) in strength.iter_mut().enumerate() {
+                values.push(sim.strength.get(side).copied().unwrap_or(0));
+            }
+            last = frame;
+        }
+        Ok::<(), io::Error>(())
+    })?;
+    let record = json!({ "frames": last, "every": options.sample_every, "strength": strength });
+    output.write_all(record.to_string().as_bytes())?;
+    output.write_all(b"\n")?;
+    Ok(strength.first().map_or(0, |values| values.len() as u64))
+}
+
 pub fn write_record(output: &mut dyn Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     let mut header = [0u8; 5];
     header[0] = kind;

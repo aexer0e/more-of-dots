@@ -32,6 +32,7 @@ mod region;
 mod video;
 mod storage;
 mod thumbnails;
+mod troops;
 
 use installed_maps::{InstalledMaps, SurfaceDigest};
 
@@ -2535,6 +2536,8 @@ pub fn run() {
             open_share_link,
             list_replays,
             replay_thumbnail_paths,
+            troops::replay_troop_lines,
+            troops::replay_troop_store,
             replay_index_progress,
             upload_replay,
             add_replay_file,

@@ -17,6 +17,7 @@ import { mountRegionPage, unmountRegionPage } from "./region/page";
 import "./styles.css";
 import "./replays/styles.css";
 import { MATCH_TYPES, REPLAY_VARIANTS, matchesReplay, matchupTitle, replaySuggestions, toggleMatchType, type PlayerSuggestion, type ReplayVariant, type ReplayFilterRecord, type ReplayFilters, type ReplaySuggestion } from "./replays/filters";
+import { parseTroopStore, troopLinesMarkup, type TroopSides } from "./replays/troop-lines";
 import { VirtualGrid } from "./replays/virtual-grid";
 
 declare global {
@@ -118,6 +119,8 @@ const BROWSER_REPLAY_PLAYBACK_ENABLED = true;
 // Cards narrower than this many device pixels use the downscaled thumbnails.
 const SMALL_THUMBNAIL_WIDTH = 480;
 const THUMBNAIL_BATCH_SIZE = 32;
+// Each replay in a batch is simulated, so batches stay small.
+const TROOP_BATCH_SIZE = 4;
 const FALLBACK_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(`
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">
   <rect width="640" height="360" fill="#9fbd42"/>
@@ -161,6 +164,14 @@ let browserThumbnailPrefetchTimer = 0;
 const browserThumbnailUrls = new Map<string, string>();
 const browserThumbnailPending = new Set<string>();
 const browserThumbnailInFlight = new Set<string>();
+// Troop counts by replay; empty for replays that have none.
+let browserTroopSides = new Map<string, TroopSides>();
+let browserTroopStore: Promise<void> | null = null;
+// Replay keys waiting for troop lines by file path, the most recently shown last.
+const browserTroopPending = new Map<string, string>();
+const browserTroopSimulating = new Set<string>();
+let browserTroopInFlight = false;
+let browserTroopPrefetchTimer = 0;
 let browserIndexProgress: ReplayIndexProgress | null = null;
 let browserOpeningPaths = new Set<string>();
 // Share buttons that are uploading, just copied a link, or failed, by file path.
@@ -1228,6 +1239,7 @@ function renderReplayCard(replay: ReplayBrowserItem, replayIndex: number): strin
     <article class="${cardClasses}" data-card-index="${replayIndex}" aria-label="${escapeHtml(accessibleLabel)}">
       <img class="replay-thumb" alt="" decoding="async" src="${escapeHtml(thumbnailSource)}" ${thumbnailKey ? `data-thumbnail-key="${escapeHtml(thumbnailKey)}"` : ""}>
       <div class="replay-shade"></div>
+      <div class="replay-troops" data-troop-path="${escapeHtml(replay.filePath)}">${replayTroopLines(replay)}</div>
       <div class="replay-labels">
         ${mapButton}
         <div class="replay-label length">${escapeHtml(replay.length || formatDurationSeconds(replay.durationSeconds))}</div>
@@ -1612,6 +1624,94 @@ function scheduleReplayThumbnailPrefetch() {
     : globalThis.setTimeout(run, 200);
 }
 
+type ReplayTroopLines = { filePath: string; sides: TroopSides };
+
+// Replays are known by their file's digest; the store outlives moved files.
+function troopKey(replay: ReplayBrowserItem): string {
+  return replay.hash ?? replay.filePath;
+}
+
+// Everything already simulated, read once before the first cards are built, so
+// cards have their lines from the moment they scroll in.
+function loadStoredTroopLines(): Promise<void> {
+  return (browserTroopStore ??= invoke<string>("replay_troop_store")
+    .then((text) => {
+      browserTroopSides = parseTroopStore(text);
+    })
+    .catch(() => {
+      // Lines are simulated again as cards ask for them.
+    }));
+}
+
+// The card's troop lines if they are ready; otherwise they are requested.
+function replayTroopLines(replay: ReplayBrowserItem): string {
+  const sides = browserTroopSides.get(troopKey(replay));
+  if (sides) return troopLinesMarkup(sides);
+  queueReplayTroopLines(replay);
+  return "";
+}
+
+function queueReplayTroopLines(replay: ReplayBrowserItem) {
+  if (browserTroopSimulating.has(replay.filePath)) return;
+  // Re-adding moves the replay last, so cards on screen now go first.
+  browserTroopPending.delete(replay.filePath);
+  browserTroopPending.set(replay.filePath, troopKey(replay));
+  if (!browserTroopInFlight) void flushReplayTroopLines();
+}
+
+async function flushReplayTroopLines() {
+  const batch = [...browserTroopPending].slice(-TROOP_BATCH_SIZE);
+  if (!batch.length) return;
+  browserTroopInFlight = true;
+  batch.forEach(([filePath]) => {
+    browserTroopPending.delete(filePath);
+    browserTroopSimulating.add(filePath);
+  });
+  const keys = new Map(batch);
+  try {
+    const results = await invoke<ReplayTroopLines[]>("replay_troop_lines", { filePaths: batch.map(([filePath]) => filePath) });
+    for (const item of results) {
+      const key = keys.get(item.filePath);
+      if (key === undefined) continue;
+      browserTroopSides.set(key, item.sides);
+      const markup = troopLinesMarkup(item.sides);
+      document.querySelectorAll<HTMLElement>(`.replay-troops[data-troop-path="${CSS.escape(item.filePath)}"]`).forEach((element) => {
+        element.innerHTML = markup;
+      });
+    }
+  } catch {
+    // Cards without lines still show their map and players.
+  } finally {
+    keys.forEach((key, filePath) => {
+      browserTroopSimulating.delete(filePath);
+      if (!browserTroopSides.has(key)) browserTroopSides.set(key, []);
+    });
+    browserTroopInFlight = false;
+    if (browserTroopPending.size) void flushReplayTroopLines();
+    else scheduleReplayTroopPrefetch();
+  }
+}
+
+// Once the visible cards have their lines, the rest of the library's are
+// simulated in the background, a few replays at a time.
+function scheduleReplayTroopPrefetch() {
+  if (browserTroopPrefetchTimer) return;
+  const run = () => {
+    browserTroopPrefetchTimer = 0;
+    if (browserTroopPending.size || browserTroopInFlight || browserPage !== "replays") return;
+    let queued = 0;
+    for (const replay of browserReplays) {
+      if (browserTroopSides.has(troopKey(replay))) continue;
+      queueReplayTroopLines(replay);
+      queued += 1;
+      if (queued === TROOP_BATCH_SIZE) break;
+    }
+  };
+  browserTroopPrefetchTimer = "requestIdleCallback" in window
+    ? window.requestIdleCallback(run, { timeout: 2000 })
+    : globalThis.setTimeout(run, 500);
+}
+
 function preferredThumbnailVariant(columnWidth: number): ThumbnailVariant {
   return columnWidth * (window.devicePixelRatio || 1) <= SMALL_THUMBNAIL_WIDTH ? "small" : "full";
 }
@@ -1627,6 +1727,12 @@ function renderReplayCards(indexes: number[]): HTMLElement[] {
 function updateReplayCard(card: HTMLElement, replayIndex: number, now = Date.now()) {
   const replay = browserReplays[replayIndex];
   if (!replay) return;
+  // Lines that arrived while the card was off screen.
+  const troops = card.querySelector<HTMLElement>(".replay-troops");
+  if (troops && !troops.firstChild) {
+    const markup = replayTroopLines(replay);
+    if (markup) troops.innerHTML = markup;
+  }
   const query = normalizeSearchText(browserSearchValue());
   if ((card.dataset.highlight ?? "") !== query) {
     card.dataset.highlight = query;
@@ -2443,10 +2549,10 @@ async function loadBrowserReplays(
   }
   let dataChanged = false;
   try {
-    const payload = await invoke<ReplayBrowserPayload>("list_replays", {
-      offset: 0,
-      limit: 0,
-    });
+    const [payload] = await Promise.all([
+      invoke<ReplayBrowserPayload>("list_replays", { offset: 0, limit: 0 }),
+      loadStoredTroopLines(),
+    ]);
     const replays = payload.replays;
     const nextSignature = replayListSignature(replays);
     dataChanged = nextSignature !== browserReplaySignature;

@@ -19,6 +19,7 @@ struct Options {
     export_contours: Option<String>,
     export_regions: Option<String>,
     binary_frames: bool,
+    troops: bool,
     render_state: bool,
     game_dirs: Vec<PathBuf>,
     replay_dirs: Vec<PathBuf>,
@@ -42,8 +43,9 @@ Options:
   --max-frame N       stop after frame N (development/parity probes)
   --sample-every N    write every Nth state frame (default: 1)
   --no-combat         disable combat while debugging movement
-  --format F          jsonl (default) or binary: compact playback chunks with
-                      render state (docs/replay-frames.md)
+  --format F          jsonl (default); binary: compact playback chunks with
+                      render state (docs/replay-frames.md); troops: each side's
+                      troops once a second, as one JSON line
   --game-dir DIR      installed game folder for official maps (repeatable)
   --replay-dir DIR    replay folder with layouts for maps the catalog lacks (repeatable)
   --export-video      write raw RGB24 video frames to stdout, progress to stderr
@@ -75,6 +77,7 @@ impl Options {
             export_contours: None,
             export_regions: None,
             binary_frames: false,
+            troops: false,
             render_state: false,
             game_dirs: Vec::new(),
             replay_dirs: Vec::new(),
@@ -106,11 +109,12 @@ impl Options {
                 "--export-regions" => o.export_regions = Some(next()?),
                 "--render-state" => o.render_state = true,
                 "--format" => {
-                    o.binary_frames = match next()?.as_str() {
-                        "jsonl" => false,
-                        "binary" => true,
-                        format => return Err(format!("Unknown output format: {format}")),
-                    };
+                    let format = next()?;
+                    if !matches!(format.as_str(), "jsonl" | "binary" | "troops") {
+                        return Err(format!("Unknown output format: {format}"));
+                    }
+                    o.binary_frames = format == "binary";
+                    o.troops = format == "troops";
                     // The player draws from render state, so binary frames always carry it.
                     o.render_state |= o.binary_frames;
                 }
@@ -194,6 +198,17 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "The simulation failed.".into())
 }
 
+fn write_output(options: &Options, simulator: &mut Simulator, run_options: &RunOptions, labels: &output::LabelRenderer, out: &mut dyn Write) -> std::io::Result<u64> {
+    if options.troops {
+        // Troop counts change once a second, so finer samples add nothing.
+        output::write_troops(simulator, &RunOptions { sample_every: 30, ..*run_options }, out)
+    } else if options.binary_frames {
+        output::write_chunks(simulator, run_options, labels, out)
+    } else {
+        output::write_jsonl(simulator, run_options, labels, out)
+    }
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let options = Options::parse(args)?;
     if options.help {
@@ -226,11 +241,7 @@ fn run(args: &[String]) -> Result<(), String> {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
         let mut simulator = Simulator::new(replay);
-        let result = if options.binary_frames {
-            output::write_chunks(&mut simulator, &run_options, labels, &mut stdout)
-        } else {
-            output::write_jsonl(&mut simulator, &run_options, labels, &mut stdout)
-        };
+        let result = write_output(&options, &mut simulator, &run_options, labels, &mut stdout);
         stdout.flush().ok();
         return result.map(|_| ()).map_err(|e| e.to_string());
     }
@@ -248,11 +259,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let written = (|| -> std::io::Result<u64> {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
-        let frames = if options.binary_frames {
-            output::write_chunks(&mut simulator, &run_options, labels, &mut file)?
-        } else {
-            output::write_jsonl(&mut simulator, &run_options, labels, &mut file)?
-        };
+        let frames = write_output(&options, &mut simulator, &run_options, labels, &mut file)?;
         file.flush()?;
         Ok(frames)
     })();

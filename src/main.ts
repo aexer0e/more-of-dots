@@ -988,6 +988,7 @@ async function replayCardDetails(replay: ReplayBrowserItem): Promise<CardDetails
     frames: replay.durationSeconds * 30,
     version: replay.version ?? null,
     picture,
+    troops: browserTroopSides.get(troopKey(replay)),
   };
 }
 

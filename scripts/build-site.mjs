@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { writeLinkPreviews } from './og-cards.mjs';
 import { publishTournaments } from './tournaments.mjs';
+import { reduceTroops } from '../src/replays/troop-lines.ts';
 
 const project = path.resolve(import.meta.dirname, '..');
 const at = (...parts) => path.join(project, ...parts);
@@ -45,7 +46,21 @@ for (const maps of [at('engine/maps'), gameMaps].filter(Boolean))
 // The site finds the picture of a replay that only names its map in this list.
 fs.writeFileSync(path.join(site, 'maps/index.json'), JSON.stringify([...published].sort()));
 if (audio) fs.cpSync(audio, path.join(site, 'audio'), { recursive: true });
-if (tournaments) publishTournaments(tournaments, path.join(site, 'tournaments'));
+if (tournaments) {
+  // Each published replay is simulated here for the lines on its card and preview.
+  run('cargo', ['build', '--release', '--manifest-path', at('engine/Cargo.toml'), '-p', 'replay-sim']);
+  const simulator = at(`engine/target/release/replay-sim${process.platform === 'win32' ? '.exe' : ''}`);
+  const troops = (replay) => {
+    try {
+      const output = execFileSync(simulator, [replay, '--format', 'troops', '-o', '-', ...(gameMaps ? ['--game-dir', gameMaps] : [])], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return JSON.parse(output).strength.map((side) => reduceTroops(side));
+    } catch (error) {
+      console.warn(`No troop lines for ${path.basename(replay)}: ${String(error.stderr || error.message).trim()}`);
+      return null;
+    }
+  };
+  publishTournaments(tournaments, path.join(site, 'tournaments'), troops);
+}
 else {
   fs.mkdirSync(path.join(site, 'tournaments'), { recursive: true });
   fs.writeFileSync(path.join(site, 'tournaments/index.json'), '[]');

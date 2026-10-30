@@ -3,8 +3,6 @@
 export type TroopSides = number[][];
 
 const SIZE = 1000;
-const MARGIN_TOP = 30;
-const MARGIN_BOTTOM = 30;
 
 /** Reads the host's store: one `{"h":hash,"s":sides}` per line. A damaged line is skipped. */
 export function parseTroopStore(text: string): Map<string, TroopSides> {
@@ -34,21 +32,38 @@ function curve(points: [number, number][]): string {
   return path;
 }
 
-/** One thin line per side, scaled so the largest army reaches near the top. A wiped-out side's line stops there. */
-export function troopLinesMarkup(sides: TroopSides): string {
+/** Averages a side's troops into at most `points` evenly spaced values. */
+export function reduceTroops(values: number[], points = 30): number[] {
+  const count = Math.min(points, values.length);
+  return Array.from({ length: count }, (_, index) => {
+    const start = Math.floor((index * values.length) / count);
+    const end = Math.max(Math.floor(((index + 1) * values.length) / count), start + 1);
+    let total = 0;
+    for (let at = start; at < end; at += 1) total += values[at];
+    return Math.floor(total / (end - start));
+  });
+}
+
+/** A curve per side for a picture of this size, scaled so the largest army reaches near the top. A wiped-out side's line stops there. Empty for a side with too few points. */
+export function troopCurves(sides: TroopSides, width: number, height: number): string[] {
   const peak = Math.max(0, ...sides.flat());
-  if (!peak) return "";
-  const paths = sides
-    .map((values, side) => {
-      if (values.length < 2) return "";
-      const wiped = values.indexOf(0);
-      const kept = wiped > 0 ? values.slice(0, wiped + 1) : values;
-      const points = kept.map((value, index): [number, number] => [
-        Math.round((index / (values.length - 1)) * SIZE),
-        Math.round(SIZE - MARGIN_BOTTOM - (value / peak) * (SIZE - MARGIN_TOP - MARGIN_BOTTOM)),
-      ]);
-      return `<path class="replay-troop-line troop-side-${side + 1}" d="${curve(points)}"/>`;
-    })
+  if (!peak) return [];
+  const margin = height * 0.03;
+  return sides.map((values) => {
+    if (values.length < 2) return "";
+    const wiped = values.indexOf(0);
+    const kept = wiped > 0 ? values.slice(0, wiped + 1) : values;
+    return curve(kept.map((value, index): [number, number] => [
+      Math.round((index / (values.length - 1)) * width),
+      Math.round(height - margin - (value / peak) * (height - 2 * margin)),
+    ]));
+  });
+}
+
+/** One thin line per side, stretched over the whole card. */
+export function troopLinesMarkup(sides: TroopSides): string {
+  const paths = troopCurves(sides, SIZE, SIZE)
+    .map((path, side) => (path ? `<path class="replay-troop-line troop-side-${side + 1}" d="${path}"/>` : ""))
     .join("");
-  return `<svg viewBox="0 0 ${SIZE} ${SIZE}" preserveAspectRatio="none" aria-hidden="true">${paths}</svg>`;
+  return paths ? `<svg viewBox="0 0 ${SIZE} ${SIZE}" preserveAspectRatio="none" aria-hidden="true">${paths}</svg>` : "";
 }

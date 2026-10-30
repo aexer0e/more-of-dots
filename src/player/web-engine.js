@@ -9,11 +9,10 @@ const post = {
   chunk: (payload) => postMessage({ kind: "chunk", payload }, [payload.buffer]),
 };
 
-async function simulate(bytes, base) {
-  const reader = new RecordReader(post);
+async function open(bytes, base, write) {
   const wasm = await fetch(`${base}engine/replay-sim.wasm`);
   if (!wasm.ok) throw new Error("The replay engine could not be loaded.");
-  const engine = await loadEngine(await wasm.arrayBuffer(), (bytes) => reader.push(bytes));
+  const engine = await loadEngine(await wasm.arrayBuffer(), write);
   // Official maps are hosted beside the page and fetched only when a replay names one.
   for (let missing, last; (missing = engine.open(bytes)) !== null; last = missing) {
     const name = missing.toLowerCase();
@@ -29,8 +28,22 @@ async function simulate(bytes, base) {
     if (!map) throw new Error(`This replay uses a map that is not available here (${missing}).`);
     engine.addMap(missing, map);
   }
+  return engine;
+}
+
+async function simulate(bytes, base) {
+  const reader = new RecordReader(post);
+  const engine = await open(bytes, base, (bytes) => reader.push(bytes));
   engine.run();
   reader.finish();
+}
+
+/// Each side's troops once a second, for the lines on replay cards.
+async function troops(bytes, base) {
+  const parts = [];
+  const engine = await open(bytes, base, (bytes) => parts.push(bytes));
+  engine.troops();
+  return JSON.parse(decoder.decode(concat(parts))).strength;
 }
 
 // A .repsim or .jsonl file already holds the simulated frames: its state records
@@ -100,6 +113,10 @@ async function read(file) {
 
 self.addEventListener("message", async ({ data }) => {
   try {
+    if (data.troops) {
+      postMessage({ kind: "troops", strength: await troops(new Uint8Array(await data.file.arrayBuffer()), data.base) });
+      return;
+    }
     if (data.simulated) await read(data.file);
     else await simulate(new Uint8Array(await data.file.arrayBuffer()), data.base);
     postMessage({ kind: "done" });

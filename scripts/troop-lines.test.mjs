@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseTroopStore, troopLinesMarkup } from '../src/replays/troop-lines.ts';
+import { parseTroopStore, reduceTroops, troopCurves, troopLinesMarkup } from '../src/replays/troop-lines.ts';
 
 test('the store skips damaged lines and keeps the latest entry for a replay', () => {
   const lines = parseTroopStore('{"h":"a","s":[[1,2]]}\nnot json\n{"h":"b","s":[]}\n{"h":"a","s":[[3,4]]}\n{"h":"c","s":[[1');
@@ -22,6 +22,18 @@ test('each side gets one path, in its own colour, spanning the card', () => {
 test('a wiped-out side stops where it reaches zero', () => {
   const [, line] = troopLinesMarkup([[4, 4, 4, 4, 4], [4, 2, 0, 0, 0]]).match(/troop-side-2" d="([^"]+)"/);
   assert.match(line, / 500 970$/);
+});
+
+test('reducing averages into even buckets and keeps short series', () => {
+  assert.deepEqual(reduceTroops([1, 3, 5, 7], 2), [2, 6]);
+  assert.deepEqual(reduceTroops([4, 8]), [4, 8]);
+  assert.deepEqual(reduceTroops([]), []);
+});
+
+test('curves fit the size of the picture', () => {
+  const [line] = troopCurves([[10, 5]], 1200, 630);
+  assert.match(line, /^M0 19C/);
+  assert.match(line, / 1200 \d+$/);
 });
 
 test('replays without troops draw nothing', () => {

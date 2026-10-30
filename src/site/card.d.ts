@@ -5,6 +5,8 @@ export type CardDetails = {
   version?: string | null;
   /** The map picture, as a URL the page may draw from. */
   picture?: string | null;
+  /** Each side's troops over the match, drawn as lines over the map. */
+  troops?: number[][] | null;
 };
 
 /** A JPEG of a shared replay's link preview. `base` is where the site's og/ fonts are. */

@@ -81,3 +81,5 @@ Across 90 dev replays the chunks took 842 MB against 22.9 GB of JSONL. For each 
 ## Troop lines
 
 Replay cards draw each side's troops over the whole match. The desktop app gets them from `--format troops`, which runs the simulation without render state and writes one JSON line: `{"frames": end, "every": 30, "strength": [[...], ...]}`. Each series holds a side's `strength` (troops in hundreds) at every 30th frame. The app averages each series into at most 30 points and appends them to `media-cache/replay-troops/lines.jsonl`, one `{"h": sha256, "s": sides}` per line. The library reads that file whole before building the first cards, so lines are there as cards scroll in. Replays missing from it are simulated when their cards appear, then the rest of the library, two replays at a time at below normal priority.
+
+The hosted site draws the same lines. Tournament replays are simulated once when the site is built and kept in each tournament's `tournament.json`, which the link preview images also read. A visitor's own replays are simulated in a worker with the WebAssembly module's `run(2)` and kept with the replay in IndexedDB.

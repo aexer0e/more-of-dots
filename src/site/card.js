@@ -1,5 +1,7 @@
 // The picture a shared replay's link preview shows, drawn in the sharer's browser
 // in the layout of the tournament cards the build draws (scripts/og-cards.mjs).
+import { troopCurves } from "../replays/troop-lines";
+
 const WIDTH = 1200,
   HEIGHT = 630,
   PAD_X = 52,
@@ -8,6 +10,7 @@ const BLUE = "#8cc0ee",
   RED = "#ff8a8a",
   MUTED = "#c4cdc8",
   TEXT = "#eef4f0";
+const SIDE_COLORS = [BLUE, RED, "#c084fc", "#ffa25c"];
 
 let fonts;
 // The card's font is published beside the site (og/Inter-*.ttf).
@@ -34,8 +37,8 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.fill();
 }
 
-/// A JPEG of the card: the replay's map, its players and its length and version.
-export async function drawCard({ players, frames, version, picture }, base) {
+/// A JPEG of the card: the replay's map, each side's troops, its players and its length and version.
+export async function drawCard({ players, frames, version, picture, troops }, base) {
   await loadFonts(base).catch(() => {});
   const canvas = Object.assign(document.createElement("canvas"), { width: WIDTH, height: HEIGHT });
   const ctx = canvas.getContext("2d");
@@ -50,6 +53,15 @@ export async function drawCard({ players, frames, version, picture }, base) {
   }
   ctx.fillStyle = "rgba(8,10,9,0.55)";
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.globalAlpha = 0.8;
+  ctx.lineWidth = 4;
+  ctx.lineJoin = ctx.lineCap = "round";
+  troopCurves(troops ?? [], WIDTH, HEIGHT).forEach((path, side) => {
+    if (!path) return;
+    ctx.strokeStyle = SIDE_COLORS[side];
+    ctx.stroke(new Path2D(path));
+  });
+  ctx.globalAlpha = 1;
 
   // Site name, top left.
   const middle = PAD_Y + 15;

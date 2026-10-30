@@ -20,6 +20,7 @@ import { addReplay, getReplay, listReplays, refreshDetails, removeReplay, saveRe
 import { downloadLink, fetchShared, shareReplay, unshareReplay, uploadCard } from "./share.js";
 import { drawCard } from "./card.js";
 import { box, connect, layout, nextMatches, roundName, sides } from "./bracket.js";
+import { reduceTroops, troopLinesMarkup } from "../replays/troop-lines";
 
 const base = new URL(import.meta.env.BASE_URL, document.baseURI).href;
 // The site's folder as a path, such as /wod-replay-player/; every page is under it.
@@ -364,12 +365,42 @@ async function addCard(id) {
   if (!token || record.shared.card) return;
   try {
     const picture = record.thumb ?? mapPicture(record.mapRef, await publishedMaps());
-    await uploadCard(id, token, await drawCard({ players: record.players, frames: record.frames, version: record.version, picture }, base));
+    const troops = await replayTroops(record);
+    await uploadCard(id, token, await drawCard({ players: record.players, frames: record.frames, version: record.version, picture, troops }, base));
     const current = await getReplay(id);
     if (current?.shared) await saveReplay({ ...current, shared: { ...current.shared, card: true } });
   } catch {
     // The preview shows the replay's details without a picture until the next share.
   }
+}
+// Lines for the visitor's own replays are simulated once, one replay at a time,
+// and kept with the replay. A replay that cannot be simulated has none this visit.
+const troopRequests = new Map();
+let troopWorker;
+let troopQueue = Promise.resolve();
+const simulateTroops = (record) =>
+  new Promise((resolve, reject) => {
+    troopWorker ??= new Worker(new URL("../player/web-engine.js", import.meta.url), { type: "module" });
+    troopWorker.onerror = () => reject(new Error("The replay engine could not be started."));
+    troopWorker.onmessage = ({ data }) => {
+      if (data.kind === "troops") resolve(data.strength.map((side) => reduceTroops(side)));
+      else reject(new Error(data.error));
+    };
+    troopWorker.postMessage({ troops: true, file: record.blob, base });
+  });
+function replayTroops(record) {
+  if (record.troops) return Promise.resolve(record.troops);
+  if (!troopRequests.has(record.id)) {
+    const request = troopQueue.then(() => simulateTroops(record)).then(async (troops) => {
+      const current = await getReplay(record.id);
+      if (current) await saveReplay({ ...current, troops });
+      for (const element of site.querySelectorAll(`[data-troops="${record.id}"]`)) element.innerHTML = troopLinesMarkup(troops);
+      return troops;
+    }).catch(() => null);
+    troopRequests.set(record.id, request);
+    troopQueue = request;
+  }
+  return troopRequests.get(record.id);
 }
 // The official map images the site publishes, as listed by the build.
 let mapIndex;
@@ -415,6 +446,7 @@ async function renderMine() {
     return `<div class="rep-card">
       <a href="${root}mine/${r.id}" aria-label="Watch ${what}, ${duration(r.frames)}">
         ${picture ? `<img src="${escape(picture)}" alt="">` : ""}<span class="shade"></span>
+        <span class="replay-troops" data-troops="${r.id}">${r.troops ? troopLinesMarkup(r.troops) : ""}</span>
         <span class="versus">${versus(r.players)}</span>
         <span class="tag bl">${r.version ? `v${escape(r.version)} · ` : ""}${kilobytes(r.size)}</span>
         <span class="tag br">${duration(r.frames)}</span>
@@ -435,6 +467,7 @@ async function renderMine() {
             <button type="button" class="btn" data-page="${home.page + 1}"${home.page === pages - 1 ? " disabled" : ""}>Next</button></div></nav>`
         : ""}`;
   fitNames();
+  page.forEach((r) => void replayTroops(r));
 }
 
 // Published tournaments.
@@ -527,7 +560,7 @@ function popover(t, m, className, style = "") {
       <b>${escape(t.display(m.player1))} ${m.scores[0]} : ${m.scores[1]} ${escape(t.display(m.player2))}</b></span>
       <a class="close" href="${root}${t.id}" aria-label="Close">${icons.close(14)}</a></div>
     ${games.length ? `<ul class="map-list">${games.map((r) => `<li><a href="${root}${t.id}/${m.id}/${r.slug}">
-        ${r.thumb ? `<img src="${base}tournaments/${t.id}/${escape(r.thumb)}" alt="">` : ""}
+        ${r.thumb ? `<span class="map-thumb"><img src="${base}tournaments/${t.id}/${escape(r.thumb)}" alt=""><span class="replay-troops">${r.troops ? troopLinesMarkup(r.troops) : ""}</span></span>` : ""}
         <span class="what"><b>${escape(r.map ?? "Unknown map")}</b><span class="fit">${versus(r.names)}</span><span class="note">${duration(r.frames)}${r.version ? ` · v${escape(r.version)}` : ""}</span></span>
         <span class="play-dot" aria-hidden="true">${icons.play(12)}</span></a></li>`).join("")}</ul>`
       : '<p class="note">No replays for this match.</p>'}
@@ -677,6 +710,7 @@ function renderGroups(t) {
         <span class="links"><span>${games.length} of ${m.scores[0] + m.scores[1]} replays</span><a href="${root}${t.id}/${m.id}">Show in bracket</a></span></div>
       <div class="cards small">${games.map((r) => `<div class="rep-card"><a href="${root}${t.id}/${m.id}/${r.slug}" aria-label="Watch ${escape(r.map ?? "")}, ${escape(r.names.join(" vs "))}, ${duration(r.frames)}">
         ${r.thumb ? `<img src="${base}tournaments/${t.id}/${escape(r.thumb)}" alt="">` : ""}<span class="shade"></span>
+        <span class="replay-troops">${r.troops ? troopLinesMarkup(r.troops) : ""}</span>
         <span class="versus">${versus(r.names)}</span><span class="tag bl">${escape(r.map ?? "Unknown map")}</span><span class="tag br">${duration(r.frames)}</span></a></div>`).join("")}</div></section>`;
   }).join("") : `<p class="empty">No replays match “${escape(filters.query)}”.</p>`;
   fitNames();

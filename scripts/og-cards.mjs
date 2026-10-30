@@ -8,10 +8,12 @@ import { fileURLToPath } from 'node:url';
 import satori from 'satori';
 import { Resvg } from '@resvg/resvg-js';
 import { roundName, sides } from '../src/site/bracket.js';
+import { troopCurves } from '../src/replays/troop-lines.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const WIDTH = 1200, HEIGHT = 630;
 const BLUE = '#8cc0ee', RED = '#ff8a8a', MUTED = '#c4cdc8', TEXT = '#eef4f0';
+const SIDE_COLORS = [BLUE, RED, '#c084fc', '#ffa25c'];
 
 const HOME = { title: 'War of Dots Replays', description: 'Watch War of Dots replays in the browser.' };
 
@@ -41,15 +43,26 @@ const shadow = '0 2px 6px rgba(0,0,0,0.65)';
 // Long names get a smaller size so a line fits the card.
 const fit = (text, largest, width = 1080) => Math.max(36, Math.min(largest, Math.floor(width / (text.length * 0.56))));
 
-const frame = (background, ...children) => h('div', { width: WIDTH, height: HEIGHT, position: 'relative', background: '#0e1110', fontFamily: 'Inter' },
+// Each side's troops over the match, as a picture laid over a map.
+function troopLines(troops, width, height, stroke) {
+  const paths = troopCurves(troops ?? [], width, height)
+    .map((d, side) => (d ? `<path d="${d}" fill="none" stroke="${SIDE_COLORS[side]}" stroke-opacity="0.8" stroke-width="${stroke}" stroke-linejoin="round" stroke-linecap="round"/>` : ''))
+    .join('');
+  if (!paths) return null;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${paths}</svg>`;
+  return img(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`, { position: 'absolute', left: 0, top: 0, width, height });
+}
+
+const frame = (background, lines, ...children) => h('div', { width: WIDTH, height: HEIGHT, position: 'relative', background: '#0e1110', fontFamily: 'Inter' },
   background ? img(background, { position: 'absolute', left: 0, top: 0, width: WIDTH, height: HEIGHT, objectFit: 'cover' }) : null,
   h('div', { position: 'absolute', left: 0, top: 0, width: WIDTH, height: HEIGHT, background: 'rgba(8,10,9,0.55)' }),
+  lines,
   h('div', { position: 'absolute', left: 0, top: 0, width: WIDTH, height: HEIGHT, padding: '44px 52px', flexDirection: 'column', justifyContent: 'space-between' }, ...children));
 
-function gameCard({ map, names, length, place }) {
+function gameCard({ map, names, length, place, troops }) {
   const line = `${names[0]} vs ${names[1]}`;
   const size = fit(line, 78);
-  return frame(map,
+  return frame(map, troopLines(troops, WIDTH, HEIGHT, 4),
     logo(),
     h('div', { flexDirection: 'column', gap: 28 },
       h('div', { alignItems: 'baseline', gap: size * 0.28, fontSize: size, fontWeight: 700, textShadow: shadow, letterSpacing: -1 },
@@ -59,17 +72,20 @@ function gameCard({ map, names, length, place }) {
 
 function matchCard({ winner, loser, score, games }) {
   const size = fit(`${winner} ${score} ${loser}`, 70, 1000);
-  return frame(games.find((g) => g.map)?.map ?? null,
+  const thumbWidth = (WIDTH - 104 - 14 * 4) / 5;
+  return frame(games.find((g) => g.map)?.map ?? null, null,
     logo(),
     h('div', { flexDirection: 'column', gap: 30 },
       h('div', { alignItems: 'center', gap: 22, fontSize: size, fontWeight: 700, letterSpacing: -1, textShadow: shadow },
         h('span', { color: BLUE }, winner),
         h('div', { padding: '4px 20px', borderRadius: 14, background: 'rgba(9,11,10,0.82)', color: TEXT, fontSize: size * 0.75 }, score),
         h('span', { color: MUTED }, loser)),
-      h('div', { gap: 14 }, games.map((g) => h('div', { flexDirection: 'column', gap: 10, width: (WIDTH - 104 - 14 * 4) / 5 },
-        g.map
-          ? img(g.map, { width: '100%', height: 126, objectFit: 'cover', borderRadius: 8, border: '2px solid rgba(238,244,240,0.25)' })
-          : h('div', { width: '100%', height: 126, borderRadius: 8, background: '#1e2321' }),
+      h('div', { gap: 14 }, games.map((g) => h('div', { flexDirection: 'column', gap: 10, width: thumbWidth },
+        h('div', { position: 'relative', width: '100%', height: 126 },
+          g.map
+            ? img(g.map, { width: '100%', height: 126, objectFit: 'cover', borderRadius: 8, border: '2px solid rgba(238,244,240,0.25)' })
+            : h('div', { width: '100%', height: 126, borderRadius: 8, background: '#1e2321' }),
+          troopLines(g.troops, Math.round(thumbWidth), 126, 2)),
         h('div', { fontSize: 24, fontWeight: 500, color: MUTED }, `${g.name} · ${g.length}`))))));
 }
 
@@ -121,7 +137,7 @@ export async function writeLinkPreviews(site) {
       if (played.length) {
         page.image = await write(`${id}/${m.id}`, matchCard({
           winner, loser, score: score.replace('-', ' : '),
-          games: played.slice(0, 5).map((r) => ({ map: picture(r.thumb), name: r.map ?? 'Map', length: clock(r.frames) })),
+          games: played.slice(0, 5).map((r) => ({ map: picture(r.thumb), name: r.map ?? 'Map', length: clock(r.frames), troops: r.troops })),
         }));
         cards++;
       }
@@ -136,7 +152,7 @@ export async function writeLinkPreviews(site) {
           title: `${names.map(display).join(' vs ')} · ${r.map ?? 'Unknown map'}`,
           description: t.name,
           image: await write(`${id}/${m.id}/${slug}`, gameCard({
-            map: picture(r.thumb), names, length: clock(r.frames),
+            map: picture(r.thumb), names, length: clock(r.frames), troops: r.troops,
             place: { map: r.map ?? 'Unknown map', where: `${round} · Match ${m.id}` },
           })),
         };

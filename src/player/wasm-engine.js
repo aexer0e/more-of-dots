@@ -43,5 +43,9 @@ export async function loadEngine(wasm, write) {
     run(jsonl = false) {
       if (call(() => exports.run(jsonl ? 1 : 0)) !== 0) throw new Error(message());
     },
+    /** Simulates the opened replay, writing only each side's troops as one JSON line. */
+    troops() {
+      if (call(() => exports.run(2)) !== 0) throw new Error(message());
+    },
   };
 }

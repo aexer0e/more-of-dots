@@ -5,6 +5,7 @@
 //   tournaments/index.json             one summary per tournament, for the home page
 //   tournaments/<id>/tournament.json    the bracket plus every replay's details
 //   tournaments/<id>/thumbs/<hash>.png  one map image per distinct map
+// `troops` gives each replay's lines for its cards: the troops of each side.
 // A replay whose players met more than once names its match in tournament.json:
 //   "replays": { "file.rep": 113 }
 import crypto from 'node:crypto';
@@ -32,7 +33,7 @@ export function readReplayHeader(bytes) {
   };
 }
 
-function publishTournament(source, target, id) {
+function publishTournament(source, target, id, troops) {
   const tournament = JSON.parse(fs.readFileSync(path.join(source, 'tournament.json'), 'utf8'));
   const usernames = new Map(tournament.players.filter((p) => p.username).map((p) => [lower(p.username), p.name]));
   const overrides = tournament.replays ?? {};
@@ -59,7 +60,7 @@ function publishTournament(source, target, id) {
       fs.writeFileSync(path.join(target, thumb), image);
     }
     fs.copyFileSync(path.join(source, file), path.join(target, file));
-    replays.push({ file, match, players: header.players, version: header.version, frames: header.frames, map: header.map, thumb, size: bytes.length });
+    replays.push({ file, match, players: header.players, version: header.version, frames: header.frames, map: header.map, thumb, size: bytes.length, troops: troops?.(path.join(source, file)) ?? null });
   }
   for (const m of tournament.matches) {
     const count = replays.filter((r) => r.match === m.id).length;
@@ -87,11 +88,11 @@ function publishTournament(source, target, id) {
 }
 
 /// Publishes every tournament folder under `source` into `target`.
-export function publishTournaments(source, target) {
+export function publishTournaments(source, target, troops) {
   const summaries = [];
   for (const id of fs.readdirSync(source).sort()) {
     if (!fs.existsSync(path.join(source, id, 'tournament.json'))) continue;
-    summaries.push(publishTournament(path.join(source, id), path.join(target, id), id));
+    summaries.push(publishTournament(path.join(source, id), path.join(target, id), id, troops));
   }
   // Newest first.
   summaries.sort((a, b) => String(b.started).localeCompare(String(a.started)));

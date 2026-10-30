@@ -141,10 +141,11 @@ fn text_label(label: &str, _side: usize) -> Value {
 }
 
 /// Simulates the opened replay, passing playback chunks (docs/replay-frames.md)
-/// to the page as they are written, or with `jsonl` the desktop engine's JSONL
-/// output for parity checks. Returns 0, or 2 with an error in the message.
+/// to the page as they are written. Mode 1 writes the desktop engine's JSONL
+/// output for parity checks instead, and mode 2 only each side's troops. Returns
+/// 0, or 2 with an error in the message.
 #[no_mangle]
-pub extern "C" fn run(jsonl: i32) -> i32 {
+pub extern "C" fn run(mode: i32) -> i32 {
     let Some(replay) = STATE.with(|state| state.borrow_mut().replay.take()) else {
         set_message("Open a replay first.");
         return 2;
@@ -152,7 +153,11 @@ pub extern "C" fn run(jsonl: i32) -> i32 {
     let mut simulator = Simulator::new(replay);
     let options = RunOptions { max_frame: None, sample_every: 1, no_combat: false, render_state: true };
     let labels: &LabelRenderer = &text_label;
-    let result = if jsonl != 0 { output::write_jsonl(&mut simulator, &options, labels, &mut Host) } else { output::write_chunks(&mut simulator, &options, labels, &mut Host) };
+    let result = match mode {
+        1 => output::write_jsonl(&mut simulator, &options, labels, &mut Host),
+        2 => output::write_troops(&mut simulator, &RunOptions { sample_every: 30, render_state: false, ..options }, &mut Host),
+        _ => output::write_chunks(&mut simulator, &options, labels, &mut Host),
+    };
     match result {
         Ok(_) => 0,
         Err(error) => {

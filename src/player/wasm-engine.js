@@ -19,14 +19,19 @@ export async function loadEngine(wasm, write) {
   };
   const message = () => decoder.decode(view(exports.message_ptr(), exports.message_len()));
   // A failure inside the module traps; its message is still readable.
+  // Only a trap leaves its reason in the message; any other error is its own, and
+  // the message may still hold an earlier answer, such as a map's name.
   const call = (action) => {
     try {
       return action();
     } catch (error) {
-      throw new Error(message() || String(error?.message ?? error));
+      if (error instanceof WebAssembly.RuntimeError) throw new Error(message() || String(error.message));
+      throw error;
     }
   };
   return {
+    /** Whether this build of the module has live play (an older cached copy may not). */
+    live: typeof exports.live_start === "function",
     /** Stores a map where the engine looks for bundled maps. */
     addMap(path, bytes) {
       call(() => exports.add_map(...pass(encoder.encode(path)), ...pass(bytes)));

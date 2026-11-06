@@ -10,7 +10,8 @@ const post = {
 };
 
 async function open(bytes, base, write) {
-  const wasm = await fetch(`${base}engine/replay-sim.wasm`);
+  // Revalidated: the address is the same for every release of the engine.
+  const wasm = await fetch(`${base}engine/replay-sim.wasm`, { cache: "no-cache" });
   if (!wasm.ok) throw new Error("The replay engine could not be loaded.");
   const engine = await loadEngine(await wasm.arrayBuffer(), write);
   // Official maps are hosted beside the page and fetched only when a replay names one.

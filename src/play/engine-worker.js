@@ -17,9 +17,12 @@ const take = () => {
 const text = new TextDecoder();
 
 async function open(bytes, base) {
-  const wasm = await fetch(`${base}engine/replay-sim.wasm`);
+  // The engine's address never changes between releases, so the browser checks
+  // with the server for a newer copy instead of using one it kept.
+  const wasm = await fetch(`${base}engine/replay-sim.wasm`, { cache: "no-cache" });
   if (!wasm.ok) throw new Error("The game engine could not be loaded.");
   engine = await loadEngine(await wasm.arrayBuffer(), (part) => output.push(part));
+  if (!engine.live) throw new Error("This page loaded an older game engine. Reload the page to update it.");
   // Official maps are hosted beside the page and fetched only when a replay names one.
   for (let missing, last; (missing = engine.open(bytes)) !== null; last = missing) {
     const name = missing.toLowerCase();

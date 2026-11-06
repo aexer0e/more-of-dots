@@ -37,7 +37,7 @@ function pushout(points, positions, radius = 18) {
       }
     }
     if (distance2 >= radius * radius) return point;
-    if (distance2 === 0) return [closest[0] + radius, closest[1]];
+    if (distance2 === 0) return [...closest];
     const scale = radius / Math.sqrt(distance2);
     return [
       closest[0] + (point[0] - closest[0]) * scale,
@@ -74,39 +74,65 @@ export function frontLines(contours, dots, mapSize = [1600, 900]) {
       .filter((d) => d && d.health > 0 && !d.ship && d.color === color)
       .map((d) => d.position),
   );
-  const sets = contours.map((polygons) => new Set(polygons.flat().map(key)));
+  // As in the game, a side's polygon is matched against each of the other side's
+  // polygons in turn. Points past the map's edge are shared by every polygon that
+  // reaches that edge, so matching against all of them at once would join two
+  // separate lines along the edge.
+  const sets = contours.map((polygons) =>
+    polygons.map((polygon) => new Set(polygon.map(key))),
+  );
+  const adjust = (points, loop, colors) => {
+    if (points.length <= 2) return points.map((p) => [...p]);
+    extend(points);
+    let line = smooth(points, loop);
+    for (const color of colors) line = pushout(line, positions[color]);
+    return line;
+  };
   for (let side = 0; side < contours.length; side++)
-    for (let other = side + 1; other < contours.length; other++) {
-      for (const polygon of contours[side]) {
-        const mask = polygon.map((p) => sets[other].has(key(p)));
-        const segments = [];
-        if (mask.every(Boolean))
-          segments.push({ points: polygon.map((p) => [...p]), loop: true });
-        else {
-          for (let i = 0; i < mask.length; i++) {
-            if (!mask[i] || mask[(i + mask.length - 1) % mask.length]) continue;
-            const points = [];
-            let j = i;
-            do {
-              points.push([...polygon[j]]);
-              j = (j + 1) % mask.length;
-            } while (mask[j] && j !== i);
-            if (points.length > 1) segments.push({ points, loop: false });
+    for (let other = side + 1; other < contours.length; other++)
+      contours[side].forEach((polygon, index) => {
+        const own = sets[side][index];
+        for (const set of sets[other]) {
+          if (![...own].some((k) => set.has(k))) continue;
+          const mask = polygon.map((p) => set.has(key(p)));
+          if (mask.every(Boolean)) {
+            lines.push(adjust(polygon, true, [side, other]));
+            continue;
           }
-        }
-        for (const segment of segments) {
-          const p = segment.points;
-          p[0] = p[0].map((v, k) => (v - p[1][k]) * 1.5 + p[1][k]);
-          const last = p.length - 1;
-          p[last] = p[last].map(
-            (v, k) => (v - p[last - 1][k]) * 1.5 + p[last - 1][k],
+          const n = mask.length,
+            starts = [],
+            ends = [];
+          for (let i = 0; i < n; i++) {
+            const change = mask[i] - mask[(i + n - 1) % n];
+            if (change === 1) starts.push(i);
+            else if (change === -1) ends.push(i);
+          }
+          if (!starts.length) continue;
+          if (starts[0] >= ends[0]) {
+            // A run that wraps past the polygon's start is a copy in the game.
+            const run = [...polygon.slice(starts.at(-1)), ...polygon.slice(0, ends[0])];
+            lines.push(adjust(run.map((p) => [...p]), false, [side, other]));
+            starts.pop();
+            ends.shift();
+          }
+          // Other runs share the polygon's points, so extending their ends
+          // moves those points for the polygons matched after.
+          starts.forEach((start, i) =>
+            lines.push(adjust(polygon.slice(start, ends[i]), false, [side, other])),
           );
-          let line = smooth(p, segment.loop);
-          for (const color of [side, other])
-            line = pushout(line, positions[color]);
-          lines.push(line);
         }
-      }
-    }
+      });
   return lines;
+}
+
+/// Lengthens a run by half its first and last steps, in place.
+function extend(points) {
+  const n = points.length;
+  const at = (end, next, after) => {
+    const from = points[end][0] === points[next][0] && points[end][1] === points[next][1] ? points[after] : points[next];
+    points[end][0] = (points[end][0] - from[0]) * 1.5 + from[0];
+    points[end][1] = (points[end][1] - from[1]) * 1.5 + from[1];
+  };
+  at(0, 1, 2);
+  at(n - 1, n - 2, n - 3);
 }

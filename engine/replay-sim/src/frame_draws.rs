@@ -178,6 +178,17 @@ fn smooth(points: &[[f64; 2]], looped: bool) -> Vec<[f64; 2]> {
     result
 }
 
+/// Lengthens a run by half its first and last steps, in place.
+fn extend(points: &mut [[f64; 2]]) {
+    let n = points.len();
+    let at = |points: &mut [[f64; 2]], end: usize, next: usize, after: usize| {
+        let from = if points[end] == points[next] { points[after] } else { points[next] };
+        points[end] = [(points[end][0] - from[0]) * 1.5 + from[0], (points[end][1] - from[1]) * 1.5 + from[1]];
+    };
+    at(points, 0, 1, 2);
+    at(points, n - 1, n - 2, n - 3);
+}
+
 fn pushout(points: Vec<[f64; 2]>, positions: &[[f64; 2]]) -> Vec<[f64; 2]> {
     const RADIUS: f64 = 18.0;
     if positions.is_empty() {
@@ -200,7 +211,7 @@ fn pushout(points: Vec<[f64; 2]>, positions: &[[f64; 2]]) -> Vec<[f64; 2]> {
                 return point;
             }
             if distance2 == 0.0 {
-                return [closest[0] + RADIUS, closest[1]];
+                return closest;
             }
             let scale = RADIUS / distance2.sqrt();
             [closest[0] + (point[0] - closest[0]) * scale, closest[1] + (point[1] - closest[1]) * scale]
@@ -233,45 +244,63 @@ impl FrameDraws {
                 })
                 .collect()
         };
+        let mut contours = contours;
         let positions: Vec<Vec<[f64; 2]>> = (0..contours.len()).map(|color| dots.iter().filter(|d| d.health > 0.0 && !d.ship && d.color == color).map(|d| d.position).collect()).collect();
-        let sets: Vec<HashSet<(u64, u64)>> = contours.iter().map(|polygons| polygons.iter().flatten().map(|p| key(*p)).collect()).collect();
+        // As in the game, a side's polygon is matched against each of the other side's
+        // polygons in turn. Points past the map's edge are shared by every polygon that
+        // reaches that edge, so matching against all of them at once would join two
+        // separate lines along the edge.
+        let sets: Vec<Vec<HashSet<(u64, u64)>>> = contours.iter().map(|polygons| polygons.iter().map(|polygon| polygon.iter().map(|p| key(*p)).collect()).collect()).collect();
+        let adjust = |points: &mut [[f64; 2]], looped: bool, colors: [usize; 2]| {
+            if points.len() <= 2 {
+                return points.to_vec();
+            }
+            extend(points);
+            let mut line = smooth(points, looped);
+            for color in colors {
+                line = pushout(line, &positions[color]);
+            }
+            line
+        };
         let mut lines = Vec::new();
         for side in 0..contours.len() {
             for other in side + 1..contours.len() {
-                for polygon in &contours[side] {
-                    let mask: Vec<bool> = polygon.iter().map(|p| sets[other].contains(&key(*p))).collect();
-                    let mut segments: Vec<(Vec<[f64; 2]>, bool)> = Vec::new();
-                    if mask.iter().all(|&x| x) {
-                        segments.push((polygon.clone(), true));
-                    } else {
+                for index in 0..contours[side].len() {
+                    for set in &sets[other] {
+                        if sets[side][index].is_disjoint(set) {
+                            continue;
+                        }
+                        let polygon = &mut contours[side][index];
+                        let mask: Vec<bool> = polygon.iter().map(|p| set.contains(&key(*p))).collect();
+                        if mask.iter().all(|&x| x) {
+                            lines.push(adjust(polygon, true, [side, other]));
+                            continue;
+                        }
                         let n = mask.len();
+                        let (mut starts, mut ends) = (Vec::new(), Vec::new());
                         for i in 0..n {
-                            if !mask[i] || mask[(i + n - 1) % n] {
-                                continue;
-                            }
-                            let mut points = Vec::new();
-                            let mut j = i;
-                            loop {
-                                points.push(polygon[j]);
-                                j = (j + 1) % n;
-                                if !(mask[j] && j != i) {
-                                    break;
-                                }
-                            }
-                            if points.len() > 1 {
-                                segments.push((points, false));
+                            match mask[i] as i8 - mask[(i + n - 1) % n] as i8 {
+                                1 => starts.push(i),
+                                -1 => ends.push(i),
+                                _ => {}
                             }
                         }
-                    }
-                    for (mut p, looped) in segments {
-                        p[0] = [(p[0][0] - p[1][0]) * 1.5 + p[1][0], (p[0][1] - p[1][1]) * 1.5 + p[1][1]];
-                        let last = p.len() - 1;
-                        p[last] = [(p[last][0] - p[last - 1][0]) * 1.5 + p[last - 1][0], (p[last][1] - p[last - 1][1]) * 1.5 + p[last - 1][1]];
-                        let mut line = smooth(&p, looped);
-                        for color in [side, other] {
-                            line = pushout(line, &positions[color]);
+                        if starts.is_empty() {
+                            continue;
                         }
-                        lines.push(line);
+                        if starts[0] >= ends[0] {
+                            // A run that wraps past the polygon's start is a copy in the game.
+                            let mut run = polygon[starts[starts.len() - 1]..].to_vec();
+                            run.extend_from_slice(&polygon[..ends[0]]);
+                            lines.push(adjust(&mut run, false, [side, other]));
+                            starts.pop();
+                            ends.remove(0);
+                        }
+                        // Other runs share the polygon's points, so extending their ends
+                        // moves those points for the polygons matched after.
+                        for (&start, &end) in starts.iter().zip(&ends) {
+                            lines.push(adjust(&mut polygon[start..end], false, [side, other]));
+                        }
                     }
                 }
             }

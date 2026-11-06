@@ -11,6 +11,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
+mod live;
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -26,6 +28,7 @@ struct State {
     files: MapFiles,
     replay: Option<Replay>,
     message: Vec<u8>,
+    live: Option<live::Live>,
 }
 
 thread_local! {
@@ -33,6 +36,7 @@ thread_local! {
         files: MapFiles { memory: Some(HashMap::new()), ..Default::default() },
         replay: None,
         message: Vec::new(),
+        live: None,
     });
 }
 

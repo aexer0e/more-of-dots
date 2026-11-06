@@ -31,6 +31,11 @@ export async function chooseReplay() {
   return typeof path === "string" ? path : null;
 }
 
+/// The bytes of an opened .rep in the browser, or null in the desktop app.
+export async function replayFile(path) {
+  return web ? (await web).replayFile(path) : null;
+}
+
 /// Makes a dropped or picked browser file openable by path.
 export async function addFile(file) {
   return (await web).addFile(file);

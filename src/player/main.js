@@ -1,7 +1,8 @@
 import "./player.css";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { addFile, chooseReplay as pickReplay, gameAudio as hostAudio, invoke } from "./host.js";
+import { addFile, chooseReplay as pickReplay, gameAudio as hostAudio, invoke, replayFile } from "./host.js";
+import { leave as leaveForPlay } from "../play/handoff.js";
 import { initializeEngine, player, loadReplay, paint } from "./client.js";
 import { displayOptions } from "./overlays.js";
 import { ReplaySound } from "./sound.js";
@@ -76,6 +77,7 @@ document.querySelector("#player-ui").innerHTML = `
         <label><span>SFX</span><input id="sfx-volume" type="range" min="0" max="100" step="1"><output id="sfx-value"></output></label>
       </div>
     </div>
+    <button id="play-here" class="chip" title="Continue this replay from the current frame as a match against another player" hidden>Play from here</button>
     <button id="open-replay" class="icon-button" aria-label="Open replay" title="Open replay (Ctrl+O)">${icons.open}</button>
     <button id="fullscreen" class="icon-button" aria-label="Fullscreen" title="Fullscreen (F)">${icons.full}</button>
   </section>
@@ -430,6 +432,7 @@ async function openPath(path) {
     document.title = `${names || file} — More of Dots`;
     if (isTauri()) void getCurrentWindow().setTitle(document.title).catch(() => {});
     errorShown = false;
+    $("play-here").hidden = isTauri() || !/\.rep$/i.test(path);
     updatePosition(0);
     // The window may have been resized while loading; draw the first frame at
     // the current size and let it reach the screen before revealing it.
@@ -511,6 +514,22 @@ $("play").onclick = toggle;
 $("back").onclick = $("welcome-back").onclick = () => embedding.back?.();
 $("open").onclick = () => chooseReplay().catch(showError);
 $("open-replay").onclick = () => chooseReplay().catch(showError);
+// The hosted site continues a .rep from the shown frame as a match (src/play).
+$("play-here").onclick = async () => {
+  if (!player.ready || !/\.rep$/i.test(player.info.path)) return;
+  pause();
+  try {
+    const file = await replayFile(player.info.path);
+    const id = await leaveForPlay({
+      replay: await file.arrayBuffer(),
+      frame: player.frame,
+      name: player.info.playerNames.filter(Boolean).join(" vs ") || player.info.path.split(/[\\/]/).pop(),
+    });
+    location.href = new URL(`play?from=${id}`, document.baseURI).href;
+  } catch (error) {
+    showError(error);
+  }
+};
 $("speed").onclick = () => speedMenu($("speed-menu").hidden);
 $("speed").addEventListener(
   "wheel",

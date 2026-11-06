@@ -569,6 +569,19 @@ fn core_json(sim: &Simulator, out: &mut String) {
     out.push('}');
 }
 
+/// Live play: the current state as a chunk record holding one complete frame.
+pub fn live_chunk(sim: &mut Simulator, frame: i32) -> io::Result<Vec<u8>> {
+    sim.render_state = true;
+    let mut chunk = ChunkBuilder::default();
+    write_frame(sim, &mut chunk, frame);
+    let produced = sim.take_produced_sides();
+    chunk.header.push((frame, sim.fight_count, produced));
+    chunk.complete = chunk.frames.len();
+    let mut out = Vec::new();
+    chunk.flush(&mut out)?;
+    Ok(out)
+}
+
 /// Writes playback chunks. Frames simulated before a failure stay playable.
 pub fn write_chunks(sim: &mut Simulator, options: &RunOptions, labels: &LabelRenderer, output: &mut dyn Write) -> io::Result<u64> {
     sim.render_state = true;

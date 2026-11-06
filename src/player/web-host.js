@@ -9,6 +9,14 @@ export function addFile(file) {
   files.set(file.name, file);
   return file.name;
 }
+/// The file of a replay the page opened, for continuing it as a match (src/play).
+export async function replayFile(path) {
+  const file = files.get(path);
+  if (file) return file;
+  const response = await fetch(path);
+  if (!response.ok) throw new Error(`Cannot download this replay (${response.status}).`);
+  return response.blob();
+}
 export function chooseReplay() {
   return new Promise((resolve) => {
     const input = document.createElement("input");

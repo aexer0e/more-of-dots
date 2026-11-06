@@ -5,5 +5,5 @@ export default defineConfig({
   base: "./",
   clearScreen: false,
   worker: { format: "es" },
-  build: { outDir: "build/site", emptyOutDir: true, rollupOptions: { input: "site.html" } },
+  build: { outDir: "build/site", emptyOutDir: true, rollupOptions: { input: ["site.html", "play.html"] } },
 });

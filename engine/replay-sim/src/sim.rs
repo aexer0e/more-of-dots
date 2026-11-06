@@ -145,6 +145,53 @@ impl Simulator {
         Ok(())
     }
 
+    /// Live play: simulates one tick. Commands for it must be queued first.
+    pub fn live_tick(&mut self, tick: i32) {
+        self.tick(tick, false);
+    }
+
+    /// Live play: an order that takes effect at the start of `tick`.
+    pub fn queue_order(&mut self, tick: i32, order: Order) {
+        self.pending_orders.entry(tick).or_default().push(order);
+    }
+
+    /// Live play: a production command that takes effect at the start of `tick`.
+    pub fn queue_production(&mut self, tick: i32, command: crate::replay::Production) {
+        self.replay.productions.entry(tick).or_default().push(command);
+    }
+
+    /// Live play: forgets the recorded commands from `tick` on, so the players
+    /// continue the match from there.
+    pub fn drop_commands_from(&mut self, tick: i32) {
+        self.pending_orders.retain(|&t, _| t < tick);
+        self.replay.productions.retain(|&t, _| t < tick);
+        self.deferred_orders.clear();
+    }
+
+    /// A digest of the state both players' simulations must agree on.
+    pub fn state_hash(&self) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        let mut mix = |value: u64| {
+            for byte in value.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        };
+        mix(self.replay.units.len() as u64);
+        for unit in &self.replay.units {
+            mix(unit.active as u64);
+            mix(unit.position.x.to_bits());
+            mix(unit.position.y.to_bits());
+            mix(unit.health.to_bits());
+            mix(unit.morale.to_bits());
+        }
+        for funds in &self.economy.funds {
+            mix(funds.to_bits());
+        }
+        mix(self.rng.0 as u64);
+        hash
+    }
+
     fn tick(&mut self, tick: i32, no_combat: bool) {
         self.apply_orders(tick);
         if let Some(commands) = self.replay.productions.get(&tick) {

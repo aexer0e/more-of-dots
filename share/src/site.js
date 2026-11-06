@@ -113,6 +113,8 @@ export async function site(request, env) {
       : new Response("Not found", { status: 404 });
   }
   if ((request.method !== "GET" && request.method !== "HEAD") || FILES.test(path)) return pass();
+  // The play page (play?room=1234) is its own file.
+  if (path === "play") return fetch(new Request(`${origin}${SITE}/play.html${url.search}`, request));
   // Requests from this worker to its own site reach GitHub Pages, not the worker again.
   const page = await fetch(`${origin}${SITE}/`);
   if (!page.ok) return page;

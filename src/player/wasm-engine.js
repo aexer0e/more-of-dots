@@ -47,5 +47,27 @@ export async function loadEngine(wasm, write) {
     troops() {
       if (call(() => exports.run(2)) !== 0) throw new Error(message());
     },
+    // Live play (engine/replay-sim-web/src/live.rs). Each call's output goes to `write`.
+    /** Continues the opened replay from `frame`; writes the stream header and static record. */
+    liveStart(frame) {
+      if (call(() => exports.live_start(frame)) !== 0) throw new Error(message());
+    },
+    /** Applies one turn's commands (or none) and simulates the next tick. */
+    liveStep(commands) {
+      const bytes = commands ? encoder.encode(JSON.stringify(commands)) : new Uint8Array(0);
+      if (call(() => exports.live_step(...pass(bytes))) !== 0) throw new Error(message());
+    },
+    /** Writes the current frame as a chunk record. */
+    liveFrame() {
+      if (call(() => exports.live_frame()) !== 0) throw new Error(message());
+    },
+    /** Writes the next tick, winner, state digest and territory version as JSON. */
+    liveInfo() {
+      if (call(() => exports.live_info()) !== 0) throw new Error(message());
+    },
+    /** Writes the fog of war over a side. */
+    liveFog(side) {
+      if (call(() => exports.live_fog(side)) !== 0) throw new Error(message());
+    },
   };
 }

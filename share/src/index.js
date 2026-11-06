@@ -9,9 +9,14 @@
 // do not let a page read. It only ever returns a replay, so it cannot be used to
 // download anything else:
 //   GET    /fetch?url=<link>  → the .rep file
+// It also hosts matches continued from a replay (match.js):
+//   GET    /matches/new, /matches/<code>  (WebSocket)
 // On aexer0e.dev it serves the site's pages with their link previews (site.js).
 import { details, isReplay, MAX_SIZE, replayText } from "./replay.js";
 import { site, SITE } from "./site.js";
+import { isCode, MatchRoom, newCode } from "./match.js";
+
+export { MatchRoom };
 
 const MAX_CARD = 512 << 10;
 // The site, local development, and the desktop app's window (tauri.localhost on
@@ -138,6 +143,18 @@ export default {
     if (pathname === SITE || pathname.startsWith(`${SITE}/`)) return site(request, env);
     const [, collection, id, extra, more] = pathname.split("/");
     if (request.method === "OPTIONS") return respond(request, null, 204);
+    if (collection === "matches" && extra === undefined) {
+      if (request.headers.get("Upgrade") !== "websocket") return failure(request, 426, "Expected a WebSocket.");
+      const origin = request.headers.get("Origin");
+      if (origin && !ORIGINS.test(origin)) return failure(request, 403, "Not allowed.");
+      const creating = id === "new";
+      if (!creating && !isCode(id)) return failure(request, 404, "This room does not exist.");
+      const code = creating ? newCode() : id;
+      const headers = new Headers(request.headers);
+      headers.set("X-Room-Code", code);
+      headers.set("X-Room-Create", creating ? "1" : "0");
+      return env.MATCHES.get(env.MATCHES.idFromName(code)).fetch(new Request(request, { headers }));
+    }
     if (collection === "fetch" && id === undefined)
       return request.method === "GET" ? await fetchLink(request, env, searchParams.get("url")).catch((error) => {
         console.error(error);

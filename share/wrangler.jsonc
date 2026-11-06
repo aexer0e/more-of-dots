@@ -14,6 +14,9 @@
       "migrations_dir": "migrations"
     }
   ],
+  // One room per match continued from a replay (src/match.js).
+  "durable_objects": { "bindings": [{ "name": "MATCHES", "class_name": "MatchRoom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MatchRoom"] }],
   // Uploads per visitor address.
   "ratelimits": [
     {

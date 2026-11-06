@@ -32,6 +32,19 @@
       "runtimeArgs": ["--prefix", "share", "wrangler", "dev", "--config", "share/wrangler.jsonc", "--port", "8787", "--var", "SITE_ORIGIN:http://127.0.0.1:4174"],
       "port": 8787,
       "url": "http://localhost:8787"
+    },
+    {
+      "name": "play-site",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/serve-site.mjs", "build/play-site", "4176"],
+      "port": 4176
+    },
+    {
+      "name": "play-rooms",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--prefix", "share", "wrangler", "dev", "--config", "share/wrangler.jsonc", "--port", "8788", "--ip", "127.0.0.1"],
+      "port": 8788,
+      "url": "http://127.0.0.1:8788"
     }
   ]
 }

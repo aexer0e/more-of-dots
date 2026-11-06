@@ -97,6 +97,20 @@ button:disabled { opacity: 0.5; cursor: default; }
   left: 50%;
   bottom: 12%;
   transform: translateX(-50%);
-  display: flex;
+  display: grid;
+  justify-items: center;
   gap: 10px;
+  width: max-content;
+  max-width: calc(100vw - 32px);
 }
+.end-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+.end-note {
+  margin: 0;
+  min-height: 1.45em;
+  padding: 0 10px;
+  border-radius: 6px;
+  color: var(--text);
+  text-align: center;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+.end-note:empty { visibility: hidden; }

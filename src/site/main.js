@@ -17,10 +17,10 @@ import { addFile } from "../player/host.js";
 // After the player's styles, so the site's win where both style an element.
 import "./site.css";
 import { addReplay, getReplay, listReplays, refreshDetails, removeReplay, saveReplay } from "./library.js";
-import { downloadLink, fetchShared, shareReplay, unshareReplay, uploadCard } from "./share.js";
-import { CARD_VERSION, drawCard } from "./card.js";
+import { downloadLink, fetchShared, unshareReplay } from "./share.js";
+import { copyShareLink, downloadKept, mapPicture, publishedMaps, replayTroops } from "./sharing.js";
 import { box, connect, layout, nextMatches, roundName, sides } from "./bracket.js";
-import { reduceTroops, troopLinesMarkup } from "../replays/troop-lines";
+import { troopLinesMarkup } from "../replays/troop-lines";
 
 const base = new URL(import.meta.env.BASE_URL, document.baseURI).href;
 // The site's folder as a path, such as /wod-replay-player/; every page is under it.
@@ -41,6 +41,7 @@ const icons = {
   search: icon(14, '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
   close: (size = 14) => icon(size, '<path d="m6 6 12 12M18 6 6 18"/>'),
   link: icon(15, '<path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2"/>'),
+  download: icon(15, '<path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/>'),
   play: (size) => icon(size, '<path d="M7 4.5v15l12-7.5z"/>', "solid"),
   trophy: icon(15, '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3M7 5H4v2a3 3 0 0 0 3 3"/>'),
   players: icon(15, '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/>'),
@@ -290,9 +291,11 @@ function showHome() {
     $("#mine").onclick = (event) => {
       const remove = event.target.closest("[data-remove]");
       const shareButton = event.target.closest("[data-share]");
+      const downloadButton = event.target.closest("[data-download]");
       const page = event.target.closest("[data-page]");
       if (remove) void forget(remove);
       else if (shareButton) void share(shareButton);
+      else if (downloadButton) void download(downloadButton.dataset.download);
       else if (page) {
         home.page = Number(page.dataset.page);
         renderMine();
@@ -324,100 +327,25 @@ async function forget(button) {
   const what = record?.players.join(" vs ") || "the replay";
   toast(token ? `Removed ${what} and stopped sharing it.` : `Removed ${what}.`);
 }
-const shareLink = (id) => new URL(`${root}r/${id}`, location.href).href;
-/// Copies text that may still be on its way, while the click that asked for it counts.
-async function copy(text) {
-  try {
-    await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((t) => new Blob([t], { type: "text/plain" })) })]);
-  } catch {
-    await navigator.clipboard.writeText(await text);
-  }
-}
 /// Uploads a replay the first time it is shared, then copies its link.
 async function share(button) {
-  const id = button.dataset.share;
-  const record = await getReplay(id);
-  if (!record) return;
   button.disabled = true;
-  const uploaded = record.shared
-    ? Promise.resolve()
-    : shareReplay(record.blob).then(async ({ token }) => {
-        const current = await getReplay(id);
-        if (current) return saveReplay({ ...current, shared: { token: token ?? null } });
-        // Removed while it uploaded.
-        if (token) await unshareReplay(id, token);
-        throw new Error("The replay was removed before it was shared.");
-      });
   try {
-    await copy(uploaded.then(() => shareLink(id)));
-    toast("Link copied.");
-  } catch {
-    const failed = await uploaded.then(() => null, (error) => error);
-    toast(failed ? failed.message : `Link: ${shareLink(id)}`);
+    toast(await copyShareLink(button.dataset.share));
+  } catch (error) {
+    toast(error.message);
   }
   void renderMine();
-  void uploaded.then(() => addCard(id), () => {});
 }
-/// Gives a replay this browser shared the picture its link preview shows, once per card design.
-async function addCard(id) {
+async function download(id) {
   const record = await getReplay(id);
-  const token = record?.shared?.token;
-  if (!token || record.shared.card === CARD_VERSION) return;
-  try {
-    const picture = record.thumb ?? mapPicture(record.mapRef, await publishedMaps());
-    const troops = await replayTroops(record);
-    await uploadCard(id, token, await drawCard({ players: record.players, frames: record.frames, version: record.version, picture, troops }, base));
-    const current = await getReplay(id);
-    if (current?.shared) await saveReplay({ ...current, shared: { ...current.shared, card: CARD_VERSION } });
-  } catch {
-    // The preview shows the replay's details without a picture until the next share.
-  }
+  if (record) downloadKept(record);
 }
-// Lines for the visitor's own replays are simulated once, one replay at a time,
-// and kept with the replay. A replay that cannot be simulated has none this visit.
-const troopRequests = new Map();
-let troopWorker;
-let troopQueue = Promise.resolve();
-const simulateTroops = (record) =>
-  new Promise((resolve, reject) => {
-    troopWorker ??= new Worker(new URL("../player/web-engine.js", import.meta.url), { type: "module" });
-    troopWorker.onerror = () => reject(new Error("The replay engine could not be started."));
-    troopWorker.onmessage = ({ data }) => {
-      if (data.kind === "troops") resolve(data.strength.map((side) => reduceTroops(side)));
-      else reject(new Error(data.error));
-    };
-    troopWorker.postMessage({ troops: true, file: record.blob, base });
+/// Draws a replay's troop lines on its card once they are simulated.
+const showTroops = (record) =>
+  void replayTroops(record).then((troops) => {
+    if (troops) for (const element of site.querySelectorAll(`[data-troops="${record.id}"]`)) element.innerHTML = troopLinesMarkup(troops);
   });
-function replayTroops(record) {
-  if (record.troops) return Promise.resolve(record.troops);
-  if (!troopRequests.has(record.id)) {
-    const request = troopQueue.then(() => simulateTroops(record)).then(async (troops) => {
-      const current = await getReplay(record.id);
-      if (current) await saveReplay({ ...current, troops });
-      for (const element of site.querySelectorAll(`[data-troops="${record.id}"]`)) element.innerHTML = troopLinesMarkup(troops);
-      return troops;
-    }).catch(() => null);
-    troopRequests.set(record.id, request);
-    troopQueue = request;
-  }
-  return troopRequests.get(record.id);
-}
-// The official map images the site publishes, as listed by the build.
-let mapIndex;
-const publishedMaps = () =>
-  (mapIndex ??= fetch(`${base}maps/index.json`, revalidate).then((r) => (r.ok ? r.json() : [])).catch(() => []).then((list) => new Set(list)));
-/// The picture of an official map a replay names, found the way More of Dots
-/// finds it in the game: by its image path, or by number in each map set.
-/// Zolamare comes first because the game gives it the numbers both sets use.
-function mapPicture(ref, maps) {
-  if (!ref) return null;
-  const name = ref.replaceAll("\\", "/").toLowerCase();
-  const candidates = /^\d+$/.test(name)
-    ? ["zolamare", "fahero", "eronion"].map((set) => `assets/${set}_maps/map${name}.png`).concat(`map${name}.png`)
-    : [name, name.split("/").pop()];
-  const found = candidates.find((candidate) => maps.has(candidate));
-  return found ? `${base}maps/${found}` : null;
-}
 
 async function renderMine() {
   const element = $("#mine");
@@ -452,6 +380,7 @@ async function renderMine() {
         <span class="tag br">${duration(r.frames)}</span>
       </a>
       <button type="button" class="rep-action rep-remove" data-remove="${r.id}" aria-label="${removal}: ${what}" title="${removal}">${icons.close(14)}</button>
+      <button type="button" class="rep-action rep-download" data-download="${r.id}" aria-label="Download: ${what}" title="Download">${icons.download}</button>
       <button type="button" class="rep-action rep-share${r.shared ? " shared" : ""}" data-share="${r.id}" aria-label="${r.shared ? "Copy link" : "Share"}: ${what}" title="${r.shared ? "Copy link" : "Share"}">${icons.link}</button>
     </div>`;
   };
@@ -467,7 +396,7 @@ async function renderMine() {
             <button type="button" class="btn" data-page="${home.page + 1}"${home.page === pages - 1 ? " disabled" : ""}>Next</button></div></nav>`
         : ""}`;
   fitNames();
-  page.forEach((r) => void replayTroops(r));
+  page.forEach((r) => r.troops || showTroops(r));
 }
 
 // Published tournaments.

@@ -8,6 +8,8 @@ import { Room } from "./net.js";
 import { Game, colors } from "./game.js";
 import { drop, pick } from "./handoff.js";
 import { matchReplay } from "./replay-file.js";
+import { addReplay } from "../site/library.js";
+import { copyShareLink, downloadKept } from "../site/sharing.js";
 
 const base = new URL(import.meta.env.BASE_URL, document.baseURI).href;
 const $ = (id) => document.getElementById(id);
@@ -160,24 +162,48 @@ async function startGame(replay) {
   }
 }
 
+// The finished match, kept in this browser's library with the visitor's other replays.
+let kept = null;
+function keepMatch() {
+  kept ??= matchReplay({
+    replay: room.replay,
+    startFrame: game.startFrame,
+    log: game.log,
+    end: game.ended.tick,
+    result: game.ended.result,
+    names: namesBySide(),
+  }).then(async (bytes) => (await addReplay(new File([bytes], `${replayName.replace(/\.rep$/i, "")} continued.rep`))).record);
+  return kept;
+}
+
 function showEnd() {
   const panel = $("end");
   panel.hidden = false;
-  panel.innerHTML = `<button id="save" class="primary">Download replay</button><button id="exit">Leave</button>`;
+  panel.innerHTML = `<div class="end-actions"><button id="share" class="primary">Copy link</button><button id="save">Download</button><button id="exit">Leave</button></div>
+    <p id="end-note" class="end-note" role="status"></p>`;
+  const note = (message) => ($("end-note").textContent = message);
+  keepMatch().then(
+    () => note("Saved to your replays."),
+    (error) => note(`This match could not be saved: ${error.message}`),
+  );
+  $("share").onclick = async () => {
+    const button = $("share");
+    button.disabled = true;
+    try {
+      // Waits for the match to be kept, then copies its link while the click still counts.
+      note(await copyShareLink(keepMatch().then((record) => record.id)));
+    } catch (error) {
+      note(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  };
   $("save").onclick = async () => {
-    const bytes = await matchReplay({
-      replay: room.replay,
-      startFrame: game.startFrame,
-      log: game.log,
-      end: game.ended.tick,
-      result: game.ended.result,
-      names: namesBySide(),
-    });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
-    link.download = `${replayName.replace(/\.rep$/i, "")} continued.rep`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    try {
+      downloadKept(await keepMatch());
+    } catch (error) {
+      note(error.message);
+    }
   };
   $("exit").onclick = leaveMatch;
 }

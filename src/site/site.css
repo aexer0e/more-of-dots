@@ -465,6 +465,9 @@ body.dragging .dropzone {
 .rep-share {
   right: 8px;
 }
+.rep-download {
+  right: 44px;
+}
 /* A shared replay's link button stays in view. */
 .rep-share.shared {
   color: var(--accent-text);
@@ -1109,7 +1112,8 @@ a.match:hover {
     padding: 1px 5px;
     font-size: 11px;
   }
-  .rep-share {
+  .rep-share,
+  .rep-download {
     top: 22px;
   }
   .rep-remove {

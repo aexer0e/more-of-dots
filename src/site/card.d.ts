@@ -9,5 +9,8 @@ export type CardDetails = {
   troops?: number[][] | null;
 };
 
+/** The current card design; replays shared with an older one are drawn again. */
+export const CARD_VERSION: number;
+
 /** A JPEG of a shared replay's link preview. `base` is where the site's og/ fonts are. */
 export function drawCard(details: CardDetails, base: string): Promise<Blob>;

@@ -12,6 +12,10 @@ const BLUE = "#8cc0ee",
   TEXT = "#eef4f0";
 const SIDE_COLORS = [BLUE, RED, "#c084fc", "#ffa25c"];
 
+// Raised when the card's design changes, so replays shared earlier get the new
+// card the next time they are shared.
+export const CARD_VERSION = 2;
+
 let fonts;
 // The card's font is published beside the site (og/Inter-*.ttf).
 const loadFonts = (base) =>

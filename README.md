@@ -64,6 +64,12 @@ Search runs locally. Compare up to ten players alongside your own rank and score
 
 The app persists the latest snapshot and up to 12 history queries. It combines concurrent requests, uses the server's published refresh interval to wait for the next expected snapshot, and revalidates expired entries with ETags. Hidden tabs do not poll the network. Saved snapshots remain visible if a refresh fails. Only player histories requested by the current comparison are downloaded.
 
+## Nations
+
+The Nations tab shows the War of Dots Nations campaign from `wod-nations-map.moreofdots.workers.dev`: the current Red and Blue map, land and city control, each nation's players, cash and net worth, the top 10 ranked players on each side, and a momentum chart over 24 hours, 1 week, 30 days or all history. The campaign routes are public, so no access code or account is needed.
+
+Captures arrive every 30 minutes, so the tab makes one request a minute after each expected capture instead of polling. That request asks only for captures newer than the last stored one. The ownership map (about 8 KB) is downloaded only when it changes. Ranges up to a week use every capture; 30 days and All use one capture per day, fetched once and stored, so older history is never downloaded twice. Economy data and rankings load only while the side columns are on screen; rankings come from the Leaderboard tab's cache. Hidden windows send no requests. The map is decoded and drawn in a worker. Below 1100 px wide the side columns are hidden and the map and chart fill the tab.
+
 ## Development examples
 
 Run `npm run dev` to prepare local examples and start the web UI at `http://127.0.0.1:5173`. Startup copies the newest 100 replays at most, filling any remaining slots from the app's replay backups and skipping duplicate content. It also copies recent editor maps, and map layouts from recent replays into ignored `build/dev-data`. It also saves fresh public Elo and World rankings with available change-only history. All three tabs are populated before Vite starts. Subsequent offline starts can reuse the last saved leaderboard snapshot.

@@ -1,0 +1,127 @@
+.nt-page { --nt-border: #2a3338; --nt-muted: #8e9ba5; --nt-accent: #7cb9f1; --nt-red: #e59a9a; --nt-blue: #8fb2e8; --nt-red-fill: #c45c5c; --nt-blue-fill: #5680c8; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; padding: 14px 22px 16px; color: #e4eaf0; background: #101519; font-size: 12px; overflow: auto; }
+.nt-page button, .nt-page input { font: inherit; }
+.nt-page button { min-height: 28px; border-radius: 5px; transition: background .12s, color .12s; }
+.nt-page button:disabled { cursor: default; opacity: .4; }
+.nt-page button:hover:not(:disabled) { background: #ffffff0b; color: #fff; }
+.nt-page :focus-visible { outline: 2px solid var(--nt-accent); outline-offset: 2px; }
+.nt-red { color: var(--nt-red); }
+.nt-blue { color: var(--nt-blue); }
+
+.nt-grid { display: grid; grid-template-columns: 280px minmax(0, 1fr) 280px; gap: 12px; flex: 1; min-height: 620px; }
+.nt-center { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
+.nt-side { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
+.nt-side-blue { text-align: right; }
+
+.nt-heading, .nt-title, .nt-heading-actions, .nt-card-head, .nt-controls { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.nt-title { gap: 9px; }
+.nt-title > svg { color: var(--nt-accent); }
+.nt-title h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -.025em; }
+.nt-heading-actions { gap: 6px; }
+.nt-status { display: inline-flex; align-items: center; gap: 7px; color: var(--nt-muted); font-size: 10px; margin-right: 4px; white-space: nowrap; }
+.nt-status i { width: 7px; height: 7px; border-radius: 50%; background: #71c5a1; }
+.nt-status i.nt-late { background: #d9a35b; }
+.nt-page .nt-icon-button { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; flex-shrink: 0; border: 1px solid transparent; background: transparent; color: var(--nt-muted); }
+
+.nt-bar-row { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 12px; }
+.nt-bar-label { display: none; white-space: nowrap; color: #9babb8; font-size: 10px; font-variant-numeric: tabular-nums; }
+.nt-bar-label strong { font-size: 14px; font-weight: 650; }
+.nt-bar-label:last-child { text-align: right; }
+.nt-bar { position: relative; display: flex; height: 12px; border-radius: 999px; overflow: hidden; background: #0c1115; }
+.nt-bar-red { background: var(--nt-red-fill); transition: width .4s; }
+.nt-bar-blue { flex: 1; background: var(--nt-blue-fill); }
+.nt-bar i { position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: #e4eaf0; opacity: .6; }
+
+.nt-map { position: relative; flex-shrink: 0; aspect-ratio: 16 / 9; border: 1px solid var(--nt-border); border-radius: 7px; overflow: hidden; background: #0b0f12; touch-action: none; }
+.nt-map[data-zoomed] { cursor: grab; }
+.nt-map[data-zoomed]:active { cursor: grabbing; }
+.nt-map canvas { position: absolute; inset: 0; width: 100%; height: 100%; transform-origin: 0 0; transition: opacity .2s; image-rendering: auto; }
+/* Once a map pixel covers more than one screen pixel, show it as a sharp square like the website. */
+.nt-map[data-pixelated] canvas { image-rendering: pixelated; }
+.nt-map-status { position: absolute; inset: 0; display: grid; place-items: center; color: var(--nt-muted); font-size: 11px; padding: 20px; text-align: center; }
+.nt-map-tools { position: absolute; right: 10px; top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.nt-map-tools .nt-icon-button { background: #0c1217e6; border-color: var(--nt-border); color: #c4d0d8; }
+
+.nt-card { background: #141b20; border: 1px solid var(--nt-border); border-radius: 7px; }
+.nt-card-head h2 { margin: 0; font-size: 12px; font-weight: 600; }
+.nt-card-head > span { color: var(--nt-muted); font-size: 10px; }
+.nt-side-blue .nt-card-head { flex-direction: row-reverse; }
+
+.nt-hero { padding: 14px; border: 1px solid #5a3436; border-radius: 7px; background: #1d1517; }
+.nt-side-blue .nt-hero { border-color: #2f4466; background: #141b26; }
+.nt-hero-name { color: var(--nt-red); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.nt-side-blue .nt-hero-name { color: var(--nt-blue); }
+.nt-hero-value { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; }
+.nt-side-blue .nt-hero-value { flex-direction: row-reverse; }
+.nt-hero-value strong { font-size: 34px; line-height: 1; font-weight: 650; font-variant-numeric: tabular-nums; }
+.nt-hero-value span { font-size: 11px; color: var(--nt-red); }
+.nt-side-blue .nt-hero-value span { color: var(--nt-blue); }
+.nt-hero small { display: block; margin-top: 6px; color: #9babb8; font-size: 10px; }
+
+.nt-stats { padding: 4px 14px; }
+.nt-stats > div { display: flex; justify-content: space-between; align-items: center; height: 30px; border-bottom: 1px solid #ffffff08; }
+.nt-stats > div:last-child { border-bottom: 0; }
+.nt-side-blue .nt-stats > div { flex-direction: row-reverse; }
+.nt-stats span { color: #9babb8; }
+.nt-stats strong { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.nt-players { flex: 1; min-height: 0; padding: 10px 14px; overflow: auto; scrollbar-width: thin; }
+.nt-players .nt-card-head { margin-bottom: 4px; }
+.nt-players ol { list-style: none; margin: 0; padding: 0; }
+.nt-players li { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; gap: 6px; align-items: center; height: 25px; border-top: 1px solid #ffffff06; font-variant-numeric: tabular-nums; }
+.nt-side-blue .nt-players li { grid-template-columns: auto minmax(0, 1fr) 32px; direction: rtl; }
+.nt-side-blue .nt-players li > * { direction: ltr; }
+.nt-players strong { font-weight: 550; }
+.nt-rank { color: var(--nt-muted); font-size: 10px; }
+.nt-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-players li.nt-you { background: #7cb9f111; box-shadow: inset 2px 0 var(--nt-accent); margin: 0 -14px; padding: 0 14px; }
+.nt-side-blue .nt-players li.nt-you { box-shadow: inset -2px 0 var(--nt-accent); }
+
+.nt-momentum { flex: 1; min-height: 250px; display: flex; flex-direction: column; padding: 10px 14px 6px; }
+.nt-momentum .nt-card-head h2 { font-size: 14px; }
+.nt-momentum .nt-card-head .nt-loading { margin-right: auto; color: var(--nt-muted); font-size: 11px; }
+.nt-segment { display: flex; gap: 2px; padding: 2px; border-radius: 5px; background: #0c1216; border: 1px solid var(--nt-border); }
+.nt-page .nt-segment button { min-height: 26px; padding: 0 10px; border: 0; border-radius: 4px; background: transparent; color: var(--nt-muted); font-size: 12px; }
+.nt-page .nt-segment button[aria-pressed=true] { background: #2a3843; color: #e2edf5; }
+.nt-chart { position: relative; flex: 1; min-height: 160px; margin-top: 6px; }
+.nt-chart svg { position: absolute; inset: 0; display: block; outline-offset: 0; }
+.nt-chart text { fill: #9babb8; font-size: 11px; font-variant-numeric: tabular-nums; }
+.nt-chart .nt-side-label { font-size: 11px; font-weight: 600; }
+.nt-chart .nt-side-label.nt-blue { fill: var(--nt-blue); }
+.nt-chart .nt-side-label.nt-red { fill: var(--nt-red); }
+.nt-gridline { stroke: #a2b7c712; stroke-dasharray: 3 5; }
+.nt-midline { stroke: #c4d0d866; }
+.nt-area-blue { fill: #5680c833; }
+.nt-area-red { fill: #c45c5c33; }
+.nt-line-land { fill: none; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; filter: drop-shadow(0 1px 1px #0009); }
+.nt-line-cities { fill: none; stroke-width: 2.4; stroke-dasharray: 2 5; stroke-linecap: round; filter: drop-shadow(0 1px 1px #0009); }
+.nt-dot { fill: #dbe4ea; }
+.nt-focus { fill: #dbe4ea; stroke: #141b20; stroke-width: 1.5; }
+.nt-crosshair { stroke: #afc7d36b; stroke-dasharray: 3 4; pointer-events: none; }
+.nt-tooltip { position: absolute; top: 4px; width: 200px; padding: 7px 9px; background: #0c1217ef; border: 1px solid #3b4b58; border-radius: 5px; font-size: 12px; pointer-events: none; box-shadow: 0 3px 10px #0004; }
+.nt-tooltip strong { display: block; font-weight: 500; color: #9dabb6; font-size: 11px; margin-bottom: 4px; }
+.nt-tooltip span { display: flex; justify-content: space-between; line-height: 1.7; color: #b7c4cd; }
+.nt-tooltip b { font-weight: 550; }
+.nt-tooltip i { font-style: normal; }
+
+.nt-empty { display: grid; place-items: center; height: 100%; min-height: 60px; color: var(--nt-muted); font-size: 11px; text-align: center; }
+.nt-error { font-size: 11px; color: #e5b289; background: #9c682a14; border: 1px solid #b3804433; border-radius: 5px; padding: 8px 11px; margin: 0; }
+
+
+.nt-spinning { animation: nt-spin 1s linear infinite; }
+@keyframes nt-spin { to { transform: rotate(360deg); } }
+
+/* Small windows keep the map and chart; the faction columns are dropped and the bar gains its labels. */
+@media (max-width: 1099px) {
+  .nt-page { padding: 14px 16px; }
+  .nt-grid { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .nt-side { display: none; }
+  .nt-bar-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .nt-bar-label { display: inline; }
+}
+@media (max-width: 620px) {
+  .nt-card-head { flex-wrap: wrap; }
+  .nt-status { display: none; }
+  .nt-bar-label { font-size: 0; }
+  .nt-bar-label strong { font-size: 12px; }
+}
+@media (prefers-reduced-motion: reduce) { .nt-spinning { animation: none; } .nt-page button, .nt-bar-red { transition: none; } }

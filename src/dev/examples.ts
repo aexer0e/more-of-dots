@@ -20,6 +20,76 @@ export async function exampleLeaderboard<T>(url: string): Promise<T> {
   const result: History = { from, to, step, rows: rows.filter((row, index) => index === 0 || JSON.stringify(row.players) !== JSON.stringify(rows[index - 1].players)) };
   return result as T;
 }
+// A generated Nations campaign: 115 days of 30-minute captures over the real playable area.
+type ExampleCapture = { capturedAt: number; share: number; cities: number };
+let exampleCampaign: ExampleCapture[] | null = null;
+function nationsCampaign() {
+  if (exampleCampaign) return exampleCampaign;
+  const latest = Math.floor(Date.now() / 1000 / 1800) * 1800 - 1800;
+  const count = 115 * 48;
+  let state = 17, share = 50;
+  const next = () => (state = (Math.imul(state, 1664525) + 1013904223) | 0) >>> 8 & 0xffff;
+  exampleCampaign = Array.from({ length: count }, (_, index) => {
+    const t = index / (count - 1);
+    const target = 50 + 3 * t + 1.6 * Math.sin(t * Math.PI * 2.3) * (1 - t);
+    share += (target - share) * 0.02 + (next() / 0xffff - 0.5) * 0.12;
+    return { capturedAt: latest - (count - 1 - index) * 1800, share, cities: Math.round(295 * (share - 0.6 + Math.sin(index / 37)) / 100) };
+  });
+  return exampleCampaign;
+}
+const PLAYABLE = 983237;
+function exampleRow(capture: ExampleCapture, index: number) {
+  const bluePixels = Math.round(PLAYABLE * capture.share / 100);
+  return {
+    id: index + 1, capturedAt: capture.capturedAt, mapHash: `example-${Math.round(capture.share * 10)}`, width: 1920, height: 1080,
+    encoding: 'playable-bitset-zlib-v1', playablePixels: PLAYABLE, mapUrl: `/v1/snapshots/${index + 1}/map`,
+    redPixels: PLAYABLE - bluePixels, bluePixels, redCities: 295 - capture.cities, blueCities: capture.cities,
+  };
+}
+async function deflate(bytes: Uint8Array<ArrayBuffer>, mode: 'compress' | 'decompress') {
+  const stream = new Response(bytes).body!.pipeThrough(mode === 'compress' ? new CompressionStream('deflate') : new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+/** Blue holds the west and north of a wavy front, Red the rest. Bit 1 is Red. */
+async function exampleOwnership(share: number) {
+  const mask = await deflate(new Uint8Array(await (await fetch('/nations/playable-mask.bitset.zlib')).arrayBuffer()), 'decompress');
+  const bits = new Uint8Array(Math.ceil(PLAYABLE / 8));
+  let index = 0;
+  const front = 1920 * (0.32 + share / 100 * 0.5);
+  for (let pixel = 0; pixel < 1920 * 1080; pixel++) {
+    if (!((mask[pixel >> 3] >> (pixel & 7)) & 1)) continue;
+    const x = pixel % 1920, y = Math.floor(pixel / 1920);
+    if (x > front + 140 * Math.sin(y / 90) + 60 * Math.sin(y / 23)) bits[index >> 3] |= 1 << (index & 7);
+    index++;
+  }
+  return deflate(bits, 'compress');
+}
+export async function exampleNations(path: string): Promise<Response> {
+  const url = new URL(path, 'http://localhost');
+  const campaign = nationsCampaign();
+  const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+  if (url.pathname === '/v1/timeline/summary') {
+    const after = Number(url.searchParams.get('after')) || 0;
+    return json({ rows: campaign.map(exampleRow).filter((row) => row.capturedAt >= after), oldestCapturedAt: campaign[0].capturedAt, latestCapturedAt: campaign.at(-1)!.capturedAt });
+  }
+  if (url.pathname === '/v1/timeline') {
+    const from = Number(url.searchParams.get('from')) || 0, to = Number(url.searchParams.get('to')) || Infinity;
+    const before = Number(url.searchParams.get('before')) || Infinity, limit = Math.min(1000, Number(url.searchParams.get('limit')) || 336);
+    const rows = campaign.map(exampleRow).filter((row) => row.capturedAt >= from && row.capturedAt <= to && row.capturedAt < before).reverse();
+    return json({ rows: rows.slice(0, limit), nextBefore: rows.length > limit ? rows[limit - 1].capturedAt : null });
+  }
+  if (/^\/v1\/snapshots\/\d+\/map$/.test(url.pathname)) {
+    const capture = campaign[Number(url.pathname.split('/')[3]) - 1] ?? campaign.at(-1)!;
+    return new Response(await exampleOwnership(capture.share));
+  }
+  if (url.pathname === '/v1/nations') {
+    return json({ capturedAt: campaign.at(-1)!.capturedAt, nations: [
+      { nation: 0, cash: 355_210, net_worth: 1_310_400, players: 236 },
+      { nation: 1, cash: 410_880, net_worth: 1_420_150, players: 212 },
+    ] });
+  }
+  return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
+}
 // `?replays=2000` repeats the examples to profile a large library in the browser.
 function stressReplays<T extends { filePath: string }>(replays: T[]): T[] {
   const count = Math.min(20_000, Number(new URLSearchParams(location.search).get('replays')) || 0);

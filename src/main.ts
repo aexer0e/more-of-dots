@@ -11,6 +11,7 @@ import { check } from "@tauri-apps/plugin-updater";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { LeaderboardApp } from "./leaderboard/App";
+import { NationsApp } from "./nations/App";
 import { cached, leaderboardRankIndex, retrieve, type Snapshot } from "./leaderboard/client";
 import MapEditorApp from "./map-editor/App";
 import { mountRegionPage, unmountRegionPage } from "./region/page";
@@ -71,7 +72,7 @@ type ReplayIndexProgress = {
 
 type BrowserFilterState = ReplayFilters;
 type ThumbnailVariant = "small" | "full";
-type BrowserPage = "replays" | "leaderboard" | "region" | "mapEditor";
+type BrowserPage = "replays" | "leaderboard" | "nations" | "region" | "mapEditor";
 type AppUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "current" | "error";
 type AppUpdateSnooze = {
   version: string;
@@ -988,8 +989,20 @@ async function replayCardDetails(replay: ReplayBrowserItem): Promise<CardDetails
     frames: replay.durationSeconds * 30,
     version: replay.version ?? null,
     picture,
-    troops: browserTroopSides.get(troopKey(replay)),
+    troops: await replayTroopSides(replay),
   };
+}
+
+// The replay's troop lines, simulated now if the background pass has not reached it.
+async function replayTroopSides(replay: ReplayBrowserItem): Promise<TroopSides> {
+  await loadStoredTroopLines();
+  const key = troopKey(replay);
+  const known = browserTroopSides.get(key);
+  if (known?.length) return known;
+  const results = await invoke<ReplayTroopLines[]>("replay_troop_lines", { filePaths: [replay.filePath] }).catch(() => []);
+  const sides = results[0]?.sides ?? [];
+  if (sides.length) browserTroopSides.set(key, sides);
+  return sides;
 }
 
 // Uploads a replay the first time it is shared, then copies its link. The share
@@ -1512,6 +1525,7 @@ function renderBrowserNav(): string {
     <nav class="browser-nav" aria-label="Main navigation">
       <button class="browser-nav-button ${browserPage === "replays" ? "is-active" : ""}" type="button" data-browser-page="replays">Replays</button>
       <button class="browser-nav-button ${browserPage === "leaderboard" ? "is-active" : ""}" type="button" data-browser-page="leaderboard">Leaderboard</button>
+      <button class="browser-nav-button ${browserPage === "nations" ? "is-active" : ""}" type="button" data-browser-page="nations">Nations</button>
       ${regionSupported
         ? `<button class="browser-nav-button ${browserPage === "region" ? "is-active" : ""}" type="button" data-browser-page="region">Region</button>`
         : `<button class="browser-nav-button is-unavailable" type="button" aria-disabled="true" title="Region selection is only available on Windows">Region</button>`}
@@ -1885,12 +1899,17 @@ function mountMapEditor() {
 }
 
 let leaderboardRoot: Root | null = null;
+let nationsRoot: Root | null = null;
 
 function renderReplayBrowser() {
 
   if (browserPage !== "leaderboard" && leaderboardRoot) {
     leaderboardRoot.unmount();
     leaderboardRoot = null;
+  }
+  if (browserPage !== "nations" && nationsRoot) {
+    nationsRoot.unmount();
+    nationsRoot = null;
   }
   browserGrid?.destroy();
   browserGrid = null;
@@ -1928,6 +1947,15 @@ function renderReplayBrowser() {
       bindBrowserEvents();
       leaderboardRoot = createRoot(document.querySelector<HTMLElement>("#leaderboardRoot")!);
       leaderboardRoot.render(createElement(LeaderboardApp));
+    }
+    return;
+  }
+  if (browserPage === "nations") {
+    if (!nationsRoot) {
+      appRoot.innerHTML = `<main class="replay-browser" aria-label="War of Dots nations">${renderBrowserNav()}${exampleMode ? `<div class="example-banner">Example workspace <span>Generated campaign data</span></div>` : ""}<div id="nationsRoot" style="display:flex;flex:1;min-height:0;overflow:hidden"></div></main>`;
+      bindBrowserEvents();
+      nationsRoot = createRoot(document.querySelector<HTMLElement>("#nationsRoot")!);
+      nationsRoot.render(createElement(NationsApp));
     }
     return;
   }
@@ -2135,7 +2163,7 @@ function bindBrowserEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-browser-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const page = button.dataset.browserPage;
-      const nextPage: BrowserPage = page === "leaderboard" || (page === "region" && regionSupported) || page === "mapEditor" ? page : "replays";
+      const nextPage: BrowserPage = page === "leaderboard" || page === "nations" || (page === "region" && regionSupported) || page === "mapEditor" ? page : "replays";
       void switchBrowserPage(nextPage);
     });
   });

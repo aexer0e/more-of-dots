@@ -18,7 +18,7 @@ import { addFile } from "../player/host.js";
 import "./site.css";
 import { addReplay, getReplay, listReplays, refreshDetails, removeReplay, saveReplay } from "./library.js";
 import { downloadLink, fetchShared, shareReplay, unshareReplay, uploadCard } from "./share.js";
-import { drawCard } from "./card.js";
+import { CARD_VERSION, drawCard } from "./card.js";
 import { box, connect, layout, nextMatches, roundName, sides } from "./bracket.js";
 import { reduceTroops, troopLinesMarkup } from "../replays/troop-lines";
 
@@ -358,17 +358,17 @@ async function share(button) {
   void renderMine();
   void uploaded.then(() => addCard(id), () => {});
 }
-/// Gives a replay this browser shared the picture its link preview shows, once.
+/// Gives a replay this browser shared the picture its link preview shows, once per card design.
 async function addCard(id) {
   const record = await getReplay(id);
   const token = record?.shared?.token;
-  if (!token || record.shared.card) return;
+  if (!token || record.shared.card === CARD_VERSION) return;
   try {
     const picture = record.thumb ?? mapPicture(record.mapRef, await publishedMaps());
     const troops = await replayTroops(record);
     await uploadCard(id, token, await drawCard({ players: record.players, frames: record.frames, version: record.version, picture, troops }, base));
     const current = await getReplay(id);
-    if (current?.shared) await saveReplay({ ...current, shared: { ...current.shared, card: true } });
+    if (current?.shared) await saveReplay({ ...current, shared: { ...current.shared, card: CARD_VERSION } });
   } catch {
     // The preview shows the replay's details without a picture until the next share.
   }

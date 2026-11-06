@@ -1,7 +1,7 @@
 // Sharing replays through the wod-replays worker (share/), the service the hosted
 // player uses. A replay is kept under the first 16 hex characters of its SHA-256,
 // so sharing the same file twice, from here or from the site, gives the same link.
-import { drawCard, type CardDetails } from "../site/card.js";
+import { CARD_VERSION, drawCard, type CardDetails } from "../site/card.js";
 
 const API = import.meta.env.VITE_SHARE_API ?? "https://wod-replays.moreofdots.workers.dev";
 export const SITE = "https://aexer0e.dev/wod-replay-player/";
@@ -9,7 +9,7 @@ export const SITE = "https://aexer0e.dev/wod-replay-player/";
 // preview's picture (null when someone had already shared the same file).
 const SHARED_KEY = "wodSharedReplays";
 
-type SharedRecord = { token: string | null; card?: boolean };
+type SharedRecord = { token: string | null; card?: boolean | number };
 
 function readShared(): Record<string, SharedRecord> {
   try {
@@ -55,10 +55,10 @@ export async function uploadReplay(bytes: Uint8Array<ArrayBuffer>): Promise<stri
   return id;
 }
 
-/** Gives a replay this app shared the picture its link preview shows, once. */
+/** Gives a replay this app shared the picture its link preview shows, once per card design. */
 export async function addCard(id: string, details: () => Promise<CardDetails>) {
   const record = shared[id];
-  if (!record?.token || record.card) return;
+  if (!record?.token || record.card === CARD_VERSION) return;
   try {
     const card = await drawCard(await details(), SITE);
     await request(`/replays/${id}/card`, {
@@ -66,7 +66,7 @@ export async function addCard(id: string, details: () => Promise<CardDetails>) {
       headers: { Authorization: `Bearer ${record.token}`, "Content-Type": "image/jpeg" },
       body: card,
     });
-    shared[id] = { ...shared[id], card: true };
+    shared[id] = { ...shared[id], card: CARD_VERSION };
     saveShared();
   } catch {
     // The preview shows the replay's details without a picture until the next share.

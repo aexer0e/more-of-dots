@@ -12,7 +12,7 @@
     "check:version": "node --test scripts/version.test.mjs",
     "check:web": "tsc --noEmit",
     "check:replays": "node --test scripts/replay-filters.test.mjs scripts/troop-lines.test.mjs",
-    "check": "npm run check:version && npm run check:leaderboard && npm run check:map && npm run check:examples && npm run check:replays && npm run check:player && npm run check:web",
+    "check": "npm run check:version && npm run check:leaderboard && npm run check:nations && npm run check:map && npm run check:examples && npm run check:replays && npm run check:player && npm run check:web",
     "build:web": "tsc && vite build",
     "build:site": "node scripts/build-site.mjs",
     "size:audit": "node scripts/size-audit.mjs",
@@ -23,9 +23,10 @@
     "check:examples": "node --test scripts/dev-data.test.mjs",
     "prepare:player": "node scripts/prepare-player.mjs",
     "check:native": "node scripts/check-native.mjs",
-    "check:player": "node --test scripts/player-scheduling.test.mjs scripts/player-sound.test.mjs scripts/player-view.test.mjs scripts/player-frames.test.mjs",
+    "check:player": "node --test scripts/player-scheduling.test.mjs scripts/player-sound.test.mjs scripts/player-view.test.mjs scripts/player-frames.test.mjs scripts/play-orders.test.mjs",
     "installers": "node scripts/download-installers.mjs",
-    "check:engine": "cargo test --release --manifest-path engine/Cargo.toml"
+    "check:engine": "cargo test --release --manifest-path engine/Cargo.toml",
+    "check:nations": "node --test scripts/nations.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

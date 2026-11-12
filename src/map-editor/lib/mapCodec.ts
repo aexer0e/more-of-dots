@@ -1,41 +1,18 @@
-import { CANVAS_HEIGHT, CANVAS_WIDTH, DEFAULT_TERRAIN_HEX, MODE_LABELS, MODE_TEAMS } from './constants';
+import { CANVAS_HEIGHT, CANVAS_WIDTH, DEFAULT_TERRAIN_HEX } from './constants';
 import { loadImageFromFile, quantizeCanvasContext } from './editorUtils';
-import type { Bridge, EditorSnapshot, MapData, Mode, Point, StoredMap } from './types';
+import { mergeShocks } from './preview';
+import type { Bridge, EditorSnapshot, MapData, Point, StoredMap } from './types';
 
-const MODE_ALIASES: Record<string, Mode> = {
-  '1v1': '1v1',
-  '1v1 duel': '1v1',
-  duel: '1v1',
-  '3pffa': 'v3',
-  '3p ffa': 'v3',
-  v3: 'v3',
-  '4pffa': 'v4',
-  '4p ffa': 'v4',
-  ffa: 'v4',
-  v4: 'v4',
-};
+const clampTeams = (count: number) => Math.max(2, Math.min(4, count));
 
-export function normalizeMode(mode: string | null | undefined): Mode {
-  return MODE_ALIASES[String(mode ?? '1v1').trim().toLowerCase()] ?? '1v1';
-}
-
+/** The game has no map mode: a map has as many teams as it has unit lists. */
 export function inferTeamCount(data: Partial<MapData> | null | undefined): number {
-  const infantryCount = Array.isArray(data?.infantry) ? data.infantry.length : 0;
-  const tankCount = Array.isArray(data?.tanks) ? data.tanks.length : 0;
-  const motorisedCount = Array.isArray(data?.motorised) ? data.motorised.length : 0;
-  return Math.max(2, Math.min(4, Math.max(infantryCount, tankCount, motorisedCount, MODE_TEAMS[normalizeMode(data?.mode as string)])));
+  const lists = (value: unknown) => (Array.isArray(value) ? value.length : 0);
+  return clampTeams(Math.max(lists(data?.infantry), lists(data?.tanks)));
 }
 
 export function teamsForMap(map: Pick<StoredMap, 'teamCount' | 'data'> | null | undefined) {
-  return Math.max(2, Math.min(4, Number(map?.teamCount) || inferTeamCount(map?.data)));
-}
-
-export function teamsForMode(mode: string | null | undefined) {
-  return MODE_TEAMS[normalizeMode(mode)];
-}
-
-export function modeLabel(mode: string | null | undefined) {
-  return MODE_LABELS[normalizeMode(mode)];
+  return clampTeams(Number(map?.teamCount) || inferTeamCount(map?.data));
 }
 
 function normalizePoint(point: unknown): Point | null {
@@ -85,38 +62,41 @@ function fitImageCover(context: CanvasRenderingContext2D, image: HTMLImageElemen
   context.drawImage(image, (width - drawWidth) / 2, (height - drawHeight) / 2, drawWidth, drawHeight);
 }
 
-export function emptyMapData(mode: Mode = '1v1', width = CANVAS_WIDTH, height = CANVAS_HEIGHT): MapData {
-  const teamCount = MODE_TEAMS[mode];
+export function emptyMapData(teamCount = 2, width = CANVAS_WIDTH, height = CANVAS_HEIGHT): MapData {
+  const teams = clampTeams(teamCount);
   return {
     map_surface: createSolidMapSurface(width, height),
-    mode,
-    infantry: Array.from({ length: teamCount }, () => []),
-    tanks: Array.from({ length: teamCount }, () => []),
-    motorised: Array.from({ length: teamCount }, () => []),
+    infantry: Array.from({ length: teams }, () => []),
+    tanks: Array.from({ length: teams }, () => []),
     cities: [],
     capitals: [],
     bridges: [],
   };
 }
 
+/** Changes the number of teams. Units of removed teams are dropped. */
+export function withTeamCount(data: MapData, teamCount: number): MapData {
+  const teams = clampTeams(teamCount);
+  const resize = (lists: Point[][]) => Array.from({ length: teams }, (_, index) => lists[index] ?? []);
+  return { ...data, infantry: resize(data.infantry), tanks: resize(data.tanks) };
+}
+
+/** Brings a map to the fields the game reads. `mode` is dropped, and shock units
+ * that older maps listed apart go back among the infantry. */
 export function normalizeMapData(data: unknown): MapData {
-  if (!data || typeof data !== 'object') return emptyMapData('1v1');
+  if (!data || typeof data !== 'object') return emptyMapData();
 
-  const raw = data as Partial<MapData> & Record<string, unknown>;
-  const mode = normalizeMode(raw.mode as string);
-  const teamCount = inferTeamCount(raw);
-
+  const { mode: _mode, motorised, ...raw } = data as Partial<MapData> & Record<string, unknown>;
+  const teamCount = clampTeams(Math.max(inferTeamCount(raw), Array.isArray(motorised) ? motorised.length : 0));
+  const points = (list: unknown) => (Array.isArray(list) ? list.map(normalizePoint).filter((point): point is Point => point !== null) : []);
   const normalizeTeamBuckets = (collection: unknown) =>
-    Array.from({ length: teamCount }, (_, index) => {
-      const bucket = Array.isArray(collection) ? collection[index] : null;
-      return Array.isArray(bucket)
-        ? bucket.map(normalizePoint).filter((point): point is Point => point !== null)
-        : [];
-    });
+    Array.from({ length: teamCount }, (_, index) => points(Array.isArray(collection) ? collection[index] : null));
 
-  const cities = Array.isArray(raw.cities)
-    ? raw.cities.map(normalizePoint).filter((point): point is Point => point !== null)
-    : [];
+  const shocks = normalizeTeamBuckets(motorised);
+  const infantry = normalizeTeamBuckets(raw.infantry).map((team, index) => (
+    shocks[index].length ? mergeShocks(team, shocks[index]) ?? [...team, ...shocks[index]] : team
+  ));
+  const cities = points(raw.cities);
   const capitals = Array.isArray(raw.capitals)
     ? raw.capitals.map(Number).filter((value) => Number.isInteger(value) && value >= 0 && value < cities.length)
     : [];
@@ -127,10 +107,8 @@ export function normalizeMapData(data: unknown): MapData {
   return {
     ...raw,
     map_surface: typeof raw.map_surface === 'string' && raw.map_surface ? raw.map_surface : createSolidMapSurface(),
-    mode,
-    infantry: normalizeTeamBuckets(raw.infantry),
+    infantry,
     tanks: normalizeTeamBuckets(raw.tanks),
-    motorised: normalizeTeamBuckets(raw.motorised),
     cities,
     capitals,
     bridges,
@@ -141,17 +119,15 @@ export function cloneMapData(mapData: MapData): MapData {
   return {
     ...mapData,
     map_surface: mapData.map_surface,
-    mode: normalizeMode(mapData.mode),
     infantry: mapData.infantry.map((team) => team.map(([x, y]) => [x, y] as Point)),
     tanks: mapData.tanks.map((team) => team.map(([x, y]) => [x, y] as Point)),
-    motorised: mapData.motorised.map((team) => team.map(([x, y]) => [x, y] as Point)),
     cities: mapData.cities.map(([x, y]) => [x, y] as Point),
     capitals: [...mapData.capitals],
     bridges: mapData.bridges.map(([start, end]) => [[start[0], start[1]], [end[0], end[1]]] as Bridge),
   };
 }
 
-function mapCoordinateStorageScale(width: number, height: number) {
+export function mapCoordinateStorageScale(width: number, height: number) {
   return width === 960 && height === 540 ? { x: 5 / 3, y: 5 / 3 } : { x: 1, y: 1 };
 }
 
@@ -164,7 +140,6 @@ export function scaleMapObjects(data: MapData, scaleX: number, scaleY: number): 
     ...data,
     infantry: data.infantry.map((team) => team.map((point) => scalePoint(point, scaleX, scaleY))),
     tanks: data.tanks.map((team) => team.map((point) => scalePoint(point, scaleX, scaleY))),
-    motorised: data.motorised.map((team) => team.map((point) => scalePoint(point, scaleX, scaleY))),
     cities: data.cities.map((point) => scalePoint(point, scaleX, scaleY)),
     bridges: data.bridges.map(([start, end]) => [
       scalePoint(start, scaleX, scaleY),
@@ -177,7 +152,7 @@ export function cloneMapRecord(map: StoredMap): StoredMap {
   return {
     ...map,
     data: cloneMapData(normalizeMapData(map.data)),
-    teamCount: Math.max(2, Math.min(4, Number(map.teamCount) || inferTeamCount(map.data))),
+    teamCount: inferTeamCount(map.data),
   };
 }
 
@@ -196,22 +171,6 @@ export function mapDataForStorage(map: StoredMap): MapData {
   const data = cloneMapData(normalizeMapData(map.data));
   if (storageScale.x === 1 && storageScale.y === 1) return data;
   return scaleMapObjects(data, storageScale.x, storageScale.y);
-}
-
-export function createMapRecord(name: string, mode: Mode = '1v1'): StoredMap {
-  const timestamp = Date.now();
-  const fileName = `map_${timestamp}.txt`;
-  return {
-    id: fileName,
-    fileName,
-    name,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    width: CANVAS_WIDTH,
-    height: CANVAS_HEIGHT,
-    teamCount: MODE_TEAMS[mode],
-    data: emptyMapData(mode),
-  };
 }
 
 export function snapshotForHistory(map: StoredMap): EditorSnapshot {

@@ -795,3 +795,22 @@
     left: 0;
     transform-origin: top left;
   }}
+/* Preview toggles: starting borders and shock units. */
+.map-editor-scope .icon-button.preview-toggle { width: auto; padding: 0 10px; font-size: 0.78rem; font-weight: 600; }
+.map-editor-scope .icon-button.preview-toggle[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent-strong); color: var(--accent-strong); }
+
+/* Team count when creating a map. */
+.map-editor-scope .team-count-choice { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.map-editor-scope .team-count-choice button { padding: 8px 0; border: 1px solid var(--line, rgba(255, 255, 255, 0.12)); border-radius: 8px; background: transparent; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
+.map-editor-scope .team-count-choice button[aria-checked="true"] { background: var(--accent-soft); border-color: var(--accent-strong); color: var(--text); }
+.map-editor-scope .preview-row { display: flex; align-items: center; gap: 6px; }
+.map-editor-scope .preview-row > span { margin-right: auto; color: var(--muted); font-size: 0.8rem; font-weight: 600; }
+.map-editor-scope .map-size-choice { grid-template-columns: repeat(2, 1fr); margin-top: 8px; }
+.map-editor-scope .map-size-choice button { display: grid; gap: 2px; justify-items: center; padding: 8px 6px; }
+.map-editor-scope .map-size-choice small { font-weight: 400; font-size: 0.78em; color: var(--muted); }
+.map-editor-scope .map-name-button { all: unset; display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 4px; cursor: text; }
+.map-editor-scope .map-name-button:hover:not(:disabled), .map-editor-scope .map-name-button:focus-visible { box-shadow: 0 0 0 1px var(--line, rgba(255, 255, 255, 0.2)); background: rgba(255, 255, 255, 0.04); }
+.map-editor-scope .map-name-button:disabled { cursor: default; }
+.map-editor-scope .map-name-edit { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.map-editor-scope .map-name-input { width: 100%; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid var(--accent-strong, #5a92c4); border-radius: 6px; background: var(--bg, #0e1110); color: var(--text, #edf2ef); font: inherit; font-weight: 600; outline: 0; }
+.map-editor-scope .map-name-error { margin: 0; font-size: 0.8rem; }

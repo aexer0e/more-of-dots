@@ -29,6 +29,7 @@ mod maps;
 mod export;
 mod player;
 mod region;
+mod replay_map;
 mod video;
 mod storage;
 mod thumbnails;
@@ -769,19 +770,10 @@ fn png_dimensions_from_base64(base64_png: &str) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+/// The game has no map mode: a map has as many teams as it has unit lists.
 fn map_team_count(data: &Value) -> usize {
-    let infantry = data
-        .get("infantry")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let tanks = data
-        .get("tanks")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let motorised = data.get("motorised").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-    infantry.max(tanks).max(motorised).clamp(2, 4)
+    let lists = |key: &str| data.get(key).and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    lists("infantry").max(lists("tanks")).clamp(2, 4)
 }
 
 fn map_dimensions(data: &Value) -> (u32, u32) {
@@ -789,14 +781,6 @@ fn map_dimensions(data: &Value) -> (u32, u32) {
         .and_then(Value::as_str)
         .and_then(png_dimensions_from_base64)
         .unwrap_or((960, 540))
-}
-
-fn mode_team_count(mode: &str) -> usize {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "v3" | "3pffa" | "3p ffa" => 3,
-        "v4" | "4pffa" | "4p ffa" | "ffa" => 4,
-        _ => 2,
-    }
 }
 
 fn solid_map_surface_base64(width: u32, height: u32) -> Result<String, String> {
@@ -821,19 +805,19 @@ fn solid_map_surface_base64(width: u32, height: u32) -> Result<String, String> {
     Ok(BASE64.encode(bytes))
 }
 
-fn default_game_map_value(mode: &str) -> Result<Value, String> {
-    let mode = match mode.trim().to_ascii_lowercase().as_str() {
-        "v3" => "v3",
-        "v4" => "v4",
-        _ => "1v1",
-    };
-    let team_count = mode_team_count(mode);
+/// A blank map in the game's format: the six fields the game reads.
+fn default_game_map_value(team_count: usize) -> Result<Value, String> {
+    blank_game_map_value(team_count, 960, 540)
+}
+
+/// An empty map with a plain terrain of the given size. The game plays a 960 x 540
+/// terrain on a 1600 x 900 battlefield and a 1920 x 1080 one on 1920 x 1080.
+fn blank_game_map_value(team_count: usize, width: u32, height: u32) -> Result<Value, String> {
+    let team_count = team_count.clamp(2, 4);
     Ok(json!({
-        "map_surface": solid_map_surface_base64(960, 540)?,
-        "mode": mode,
+        "map_surface": solid_map_surface_base64(width, height)?,
         "infantry": vec![Vec::<Value>::new(); team_count],
         "tanks": vec![Vec::<Value>::new(); team_count],
-        "motorised": vec![Vec::<Value>::new(); team_count],
         "cities": Vec::<Value>::new(),
         "capitals": Vec::<Value>::new(),
         "bridges": Vec::<Value>::new(),
@@ -845,6 +829,30 @@ fn display_name_for_map_file(file_name: &str) -> String {
         .strip_suffix(".txt")
         .unwrap_or(file_name)
         .replace('_', " ")
+}
+
+/// The file name stem for a map name: what a file name may hold on every system,
+/// with runs of spaces joined, at most 64 characters. The game and the library
+/// show a map by its file name.
+fn map_file_stem(name: &str) -> Result<String, String> {
+    let kept: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+        .collect();
+    let joined = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stem: String = joined.chars().take(64).collect();
+    let stem = stem.trim_start_matches('.').trim_end_matches(['.', ' ']).to_string();
+    if stem.is_empty() {
+        return Err("Enter a map name with letters or numbers.".into());
+    }
+    let upper = stem.to_ascii_uppercase();
+    let base = upper.split('.').next().unwrap_or_default();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&base)
+        || ((base.starts_with("COM") || base.starts_with("LPT")) && base.len() == 4 && base.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        return Err(format!("{stem} cannot be used as a file name. Choose another name."));
+    }
+    Ok(stem)
 }
 
 fn safe_map_name_slug(name: &str) -> String {
@@ -868,10 +876,8 @@ fn validate_game_map_value(value: &Value) -> Result<(), String> {
     if !value.is_object() {
         return Err("Map data must be a JSON object.".to_string());
     }
-    for key in ["map_surface", "mode"] {
-        if value.get(key).and_then(Value::as_str).is_none() {
-            return Err(format!("Map data is missing string field {key}."));
-        }
+    if value.get("map_surface").and_then(Value::as_str).is_none() {
+        return Err("Map data is missing string field map_surface.".to_string());
     }
     for key in ["infantry", "tanks", "cities", "capitals", "bridges"] {
         if value.get(key).and_then(Value::as_array).is_none() {
@@ -2326,9 +2332,74 @@ fn save_map(app: AppHandle, file_name: String, data: Value, publish: Option<bool
     map_store(&app)?.save(&file_name, data, publish.unwrap_or(false))
 }
 
+/// A new map; `large` gives a 1920 x 1080 terrain instead of 960 x 540.
 #[tauri::command]
-fn create_map(app: AppHandle, name: String, mode: String) -> Result<GameMapRecord, String> {
-    map_store(&app)?.create(&name, &mode)
+fn create_map(app: AppHandle, name: String, teams: Option<usize>, large: Option<bool>) -> Result<GameMapRecord, String> {
+    map_store(&app)?.create(&name, teams.unwrap_or(2), large.unwrap_or(false))
+}
+
+/// Gives a map a new name, which is its file name. The record's id can change.
+#[tauri::command]
+fn rename_map(app: AppHandle, file_name: String, name: String) -> Result<GameMapRecord, String> {
+    map_store(&app)?.rename(&file_name, &name)
+}
+
+/// Adds a map file from elsewhere (gzip JSON, or plain JSON) as a draft.
+#[tauri::command]
+async fn import_map_file(app: AppHandle, file_name: String, map_base64: String) -> Result<GameMapRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = BASE64.decode(map_base64.trim()).map_err(|error| format!("Could not read {file_name}: {error}"))?;
+        let data = replay_sim::replay::parse_replay_bytes(&bytes)
+            .map_err(|_| format!("{file_name} is not a War of Dots map."))?;
+        let stem = file_name.rsplit_once('.').map_or(file_name.as_str(), |(stem, _)| stem);
+        map_store(&app)?.import(stem, data)
+    })
+    .await
+    .map_err(|error| format!("Map import task failed: {error}"))?
+}
+
+/// The map a replay in the library was played on, for its card in the import
+/// dialog: the map in the game's format, its terrain size and the match mode.
+#[tauri::command]
+async fn replay_map_preview(file_path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&file_path);
+        if !path.is_file() || !is_replay_file(&path) {
+            return Err(format!("Replay file is not readable: {}", path.display()));
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let mode = replay_sim::replay::parse_replay_bytes(&bytes)?.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
+        let game_root = game::content_dirs().into_iter().next();
+        let data = replay_map::map_from_replay(&bytes, game_root.as_deref(), &discover_replay_dirs())?;
+        let (width, height) = map_dimensions(&data);
+        Ok(json!({ "data": data, "width": width, "height": height, "mode": mode }))
+    })
+    .await
+    .map_err(|error| format!("Map preview task failed: {error}"))?
+}
+
+/// Makes a draft from the map a replay was played on: a replay in the library
+/// (`file_path`) or one the person chose (`replay_base64`).
+#[tauri::command]
+async fn import_map_from_replay(app: AppHandle, name: String, file_path: Option<String>, replay_base64: Option<String>) -> Result<GameMapRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = match (file_path, replay_base64) {
+            (Some(path), _) => {
+                let path = PathBuf::from(path);
+                if !path.is_file() || !is_replay_file(&path) {
+                    return Err(format!("Replay file is not readable: {}", path.display()));
+                }
+                fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?
+            }
+            (None, Some(encoded)) => BASE64.decode(encoded.trim()).map_err(|error| format!("Could not read the replay: {error}"))?,
+            (None, None) => return Err("Choose a replay first.".into()),
+        };
+        let game_root = game::content_dirs().into_iter().next();
+        let data = replay_map::map_from_replay(&bytes, game_root.as_deref(), &discover_replay_dirs())?;
+        map_store(&app)?.import(&name, data)
+    })
+    .await
+    .map_err(|error| format!("Map import task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2472,6 +2543,24 @@ async fn open_replay_window(
     Ok(label)
 }
 
+/// Whether the map editor has changes that are not saved. Closing the main
+/// window then asks the page what to do instead of quitting.
+#[derive(Default)]
+struct UnsavedMap(std::sync::atomic::AtomicBool);
+
+#[tauri::command]
+fn map_editor_unsaved(app: AppHandle, unsaved: bool) {
+    app.state::<UnsavedMap>().0.store(unsaved, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Quits after the page has dealt with unsaved map changes.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.state::<player::PlayerSessions>().close_all();
+    app.state::<export::VideoExports>().cancel_all();
+    app.exit(0);
+}
+
 #[cfg(not(test))]
 pub fn run() {
     tauri::Builder::default()
@@ -2482,6 +2571,7 @@ pub fn run() {
         .manage(ReplayLibrary::default())
         .manage(player::PlayerSessions::default())
         .manage(export::VideoExports::default())
+        .manage(UnsavedMap::default())
         .setup(|app| {
             let local = app.path().app_cache_dir()?;
             let storage = storage::AppStorage::new(local)?;
@@ -2496,11 +2586,12 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        app_handle
-                            .state::<player::PlayerSessions>()
-                            .close_all();
-                        app_handle.state::<export::VideoExports>().cancel_all();
-                        app_handle.exit(0);
+                        if app_handle.state::<UnsavedMap>().0.load(std::sync::atomic::Ordering::Relaxed) {
+                            // The map editor asks to save or discard, then calls quit_app.
+                            let _ = app_handle.emit_to("main", "map-editor-close-requested", ());
+                            return;
+                        }
+                        quit_app(app_handle.clone());
                     }
                 });
             }
@@ -2549,6 +2640,12 @@ pub fn run() {
             read_map,
             save_map,
             create_map,
+            rename_map,
+            import_map_file,
+            import_map_from_replay,
+            replay_map_preview,
+            map_editor_unsaved,
+            quit_app,
             delete_maps,
             leaderboard_identity,
             replay_launch_request,
@@ -2896,7 +2993,7 @@ mod tests {
 
     #[test]
     fn default_map_surface_is_current_png_shape() {
-        let data = default_game_map_value("v4").unwrap();
+        let data = default_game_map_value(4).unwrap();
 
         assert_eq!(map_team_count(&data), 4);
         assert_eq!(map_dimensions(&data), (960, 540));
@@ -2914,7 +3011,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("map_test.txt");
-        let mut data = default_game_map_value("1v1").unwrap();
+        let mut data = default_game_map_value(2).unwrap();
         data.as_object_mut()
             .unwrap()
             .insert("version".to_string(), Value::Null);

@@ -29,6 +29,7 @@ src-tauri/binaries/*.exe
 src-tauri/gen/
 src-tauri/resources/player/
 engine/target/
+public/engine/
 wod-replay-server.spec
 more-of-dots-recorder.spec
 tools/python-probe-dll/target/

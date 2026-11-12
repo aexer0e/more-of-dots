@@ -123,6 +123,31 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
     case 'leaderboard_identity': result = data.identity; break;
     case 'list_replays': result = { replays: stressReplays(data.replays.slice(0, 100)) }; break;
     case 'replay_thumbnail_paths': result = []; break;
+    // The map a replay records, for the import dialog's cards. The desktop app reads
+    // official maps from the game; examples use the replay's map image instead.
+    case 'replay_map_preview': {
+      const filePath = String(args.filePath);
+      const bytes = new Uint8Array(await (await fetch(filePath)).arrayBuffer());
+      const text = bytes[0] === 0x1f && bytes[1] === 0x8b
+        ? await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text()
+        : new TextDecoder().decode(bytes);
+      const raw = JSON.parse(text) as { mode?: string; map?: unknown; custom_map?: unknown };
+      const map = (typeof raw.map === 'object' && raw.map ? raw.map : raw.custom_map) as Record<string, unknown> | undefined;
+      if (!map || !Array.isArray(map.infantry)) throw new Error('This example replay names an official map; the desktop app reads its layout from the game.');
+      let surface = typeof map.map_surface === 'string' ? map.map_surface : '';
+      if (!surface) {
+        const thumbnail = (data.replays.find((replay) => replay.filePath === filePath) as { thumbnailDataUrl?: string } | undefined)?.thumbnailDataUrl;
+        if (!thumbnail) throw new Error('No map image for this example replay.');
+        const png = new Uint8Array(await (await fetch(thumbnail)).arrayBuffer());
+        let binary = '';
+        for (let at = 0; at < png.length; at += 0x8000) binary += String.fromCharCode(...png.subarray(at, at + 0x8000));
+        surface = btoa(binary);
+      }
+      const header = Uint8Array.from(atob(surface).slice(0, 24), (character) => character.charCodeAt(0));
+      const view = new DataView(header.buffer);
+      result = { data: { ...map, map_surface: surface }, width: view.getUint32(16), height: view.getUint32(20), mode: raw.mode ?? '' };
+      break;
+    }
     case 'replay_troop_store': result = new URLSearchParams(location.search).has('notroops') ? '' : data.replays.slice(0, 100).map((replay) => JSON.stringify({ h: (replay as { hash?: string }).hash ?? replay.filePath, s: exampleTroops(replay.filePath) })).join('\n'); break;
     case 'replay_troop_lines': result = (args.filePaths as string[]).map((filePath) => ({ filePath, sides: new URLSearchParams(location.search).has('notroops') ? [] : exampleTroops(filePath) })); break;
     // The export dialog asks for a default folder and the game's sounds; examples never write videos.
@@ -134,22 +159,33 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
       const map = data.maps.find((m) => m.id === args.fileName);
       if (!map) throw new Error('Example map not found.');
       const incoming = args.data as StoredMap['data'];
-      if (args.publish && incoming.infantry.some((units, i) => units.length + incoming.tanks[i].length + incoming.motorised[i].length === 0)) {
+      if (args.publish && incoming.infantry.some((units, i) => units.length + incoming.tanks[i].length === 0)) {
         throw new Error('Each team needs at least one unit before saving to the game. You can save this map as a draft.');
       }
       map.data = args.data as StoredMap['data'];
       map.status = args.publish ? 'published' : 'draft';
       const header = Uint8Array.from(atob(map.data.map_surface).slice(0, 24), (char) => char.charCodeAt(0));
       if (header.length >= 24) { const view = new DataView(header.buffer); map.width = view.getUint32(16); map.height = view.getUint32(20); }
-      map.teamCount = Math.max(2, map.data.infantry.length, map.data.tanks.length, map.data.motorised.length);
+      map.teamCount = Math.max(2, map.data.infantry.length, map.data.tanks.length);
       map.updatedAt = Date.now(); result = map; break;
     }
     case 'create_map': {
       const { emptyMapData } = await import('../map-editor/lib/mapCodec');
       const id = `example-${Date.now()}.txt`;
-      const map: StoredMap = { id, fileName: id, name: String(args.name), data: emptyMapData(args.mode as '1v1'), width: 960, height: 540, teamCount: args.mode === 'v4' ? 4 : args.mode === 'v3' ? 3 : 2, createdAt: Date.now(), updatedAt: Date.now() };
+      const [width, height] = args.large ? [1920, 1080] : [960, 540];
+      const map: StoredMap = { id, fileName: `${String(args.name)}.txt`, name: String(args.name), data: emptyMapData(Number(args.teams) || 2, width, height), width, height, teamCount: Number(args.teams) || 2, createdAt: Date.now(), updatedAt: Date.now() };
       map.status = 'draft';
       data.maps.unshift(map); result = map; break;
+    }
+    case 'rename_map': {
+      const map = data.maps.find((m) => m.id === args.fileName);
+      if (!map) throw new Error('Map not found.');
+      const name = String(args.name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 64);
+      if (!name) throw new Error('Enter a map name with letters or numbers.');
+      if (data.maps.some((m) => m !== map && m.name.toLowerCase() === name.toLowerCase())) throw new Error(`A map named ${name} already exists.`);
+      map.name = name;
+      map.fileName = `${name}.txt`;
+      map.updatedAt = Date.now(); result = map; break;
     }
     case 'delete_maps': data.maps = data.maps.filter((m) => !(args.fileNames as string[]).includes(m.id)); result = args.fileNames; break;
     // A pretend running game; example mode never touches the real one.

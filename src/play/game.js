@@ -24,6 +24,9 @@ export const TURN_TICKS = 15;
 const TICK_MS = 1000 / 30;
 // The game's peace offer waits this many ticks before it can be made again.
 const PEACE_COOLDOWN = 1800;
+// A press on a unit that moves this many screen pixels draws an arrow, even one
+// shorter than the spacing between waypoints; less is a click that selects.
+const ARROW_DRAG_PX = 4;
 export const colors = ["blue", "red", "purple", "orange"];
 export const sideRgb = [
   [0, 0, 255],
@@ -367,6 +370,8 @@ export class Game {
         if (steps.length) break;
         const turn = relative / TURN_TICKS;
         if (!this.turns.has(turn)) {
+          // A local match makes its turns when they are due.
+          this.room?.need?.(turn);
           this.budget = Math.min(this.budget, 1);
           break;
         }
@@ -597,6 +602,8 @@ export class Game {
       shift,
       formation: event.ctrlKey,
       withhold: event.altKey,
+      client: [event.clientX, event.clientY],
+      travel: 0,
     };
   }
 
@@ -613,6 +620,8 @@ export class Game {
       return;
     }
     if (!this.gesture) return;
+    const [cx, cy] = this.gesture.client;
+    this.gesture.travel = Math.max(this.gesture.travel, Math.hypot(event.clientX - cx, event.clientY - cy));
     const world = this.toWorld(point);
     this.gesture.end = world;
     extendGesture(this.gesture.points, world);
@@ -632,6 +641,11 @@ export class Game {
     gesture.end = this.toWorld(this.canvasPoint(event));
     const units = this.myUnits().filter((dot) => this.selected.has(dot.id));
     const withhold = gesture.withhold || event.altKey;
+    if (this.shortArrow(gesture)) {
+      if (!units.length) return;
+      if (gesture.formation) return this.give(formationOrders(units, [gesture.points[0], gesture.end]), withhold);
+      return this.give(routeOrders(units, [gesture.points[0], gesture.end]), withhold);
+    }
     const dragged = gesture.points.length > 1;
     if (!dragged) {
       // A click: on a unit it only selects; elsewhere the selection moves there.
@@ -653,6 +667,12 @@ export class Game {
     this.give(routeOrders(units, gesture.points), withhold);
   }
 
+  /** Whether a gesture is an arrow drawn from a unit that ends before its first
+   * waypoint: it goes straight to where the pointer was released. */
+  shortArrow(gesture) {
+    return gesture.onUnit && gesture.points.length < 2 && gesture.travel >= ARROW_DRAG_PX;
+  }
+
   /** Whether a gesture draws a selection loop rather than an order: with nothing
    * selected, with Shift held, or when it closes around units of the side. */
   selecting(gesture, units) {
@@ -667,6 +687,7 @@ export class Game {
   preview(gesture) {
     const units = this.myUnits().filter((dot) => this.selected.has(dot.id));
     if (!units.length || this.selecting(gesture, units)) return null;
+    if (this.shortArrow(gesture)) return (gesture.formation ? formationOrders : routeOrders)(units, [gesture.points[0], gesture.end]);
     if (gesture.points.length < 2) return gesture.onUnit ? null : (gesture.withhold || this.keys.has("AltLeft") || this.keys.has("AltRight") ? gatherOrders : clickOrders)(units, gesture.end);
     if (gesture.formation) return formationOrders(units, [...gesture.points, gesture.end]);
     return routeOrders(units, [...gesture.points, gesture.end]);

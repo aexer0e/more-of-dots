@@ -24,6 +24,8 @@ flate2 = "1"
 mp4 = "0.14"
 openh264 = "0.9.9"
 png = "0.17"
+# Map imports from replays use the engine's own layouts and shock unit rule.
+replay-sim = { path = "../engine/replay-sim", default-features = false }
 # Use the same TLS provider as the updater.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }

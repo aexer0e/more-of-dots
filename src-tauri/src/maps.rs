@@ -1,8 +1,8 @@
 //! Drafts never live in the game's map scan directory. Publishing is explicit.
 use super::{
-    default_game_map_value, display_name_for_map_file, map_dimensions, map_team_count,
-    read_gzip_json_file, safe_map_file_name, safe_map_name_slug, validate_game_map_value,
-    write_gzip_json_file, GameMapRecord,
+    blank_game_map_value, default_game_map_value, display_name_for_map_file, map_dimensions,
+    map_file_stem, map_team_count, read_gzip_json_file, safe_map_file_name, safe_map_name_slug,
+    validate_game_map_value, write_gzip_json_file, GameMapRecord,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,40 @@ fn validate_terrain(data: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Removes the fields older versions of More of Dots added and the game never
+/// reads. `mode` goes: the game counts teams from the unit lists. Placed
+/// `motorised` units go back into each team's infantry at the places the engine
+/// turns infantry into shock units in experiment matches
+/// (`replay_sim::deployments::try_convert`), so they play as shocks there.
+/// When the counts do not fit that rule they are added after the infantry.
+pub(super) fn to_game_format(data: &mut Value) {
+    let Some(object) = data.as_object_mut() else { return };
+    object.remove("mode");
+    let Some(motorised) = object.remove("motorised") else { return };
+    let placed = motorised.as_array().is_some_and(|sides| sides.iter().any(|side| side.as_array().is_some_and(|units| !units.is_empty())));
+    if !placed || !object.get("infantry").is_some_and(Value::is_array) {
+        return;
+    }
+    let mut layout = object.clone();
+    layout.insert("motorised".into(), motorised.clone());
+    let entry = serde_json::json!({ "experiment": Value::Object(layout) });
+    let merged = replay_sim::deployments::try_convert(&entry, "classic")
+        .and_then(|classic| classic.get("infantry").cloned())
+        .filter(|infantry| infantry.as_array().is_some_and(|sides| sides.iter().flat_map(|side| side.as_array().into_iter().flatten()).all(|unit| !unit.is_null())));
+    let infantry = object.get_mut("infantry").unwrap();
+    match merged {
+        Some(merged) => *infantry = merged,
+        None => {
+            let sides = infantry.as_array_mut().unwrap();
+            for (side, units) in motorised.as_array().unwrap().iter().enumerate() {
+                if let (Some(list), Some(units)) = (sides.get_mut(side).and_then(Value::as_array_mut), units.as_array()) {
+                    list.extend(units.iter().cloned());
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn validate_publish(data: &Value) -> Result<(), String> {
     validate_game_map_value(data)?;
     validate_terrain(data)?;
@@ -63,12 +97,11 @@ pub(super) fn validate_publish(data: &Value) -> Result<(), String> {
 }
 
 fn validate_content(data: &Value) -> Result<(), String> {
-    let teams = match data["mode"].as_str() {
-        Some("1v1") => 2,
-        Some("v3") => 3,
-        Some("v4") => 4,
-        _ => return Err("Choose a supported map mode before saving to the game.".into()),
-    };
+    // The game has no map mode: the unit lists give the number of teams.
+    let teams = data["infantry"].as_array().map(Vec::len).unwrap_or(0);
+    if !(2..=4).contains(&teams) {
+        return Err("A map needs 2 to 4 teams.".into());
+    }
     let (width, height) = map_dimensions(data);
     let (logical_width, logical_height) = if (width, height) == (960, 540) {
         (1600, 900)
@@ -90,11 +123,7 @@ fn validate_content(data: &Value) -> Result<(), String> {
         }
     };
     let mut unit_counts = vec![0; teams];
-    for key in ["infantry", "tanks", "motorised"] {
-        // Legacy maps did not contain motorised infantry.
-        if key == "motorised" && data.get(key).is_none() {
-            continue;
-        }
+    for key in ["infantry", "tanks"] {
         let buckets = data[key]
             .as_array()
             .filter(|a| a.len() == teams)
@@ -219,23 +248,119 @@ impl MapStore {
         )
     }
 
-    pub fn create(&self, name: &str, mode: &str) -> Result<GameMapRecord, String> {
+    /// A new empty map: 960 x 540 terrain, or 1920 x 1080 when `large`.
+    pub fn create(&self, name: &str, teams: usize, large: bool) -> Result<GameMapRecord, String> {
+        let (width, height) = if large { (1920, 1080) } else { (960, 540) };
+        self.new_draft(name, blank_game_map_value(teams, width, height)?)
+    }
+
+    /// A draft made from a map file or a replay's map.
+    pub fn import(&self, name: &str, mut data: Value) -> Result<GameMapRecord, String> {
+        to_game_format(&mut data);
+        validate_game_map_value(&data)?;
+        validate_terrain(&data)?;
+        self.new_draft(name, data)
+    }
+
+    fn new_draft(&self, name: &str, data: Value) -> Result<GameMapRecord, String> {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
-        let stem = format!("map_{}_{stamp}", safe_map_name_slug(name));
-        let id = format!("draft:{stem}.json");
+        let id = format!("draft:map_{}_{stamp}.json", safe_map_name_slug(name));
+        // The file is named after the map, with a number added when that name is taken.
+        let stem = map_file_stem(name).unwrap_or_else(|_| "Untitled map".into());
+        let file_name = (1..)
+            .map(|n| if n == 1 { format!("{stem}.txt") } else { format!("{stem} {n}.txt") })
+            .find(|candidate| self.name_is_free(candidate, None))
+            .unwrap();
         self.write_draft(
             &id,
             &Draft {
-                file_name: format!("{stem}.txt"),
+                file_name,
                 source: None,
-                data: default_game_map_value(mode)?,
+                data,
                 published: false,
             },
         )?;
         self.read(&id)
+    }
+
+    /// Whether no map in the game's folders or among the drafts (other than
+    /// `except`) has this file name. Names differing only in case count as taken.
+    fn name_is_free(&self, file_name: &str, except: Option<&str>) -> bool {
+        if self.game_dirs.iter().any(|root| root.join(file_name).exists()) {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(&self.drafts) else { return true };
+        !entries.flatten().any(|entry| {
+            let id = format!("draft:{}", entry.file_name().to_string_lossy());
+            Some(id.as_str()) != except
+                && entry.path().extension().and_then(|e| e.to_str()) == Some("json")
+                && self.load_draft(&id).is_ok_and(|draft| draft.file_name.eq_ignore_ascii_case(file_name))
+        })
+    }
+
+    /// Renames a map file in a game folder, with the preview image the game keeps
+    /// beside it.
+    fn rename_game_file(&self, source: &Path, file_name: &str) -> Result<PathBuf, String> {
+        let source = self.game_path(&format!("game:{}", source.to_string_lossy()))?;
+        let target = source.with_file_name(safe_map_file_name(file_name)?);
+        let same = |a: &Path, b: &Path| a.canonicalize().ok().is_some_and(|a| b.canonicalize().ok() == Some(a));
+        if target.exists() && !same(&source, &target) {
+            return Err(format!("A map named {} already exists.", display_name_for_map_file(file_name)));
+        }
+        fs::rename(&source, &target).map_err(|e| format!("Could not rename the map: {e}"))?;
+        let (png, png_target) = (source.with_extension("png"), target.with_extension("png"));
+        if png.is_file() && (!png_target.exists() || same(&png, &png_target)) {
+            let _ = fs::rename(&png, &png_target);
+        }
+        Ok(target)
+    }
+
+    /// Gives a map a new name, which is its file name. A map in the game's folder
+    /// is renamed there, and a draft that edits it keeps following it, so the
+    /// returned record can have a new id.
+    pub fn rename(&self, id: &str, name: &str) -> Result<GameMapRecord, String> {
+        let file_name = format!("{}.txt", map_file_stem(name)?);
+        let current = self.read(id)?.file_name;
+        if current == file_name {
+            return self.read(id);
+        }
+        let draft_of_game = |path: &Path| Self::draft_id_for_source(path);
+        let except = if id.starts_with("draft:") { id.to_string() } else { draft_of_game(&self.game_path(id)?) };
+        if !current.eq_ignore_ascii_case(&file_name) && !self.name_is_free(&file_name, Some(&except)) {
+            return Err(format!("A map named {} already exists.", display_name_for_map_file(&file_name)));
+        }
+        if id.starts_with("draft:") {
+            let mut draft = self.load_draft(id)?;
+            let mut draft_id = id.to_string();
+            if let Some(source) = draft.source.clone().filter(|source| source.is_file()) {
+                let target = self.rename_game_file(&source, &file_name)?;
+                // A draft made from a game file is found by that file's path.
+                if id == draft_of_game(&source) {
+                    draft_id = draft_of_game(&target);
+                }
+                draft.source = Some(target);
+            }
+            draft.file_name = file_name;
+            self.write_draft(&draft_id, &draft)?;
+            if draft_id != id {
+                fs::remove_file(self.draft_path(id)?).map_err(|e| e.to_string())?;
+            }
+            self.read(&draft_id)
+        } else {
+            let source = self.game_path(id)?;
+            let target = self.rename_game_file(&source, &file_name)?;
+            let old = draft_of_game(&source);
+            if let Ok(mut draft) = self.load_draft(&old) {
+                draft.source = Some(target.clone());
+                draft.file_name = file_name;
+                self.write_draft(&draft_of_game(&target), &draft)?;
+                fs::remove_file(self.draft_path(&old)?).map_err(|e| e.to_string())?;
+            }
+            self.read(&format!("game:{}", target.to_string_lossy()))
+        }
     }
 
     pub fn read(&self, id: &str) -> Result<GameMapRecord, String> {
@@ -266,7 +391,8 @@ impl MapStore {
             let result = read_gzip_json_file(&path);
             (path.clone(), file_name, Some(path), result, true)
         };
-        let result = result.and_then(|data| {
+        let result = result.and_then(|mut data| {
+            to_game_format(&mut data);
             validate_game_map_value(&data)?;
             validate_terrain(&data)?;
             Ok(data)
@@ -280,7 +406,7 @@ impl MapStore {
                 };
                 (data, if published { "published" } else { "draft" }, issue)
             }
-            Err(error) => (default_game_map_value("1v1")?, "invalid", Some(error)),
+            Err(error) => (default_game_map_value(2)?, "invalid", Some(error)),
         };
         let modified = fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -368,6 +494,12 @@ impl MapStore {
                 },
             )
         };
+        // The editor was given the stored map in the game's format, so the stored
+        // copy is brought to it before the edits replace its fields; otherwise an
+        // older `motorised` list would be added to the infantry a second time.
+        to_game_format(&mut draft.data);
+        let mut data = data;
+        to_game_format(&mut data);
         if let (Some(existing), Some(incoming)) = (draft.data.as_object_mut(), data.as_object()) {
             existing.extend(incoming.clone());
         } else {
@@ -450,7 +582,7 @@ mod tests {
     }
 
     fn playable() -> Value {
-        let mut map = default_game_map_value("1v1").unwrap();
+        let mut map = default_game_map_value(2).unwrap();
         map["infantry"] = json!([[[100, 100]], [[1400, 800]]]);
         map["cities"] = json!([[200, 200], [1300, 700]]);
         map["capitals"] = json!([0, 1]);
@@ -461,7 +593,7 @@ mod tests {
     #[test]
     fn empty_draft_never_enters_game_folder_even_after_save_or_rejected_publish() {
         let (_root, store) = store();
-        let draft = store.create("Unfinished", "1v1").unwrap();
+        let draft = store.create("Unfinished", 2, false).unwrap();
         assert_eq!(draft.status, "draft");
         assert!(draft.game_file_path.is_none());
         store.save(&draft.id, draft.data.clone(), false).unwrap();
@@ -477,7 +609,7 @@ mod tests {
     fn drafts_work_without_a_game_installation() {
         let root = tempfile::tempdir().unwrap();
         let store = MapStore::new(root.path().join("drafts"), vec![]).unwrap();
-        let draft = store.create("offline", "1v1").unwrap();
+        let draft = store.create("offline", 2, false).unwrap();
         let saved = store.save(&draft.id, playable(), false).unwrap();
         assert!(store
             .save(&saved.id, saved.data, true)
@@ -489,11 +621,11 @@ mod tests {
     #[test]
     fn incomplete_edits_and_failed_publish_preserve_last_published_bytes() {
         let (_root, store) = store();
-        let draft = store.create("test", "1v1").unwrap();
+        let draft = store.create("test", 2, false).unwrap();
         let published = store.save(&draft.id, playable(), true).unwrap();
         let path = PathBuf::from(published.game_file_path.unwrap());
         let bytes = fs::read(&path).unwrap();
-        let incomplete = default_game_map_value("1v1").unwrap();
+        let incomplete = default_game_map_value(2).unwrap();
         store.save(&draft.id, incomplete.clone(), false).unwrap();
         assert!(store.save(&draft.id, incomplete, true).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -513,7 +645,7 @@ mod tests {
         write_gzip_json_file(&path, &original).unwrap();
         let id = format!("game:{}", path.to_string_lossy());
         let draft = store
-            .save(&id, default_game_map_value("1v1").unwrap(), false)
+            .save(&id, default_game_map_value(2).unwrap(), false)
             .unwrap();
         assert_eq!(read_gzip_json_file(&path).unwrap(), original);
         assert_eq!(draft.data["future_field"], original["future_field"]);
@@ -529,7 +661,7 @@ mod tests {
             if malformed {
                 fs::write(&path, b"broken gzip").unwrap();
             } else {
-                write_gzip_json_file(&path, &default_game_map_value("1v1").unwrap()).unwrap();
+                write_gzip_json_file(&path, &default_game_map_value(2).unwrap()).unwrap();
             }
             let png = path.with_extension("png");
             fs::write(&png, b"original thumbnail").unwrap();
@@ -549,9 +681,9 @@ mod tests {
     #[test]
     fn deleting_a_game_map_preserves_an_existing_unsaved_draft() {
         let (_root, store) = store();
-        let draft = store.create("test", "1v1").unwrap();
+        let draft = store.create("test", 2, false).unwrap();
         let published = store.save(&draft.id, playable(), true).unwrap();
-        let empty = default_game_map_value("1v1").unwrap();
+        let empty = default_game_map_value(2).unwrap();
         store.save(&draft.id, empty.clone(), false).unwrap();
         let game_id = format!("game:{}", published.game_file_path.unwrap());
         store.delete(&[game_id]).unwrap();
@@ -566,14 +698,13 @@ mod tests {
     fn publishing_rejects_bad_geometry_teams_capitals_and_png() {
         validate_publish(&playable()).unwrap();
         let mut legacy = playable();
-        legacy.as_object_mut().unwrap().remove("motorised");
         legacy["bridges"] = json!([[10, 10, 20, 20]]);
         validate_publish(&legacy).unwrap();
         for (key, value) in [
             ("infantry", json!([[], []])),
             ("tanks", json!([[]])),
-            ("motorised", json!(null)),
-            ("mode", json!("unknown")),
+            ("infantry", json!([[[100, 100]]])),
+            ("tanks", json!([[], [], []])),
             ("cities", json!([[1600, 900]])),
             ("cities", json!([["x", 0]])),
             ("capitals", json!([2])),
@@ -596,6 +727,35 @@ mod tests {
     }
 
     #[test]
+    fn maps_keep_only_fields_the_game_reads_and_shock_units_rejoin_the_infantry() {
+        let (_root, store) = store();
+        let mut old = playable();
+        old["mode"] = json!("v4");
+        // Five infantry and one shock unit: the shock unit becomes the last infantry,
+        // which experiment matches turn back into a shock unit.
+        old["infantry"] = json!([(0..5).map(|i| json!([100 + i, 100])).collect::<Vec<_>>(), [[1400, 800]]]);
+        old["motorised"] = json!([[[50, 50]], []]);
+        let path = store.game_dirs[0].join("old.txt");
+        write_gzip_json_file(&path, &old).unwrap();
+        let read = store.read(&format!("game:{}", path.display())).unwrap();
+        assert!(read.data.get("mode").is_none() && read.data.get("motorised").is_none());
+        assert_eq!(read.data["infantry"][0].as_array().unwrap().len(), 6);
+        assert_eq!(read.data["infantry"][0][5], json!([50, 50]));
+        assert_eq!(read.data["future_field"], json!({"keep": true}));
+        // Saving the map as the editor read it does not add the shock unit again.
+        let saved = store.save(&read.id, read.data.clone(), true).unwrap();
+        let written = read_gzip_json_file(&path).unwrap();
+        assert_eq!(written["infantry"], read.data["infantry"]);
+        assert!(written.get("mode").is_none() && written.get("motorised").is_none());
+        assert_eq!(saved.team_count, 2);
+        // Counts that do not fit the rule add the shock units after the infantry.
+        let mut uneven = playable();
+        uneven["motorised"] = json!([[[1, 1], [2, 2]], []]);
+        to_game_format(&mut uneven);
+        assert_eq!(uneven["infantry"][0], json!([[100, 100], [1, 1], [2, 2]]));
+    }
+
+    #[test]
     fn ids_cannot_escape_storage_or_overwrite_an_unrelated_map() {
         let (root, store) = store();
         let outside = root.path().join("outside.txt");
@@ -605,7 +765,7 @@ mod tests {
         assert!(store
             .save("draft:../outside.json", playable(), false)
             .is_err());
-        let draft = store.create("test", "1v1").unwrap();
+        let draft = store.create("test", 2, false).unwrap();
         let target = store.game_dirs[0].join(&draft.file_name);
         fs::write(&target, b"another map").unwrap();
         assert!(store.save(&draft.id, playable(), true).is_err());
@@ -616,7 +776,7 @@ mod tests {
     #[test]
     fn deletion_of_published_draft_removes_game_and_thumbnail() {
         let (_root, store) = store();
-        let draft = store.create("test", "1v1").unwrap();
+        let draft = store.create("test", 2, false).unwrap();
         let published = store.save(&draft.id, playable(), true).unwrap();
         let path = PathBuf::from(published.game_file_path.unwrap());
         fs::write(path.with_extension("png"), b"thumbnail").unwrap();
@@ -626,6 +786,50 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         assert_eq!(fs::read_dir(&store.drafts).unwrap().count(), 0);
         assert_eq!(fs::read_dir(&store.game_dirs[0]).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn new_maps_are_named_after_the_map_and_can_be_large() {
+        let (_root, store) = store();
+        let first = store.create("Island war", 2, false).unwrap();
+        let second = store.create("Island war", 3, true).unwrap();
+        assert_eq!(first.file_name, "Island war.txt");
+        assert_eq!(first.name, "Island war");
+        assert_eq!((first.width, first.height), (960, 540));
+        assert_eq!(second.file_name, "Island war 2.txt");
+        assert_eq!((second.width, second.height, second.team_count), (1920, 1080, 3));
+    }
+
+    #[test]
+    fn renaming_moves_game_files_and_keeps_drafts_attached() {
+        let (_root, store) = store();
+        // A draft that is not in the game yet.
+        let draft = store.create("test", 2, false).unwrap();
+        let renamed = store.rename(&draft.id, "  Coast / line  ").unwrap();
+        assert_eq!((renamed.id.as_str(), renamed.name.as_str()), (draft.id.as_str(), "Coast line"));
+        // Publishing uses the new name, and renaming again renames the game file and its preview.
+        let published = store.save(&draft.id, playable(), true).unwrap();
+        let path = PathBuf::from(published.game_file_path.unwrap());
+        assert!(path.ends_with("Coast line.txt"));
+        fs::write(path.with_extension("png"), b"thumbnail").unwrap();
+        let moved = store.rename(&draft.id, "Coast").unwrap();
+        let moved_path = PathBuf::from(moved.game_file_path.unwrap());
+        assert!(moved_path.ends_with("Coast.txt") && !path.exists());
+        assert_eq!(fs::read(moved_path.with_extension("png")).unwrap(), b"thumbnail");
+        assert_eq!(moved.status, "published");
+        // A map only in the game folder, with an unsaved draft of it.
+        let game = store.game_dirs[0].join("old.txt");
+        write_gzip_json_file(&game, &playable()).unwrap();
+        let edited = store.save(&format!("game:{}", game.to_string_lossy()), playable(), false).unwrap();
+        let record = store.rename(&format!("game:{}", game.to_string_lossy()), "New").unwrap();
+        assert!(record.id.ends_with("New.txt") && !game.exists());
+        assert!(store.load_draft(&edited.id).is_err());
+        let draft = store.load_draft(&MapStore::draft_id_for_source(&store.game_dirs[0].join("New.txt"))).unwrap();
+        assert_eq!(draft.file_name, "New.txt");
+        // Taken names and empty names are refused.
+        assert!(store.rename(&record.id, "coast").unwrap_err().contains("already exists"));
+        assert!(store.rename(&record.id, "  ///  ").is_err());
+        assert_eq!(store.list().unwrap().len(), 3);
     }
 
     #[test]
@@ -641,7 +845,7 @@ mod tests {
     #[test]
     fn corrupt_draft_does_not_hide_other_maps_and_can_be_deleted() {
         let (_root, store) = store();
-        store.create("good", "1v1").unwrap();
+        store.create("good", 2, false).unwrap();
         fs::write(store.drafts.join("broken.json"), b"broken json").unwrap();
         let maps = store.list().unwrap();
         assert_eq!(maps.len(), 2);
@@ -659,7 +863,7 @@ mod tests {
     #[test]
     fn external_game_changes_are_visible_and_not_deleted_with_the_older_draft() {
         let (_root, store) = store();
-        let draft = store.create("test", "1v1").unwrap();
+        let draft = store.create("test", 2, false).unwrap();
         let published = store.save(&draft.id, playable(), true).unwrap();
         let path = PathBuf::from(published.game_file_path.unwrap());
         fs::write(&path, b"externally damaged").unwrap();

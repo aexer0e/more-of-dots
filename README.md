@@ -8,11 +8,13 @@ Version 2.0.0 includes an independent replay player and video exporter in the de
 - Save independent replay simulations and export MP4 videos
 - Back up discovered replays automatically
 - Follow global leaderboards, track your progress, and compare players
-- Create and edit custom maps, including motorised infantry
+- Create and edit custom maps, and try them in a test match
 
 More of Dots runs on Windows and on macOS with Apple silicon. A Linux AppImage is also built, for playing the game through Steam's Proton; it is less tested. Region selection is available on Windows only; elsewhere its tab is shown but cannot be opened.
 
 ## Custom maps
+
+The editor saves maps in the game's format: terrain, infantry, tanks, cities, capitals and bridges. A map has 2 to 4 teams. Shock units are not placed; experiment matches turn every fifth infantry, counted from the last, into a shock unit, and the editor shows which ones. Adding infantry does not change which units already placed become shock units. A team's first city becomes its capital. Terrain is painted with a brush, line, curve, shapes (rectangle, ellipse, polygon), lasso, paint bucket and a smoothing brush that straightens jagged edges without adding colours the game does not use. **Run** plays the map from its first frame with the game's controls. Units of every team take orders, and the selected team's economy is shown; production is locked in a test match.
 
 New maps and **Save draft** stay in More of Dots under `%APPDATA%\local.more-of-dots\map-drafts`. **Save to game** checks the map before publishing it to War of Dots. Each team needs at least one unit. Saving unfinished edits as a draft leaves the last published copy intact.
 

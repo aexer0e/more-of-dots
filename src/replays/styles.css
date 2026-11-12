@@ -122,3 +122,34 @@ button.winner-name { font-weight: var(--fw-bold); }
 .add-replays-drop small { color: var(--muted); font-size: var(--fs-md); }
 .add-replays-drop.is-empty { border-color: var(--line-strong); }
 .add-replays-drop.is-empty > svg { stroke: var(--muted); }
+
+/* Import from .rep (map editor): the add-replays dialog with two tabs. */
+.map-import-dialog { max-width: 600px; }
+.map-import-note { margin: -8px 0 0; color: var(--muted); font-size: var(--fs-sm); }
+.map-import-tabs { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
+.map-import-tabs button { flex: 1; height: 32px; border: 0; border-radius: calc(var(--r-md) - 2px); background: transparent; color: var(--muted); font: inherit; font-weight: var(--fw-medium); cursor: pointer; }
+.map-import-tabs button[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--line-strong); }
+.map-import-library { display: flex; flex-direction: column; gap: var(--s-2); }
+.map-import-library .add-replays-link-field input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; }
+.map-import-list { margin: 0; padding: 0; list-style: none; max-height: 340px; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
+.map-import-list li + li { border-top: 1px solid var(--line); }
+.map-import-list button { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; width: 100%; padding: 9px 12px; border: 0; background: transparent; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.map-import-list button:hover:not(:disabled), .map-import-list button:focus-visible { background: rgba(90, 146, 196, 0.1); outline: 0; }
+.map-import-list button:disabled { cursor: progress; opacity: 0.6; }
+.map-import-title { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-import-detail { grid-column: 1; color: var(--muted); font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-import-meta { grid-column: 2; grid-row: 1 / span 2; align-self: center; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; }
+.map-import-empty { margin: 0; padding: 12px; color: var(--muted); font-size: var(--fs-sm); text-align: center; }
+.map-import-dialog:has(.map-import-grid) { max-width: 760px; }
+.map-import-grid { margin: 0; padding: 2px; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; max-height: min(62vh, 560px); overflow-y: auto; }
+.map-import-card { display: grid; gap: 3px; width: 100%; padding: 0 0 9px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); color: var(--text); font: inherit; text-align: left; cursor: pointer; overflow: hidden; }
+.map-import-card:hover:not(:disabled), .map-import-card:focus-visible { border-color: var(--accent); outline: 0; }
+.map-import-card:disabled { cursor: default; opacity: 0.55; }
+.map-import-card > span:not(.map-import-thumb) { padding: 0 10px; }
+.map-import-thumb { position: relative; display: block; aspect-ratio: 16 / 9; margin-bottom: 5px; background: #0b0e0d; }
+.map-import-thumb canvas { display: block; width: 100%; height: 100%; }
+.map-import-thumb[data-state="waiting"] canvas, .map-import-thumb[data-state="failed"] canvas { visibility: hidden; }
+.map-import-thumb-note { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: var(--fs-sm); }
+.map-import-teams { position: absolute; right: 6px; top: 6px; padding: 1px 7px; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 11px; }
+.map-import-card .map-import-meta { grid-column: auto; grid-row: auto; color: var(--muted); font-size: var(--fs-sm); }
+.map-import-count { position: absolute; left: 6px; top: 6px; padding: 1px 7px; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 11px; }

@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useRef, useState, type KeyboardEvent } from 'react';
 import { CANVAS_HEIGHT, CANVAS_WIDTH, CAPITAL_SIZE, CITY_SIZE, SPRITE_SIZE, teamColorForIndex } from '../lib/constants';
-import { modeLabel, formatUpdatedAt } from '../lib/mapCodec';
+import { formatUpdatedAt } from '../lib/mapCodec';
 import type { StoredMap } from '../lib/types';
 import { spriteAssets, uiAssets } from '../lib/assets';
 
@@ -11,6 +11,70 @@ interface MapLibraryProps {
   onRefresh: () => void;
   onDeleteSelected: (fileNames: string[]) => void;
   onEdit: (mapId: string) => void;
+  /** Renames a map; rejects with a message when the name cannot be used. */
+  onRename: (map: StoredMap, name: string) => Promise<void>;
+}
+
+/** A map's name; clicking it edits the name in place. Enter or leaving the field
+ * saves it, Escape keeps the old one. */
+function MapName({ map, disabled, onRename }: { map: StoredMap; disabled: boolean; onRename: MapLibraryProps['onRename'] }) {
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  // Enter disables the field, which also blurs it; one rename is sent.
+  const sending = useRef(false);
+
+  async function commit(value: string) {
+    if (sending.current) return;
+    const name = value.trim();
+    if (!name || name === map.name) {
+      setEditing(false);
+      setError('');
+      return;
+    }
+    setBusy(true);
+    sending.current = true;
+    try {
+      await onRename(map, name);
+      setEditing(false);
+      setError('');
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      sending.current = false;
+      setBusy(false);
+    }
+  }
+
+  if (!editing)
+    return (
+      <h4 title={map.name}>
+        <button className="map-name-button" type="button" disabled={disabled} title="Rename the map" onClick={() => { setError(''); setEditing(true); }}>
+          {map.name}
+        </button>
+      </h4>
+    );
+
+  return (
+    <div className="map-name-edit">
+      <input
+        aria-label={`New name for ${map.name}`}
+        autoFocus
+        className="map-name-input"
+        defaultValue={map.name}
+        disabled={busy}
+        maxLength={64}
+        onBlur={(event) => { if (!error) void commit(event.currentTarget.value); }}
+        onFocus={(event) => event.currentTarget.select()}
+        onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
+          if (event.key === 'Enter') void commit(event.currentTarget.value);
+          if (event.key === 'Escape') { setEditing(false); setError(''); }
+        }}
+        onChange={() => error && setError('')}
+      />
+      {error ? <p className="dialog-error map-name-error" role="alert">{error}</p> : null}
+    </div>
+  );
 }
 
 function thumbnailCoordinateX(map: StoredMap, x: number) {
@@ -94,25 +158,6 @@ function MapThumbnail({ map }: { map: StoredMap }) {
               />
             ));
           })}
-          {map.data.motorised.flatMap((team, teamIndex) => {
-            const teamColor = teamColorForIndex(teamIndex);
-            const sprite = spriteAssets[teamColor].motorised;
-            return team.map(([x, y], unitIndex) => (
-              <img
-                alt=""
-                className="map-thumb-sprite"
-                draggable={false}
-                key={`motorised-${teamIndex}-${unitIndex}`}
-                  src={sprite}
-                  style={{
-                  height: `${thumbnailPercentHeight(map, thumbnailIconSize(map, SPRITE_SIZE))}%`,
-                  left: `${thumbnailPercentX(map, x)}%`,
-                  top: `${thumbnailPercentY(map, y)}%`,
-                  width: `${thumbnailPercentWidth(map, thumbnailIconSize(map, SPRITE_SIZE))}%`,
-                }}
-              />
-            ));
-          })}
           {map.data.cities.map(([x, y], cityIndex) => {
             const isCapital = capitalIndexes.has(cityIndex);
             const size = thumbnailIconSize(map, isCapital ? CAPITAL_SIZE : CITY_SIZE);
@@ -155,6 +200,7 @@ export function MapLibrary({
   onRefresh,
   onDeleteSelected,
   onEdit,
+  onRename,
 }: MapLibraryProps) {
   const [selecting, setSelecting] = useState(false);
   const [selectedMapIds, setSelectedMapIds] = useState<Set<string>>(() => new Set());
@@ -264,14 +310,14 @@ export function MapLibrary({
                       <span aria-hidden="true" className="map-status-dot" />
                       {map.status === 'draft' ? 'Draft' : map.status === 'invalid' ? 'Unreadable map' : 'In game'}
                     </span>
-                    <span className="map-mode-pill" title={`${modeLabel(map.data.mode)} / ${map.teamCount} teams`}>
-                      {map.data.mode === 'v3' ? '3P' : map.data.mode === 'v4' ? '4P' : '1v1'}
+                    <span className="map-mode-pill" title={`${map.teamCount} teams`}>
+                      {map.teamCount} teams
                     </span>
                   </span>
                 </button>
                 <div className="map-card-body">
                   <div className="map-card-head">
-                    <h4 title={map.name}>{map.name}</h4>
+                    <MapName map={map} disabled={selecting || map.status === 'invalid'} onRename={onRename} />
                     <div className="map-card-actions">
                       {selecting ? (
                         <button className="secondary-button compact" type="button" aria-pressed={selected} onClick={() => toggleMapSelection(map.id)}>

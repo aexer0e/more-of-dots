@@ -1,15 +1,13 @@
-export type Mode = '1v1' | 'v3' | 'v4';
-
 export type Point = [number, number];
 
 export type Bridge = [Point, Point];
 
+/** The fields War of Dots reads from a map file. The number of teams is the
+ * number of unit lists; experiment matches turn some infantry into shock units. */
 export interface MapData {
   map_surface: string;
-  mode: Mode;
   infantry: Point[][];
   tanks: Point[][];
-  motorised: Point[][];
   cities: Point[];
   capitals: number[];
   bridges: Bridge[];
@@ -46,7 +44,6 @@ export type ToolId =
   | 'select'
   | 'infantry'
   | 'tank'
-  | 'motorised'
   | 'city'
   | 'capital'
   | 'bridge'

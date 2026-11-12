@@ -140,10 +140,12 @@ export async function seedExamples() {
       const vanilla = await catalog.isVanilla(raw);
       const mapIdentity = await catalog.identity(raw);
       replays.push({ ...mapIdentity, fileName: file.name, filePath: '/__examples/replays/' + file.name, hash: hash(bytes), version: raw.version, mode: raw.mode ?? null, teamSize: Math.max(1, ...(raw.player_usernames ?? []).map(side => Array.isArray(side) ? side.length : 1)), players: players.map((p) => ({ ...p, winner: winner === p.teamIndex })).sort((a, b) => Number(b.teamIndex === perspective) - Number(a.teamIndex === perspective) || Number(b.name === identity) - Number(a.name === identity)), draw: raw.result === 0.5, length: `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`, durationSeconds: seconds, modified: Math.floor(file.modified / 1000), eventLabel: vanilla ? null : 'Custom', thumbnailDataUrl: png ? await image(png) : null });
-      // Recent replay layouts include the new maps and Shock units for editor testing.
+      // Recent replay layouts include the new maps for editor testing. Experiment layouts list
+      // shock units apart; the editor puts them back among the infantry, as the game stores them.
       if (png && typeof raw.map === 'object' && maps.length < 12) {
-        const data = { ...raw.map, map_surface: png.toString('base64'), mode: raw.map.mode ?? (sides === 4 ? 'v4' : sides === 3 ? 'v3' : '1v1'), motorised: raw.map.motorised ?? Array.from({ length: sides }, () => []) };
+        const data = { ...raw.map, map_surface: png.toString('base64') };
         delete data.path;
+        delete data.mode;
         const id = `replay-map-${maps.length + 1}.txt`;
         await fs.writeFile(path.join(dataDir, 'maps', id), JSON.stringify(data));
         maps.push({ id, fileName: id, name: raw.map.path ? path.basename(raw.map.path, '.png').replaceAll('_', ' ') : `Custom ${maps.length + 1}`, data, width: png.readUInt32BE(16), height: png.readUInt32BE(20), teamCount: sides, createdAt: file.modified, updatedAt: file.modified });
@@ -160,7 +162,7 @@ export async function seedExamples() {
       if (!data.map_surface) continue;
       const png = Buffer.from(data.map_surface, 'base64');
       await fs.writeFile(path.join(dataDir, 'maps', file.name), bytes);
-      maps.push({ id: file.name, fileName: file.name, name: file.name.replace(/\.txt$/, '').replaceAll('_', ' '), data, width: png.readUInt32BE(16), height: png.readUInt32BE(20), teamCount: Math.max(2, data.infantry?.length ?? 0, data.tanks?.length ?? 0, data.motorised?.length ?? 0), createdAt: file.modified, updatedAt: file.modified });
+      maps.push({ id: file.name, fileName: file.name, name: file.name.replace(/\.txt$/, '').replaceAll('_', ' '), data, width: png.readUInt32BE(16), height: png.readUInt32BE(20), teamCount: Math.max(2, data.infantry?.length ?? 0, data.tanks?.length ?? 0), createdAt: file.modified, updatedAt: file.modified });
     } catch { /* Ignore unrelated editor files. */ }
   }
   let leaderboard = previous?.leaderboard;

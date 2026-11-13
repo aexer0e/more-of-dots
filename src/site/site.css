@@ -1287,3 +1287,19 @@ a.match:hover {
     padding: 0 16px;
   }
 }
+
+/* The world map's way in: a faint globe at the foot of the home page. */
+.world-egg {
+  display: block;
+  margin: 8px auto 0;
+  padding: 6px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  opacity: 0.25;
+  cursor: pointer;
+  line-height: 0;
+  transition: opacity 0.2s;
+}
+.world-egg:hover, .world-egg:focus-visible { opacity: 0.8; }
+.world-egg:disabled { cursor: progress; }

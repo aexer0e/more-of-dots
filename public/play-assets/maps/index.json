@@ -1,0 +1,13 @@
+[
+  {
+    "id": "zolamare",
+    "name": "Zolamare",
+    "layouts": [
+      {
+        "id": "zolamare-world",
+        "name": "World",
+        "about": "The whole world at the scale of a 1080p map: thirty provinces, 2000 units a side."
+      }
+    ]
+  }
+]

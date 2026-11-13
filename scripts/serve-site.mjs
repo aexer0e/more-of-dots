@@ -15,6 +15,7 @@ const types = {
   ".json": "application/json",
   ".png": "image/png",
   ".jpg": "image/jpeg",
+  ".webp": "image/webp",
   ".svg": "image/svg+xml",
   ".wasm": "application/wasm",
   ".mp3": "audio/mpeg",

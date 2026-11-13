@@ -47,9 +47,11 @@ const executable = `replay-sim${windows ? ".exe" : ""}`;
 fs.copyFileSync(path.join(engine, "target", "release", executable), path.join(destination, executable));
 if (!windows) fs.chmodSync(path.join(destination, executable), 0o755);
 // The map editor's test matches run the WebAssembly engine in the app's window.
-run("cargo", ["build", "--release", "--quiet", "--manifest-path", path.join(engine, "Cargo.toml"), "-p", "replay-sim-web", "--target", "wasm32-unknown-unknown"], "WebAssembly engine compilation failed. It needs Rust's wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown).");
+run("cargo", ["build", "--release", "--quiet", "--manifest-path", path.join(engine, "Cargo.toml"), "-p", "replay-sim-web", "-p", "mass-sim-web", "--target", "wasm32-unknown-unknown"], "WebAssembly engine compilation failed. It needs Rust's wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown).");
 fs.mkdirSync(path.join(root, "public", "engine"), { recursive: true });
 fs.copyFileSync(path.join(engine, "target", "wasm32-unknown-unknown", "release", "replay_sim_web.wasm"), path.join(root, "public", "engine", "replay-sim.wasm"));
+// The big maps' engine, made for thousands of units.
+fs.copyFileSync(path.join(engine, "target", "wasm32-unknown-unknown", "release", "mass_sim_web.wasm"), path.join(root, "public", "engine", "mass-sim.wasm"));
 // Maps for replays that only name an official map; the game's own images take precedence.
 fs.cpSync(path.join(engine, "maps"), path.join(destination, "maps"), {
   recursive: true, filter: (source) => fs.statSync(source).isDirectory() || source.endsWith(".png"),

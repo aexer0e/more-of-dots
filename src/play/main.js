@@ -78,30 +78,52 @@ const namesBySide = () => {
   return names;
 };
 
+// The lobby shown over a running match, where a watcher asks to join a side.
+let picking = false;
+function setPicking(open) {
+  picking = open;
+  document.body.toggleAttribute("data-picking", open);
+  if (open) renderLobby();
+  renderSeating();
+}
+
 function renderLobby() {
   if (!lobby) return;
   const you = me(),
-    host = you?.host;
+    host = you?.host,
+    started = lobby.started,
+    asked = you?.request ?? null;
   const link = roomLink(lobby.code);
   // The match starts once every side has a connected player.
   const ready = Array.from({ length: lobby.sides }, (_, side) => lobby.players.some((p) => p.side === side && p.online)).every(Boolean);
   const seats = Array.from({ length: lobby.sides }, (_, side) => {
     const seated = lobby.players.filter((p) => p.side === side);
-    return `<button class="seat${you?.side === side ? " chosen" : ""}" data-side="${side}" style="--side:var(--${colors[side]})" ${lobby.started ? "disabled" : ""}>
-      <span class="swatch"></span><b>${sideNames[side]}</b><span class="who">${seated.map((p) => escape(p.name) + (p.online ? "" : " (away)")).join(", ")}</span></button>`;
+    return `<button class="seat${you?.side === side ? " chosen" : ""}${asked === side ? " asked" : ""}" data-side="${side}" style="--side:var(--${colors[side]})">
+      <span class="swatch"></span><b>${sideNames[side]}</b><span class="who">${seated.map((p) => escape(p.name) + (p.online ? "" : " (away)")).join(", ")}${asked === side ? `${seated.length ? ", " : ""}${escape(you.name)} (asked)` : ""}</span></button>`;
   }).join("");
   const watching = lobby.players.filter((p) => p.side === null);
   // Typing in the name field survives the lobby redrawing around it.
   const typing = document.activeElement?.id === "name" ? { value: $("name").value, at: $("name").selectionStart } : null;
+  // Once the match runs, choosing a side asks the host.
+  const actions = !started
+    ? host
+      ? `<button id="start" class="primary" ${!ready ? "disabled" : ""}>Start match</button>${ready ? "" : `<span class="muted">Waiting for a player on every side.</span>`}`
+      : `<span class="muted">The host starts the match.</span>`
+    : asked !== null
+      ? `<button id="close">Close</button><span class="muted">Waiting for the host to let you join ${sideNames[asked]}.</span>`
+      : you?.side !== null && you?.side !== undefined
+        ? `<button id="close">Close</button>`
+        : `<span class="muted">${host ? "Choose a side to join it, or watch." : "Choose a side to ask the host, or watch."}</span>`;
   ui.innerHTML = `
-    <h1>Play from ${matchTime(lobby.frame)}</h1>
-    <p class="muted">${escape(replayName)}</p>
+    ${started ? `<h1>Join the match</h1>
+    <p class="muted">${escape(replayName)}</p>` : lobby.frame ? `<h1>Play from ${matchTime(lobby.frame)}</h1>
+    <p class="muted">${escape(replayName)}</p>` : `<h1>${escape(replayName)}</h1>`}
     <label class="field"><span>Your name</span><input id="name" maxlength="24" autocomplete="off" spellcheck="false" value="${escape(typing?.value ?? you?.name ?? "")}"></label>
     <label class="field"><span>Room link</span><span class="copy"><input id="link" readonly value="${escape(link)}"><button id="copy">Copy</button></span></label>
     <div class="seats">${seats}</div>
-    <button class="seat watch${you?.side === null ? " chosen" : ""}" data-side="none" ${lobby.started ? "disabled" : ""}><b>Watch</b><span class="who">${watching.map((p) => escape(p.name)).join(", ")}</span></button>
-    <div class="actions">${host ? `<button id="start" class="primary" ${lobby.started || !ready ? "disabled" : ""}>Start match</button>${ready ? "" : `<span class="muted">Waiting for a player on every side.</span>`}` : `<span class="muted">The host starts the match.</span>`}</div>
-    <p id="status" class="status" role="status"></p>`;
+    <button class="seat watch${you?.side === null && asked === null ? " chosen" : ""}" data-side="none"><b>Watch</b><span class="who">${watching.map((p) => escape(p.name)).join(", ")}</span></button>
+    <div class="actions">${actions}</div>
+    <p id="status" class="status" role="status">${started ? escape(seatingNote) : ""}</p>`;
   const name = $("name");
   if (typing) {
     name.focus();
@@ -129,12 +151,70 @@ function renderLobby() {
     $("copy").textContent = "Copied";
   };
   for (const button of ui.querySelectorAll(".seat"))
-    button.onclick = () => room.send({ type: "side", side: button.dataset.side === "none" ? null : Number(button.dataset.side) });
+    button.onclick = () => {
+      const side = button.dataset.side === "none" ? null : Number(button.dataset.side);
+      if (!started) return room.send({ type: "side", side });
+      if (side === null) {
+        // Watching withdraws a request.
+        if (me()?.request !== null) room.send({ type: "request", side: null });
+        return setPicking(false);
+      }
+      if (side === me()?.side) return setPicking(false);
+      room.send({ type: "request", side });
+    };
+  if ($("close")) $("close").onclick = () => setPicking(false);
   if ($("start"))
     $("start").onclick = () => {
       if (!ready) return status("Every side needs a player.");
       room.send({ type: "start" });
     };
+}
+
+// Over a running match: a watcher asks to join a side, and the host answers.
+const seating = document.createElement("div");
+seating.id = "seating";
+seating.className = "seating";
+seating.setAttribute("aria-live", "polite");
+document.body.append(seating);
+let seatingNote = "",
+  seatingNoteTimer = null;
+
+function noteSeating(message) {
+  seatingNote = message;
+  clearTimeout(seatingNoteTimer);
+  seatingNoteTimer = setTimeout(() => {
+    seatingNote = "";
+    renderSeating();
+  }, 4000);
+  renderSeating();
+}
+
+function renderSeating() {
+  const you = me();
+  if (picking && lobby?.started) renderLobby();
+  if (!lobby?.started || !game?.started || game.ended || !you) {
+    seating.innerHTML = "";
+    return;
+  }
+  const swatch = (side) => `<span class="swatch" style="--side:var(--${colors[side]})"></span>`;
+  const cards = [];
+  if (you.host)
+    for (const player of lobby.players)
+      if (player.request !== null && player.request !== undefined && player.id !== you.id)
+        cards.push(`<div class="seating-card">${swatch(player.request)}<span><b>${escape(player.name)}</b> wants to join ${sideNames[player.request]}</span>
+          <button class="primary" data-answer="${player.id}" data-accept="1">Accept</button><button data-answer="${player.id}">Decline</button></div>`);
+  if (you.side === null && !picking) {
+    if (you.request !== null && you.request !== undefined)
+      cards.push(`<div class="seating-card">${swatch(you.request)}<span>Asked the host to join ${sideNames[you.request]}</span><button data-request="none">Cancel</button></div>`);
+    else cards.push(`<div class="seating-card"><span>Watching</span><button data-join>Join...</button></div>`);
+  }
+  if (seatingNote && !picking) cards.push(`<div class="seating-card note">${escape(seatingNote)}</div>`);
+  seating.innerHTML = cards.join("");
+  for (const button of seating.querySelectorAll("[data-answer]"))
+    button.onclick = () => room.send({ type: "answer", player: Number(button.dataset.answer), accept: !!button.dataset.accept });
+  for (const button of seating.querySelectorAll("[data-request]"))
+    button.onclick = () => room.send({ type: "request", side: button.dataset.request === "none" ? null : Number(button.dataset.request) });
+  for (const button of seating.querySelectorAll("[data-join]")) button.onclick = () => setPicking(true);
 }
 
 async function startGame(replay) {
@@ -157,6 +237,7 @@ async function startGame(replay) {
     document.body.dataset.screen = early.started || lobby?.started ? "match" : "lobby";
     if (early.started || lobby?.started) game.start(0);
     for (const turn of early.turns.splice(0)) game.addTurn(turn);
+    renderSeating();
   } catch (error) {
     showError(error.message);
   }
@@ -172,11 +253,12 @@ function keepMatch() {
     end: game.ended.tick,
     result: game.ended.result,
     names: namesBySide(),
-  }).then(async (bytes) => (await addReplay(new File([bytes], `${replayName.replace(/\.rep$/i, "")} continued.rep`))).record);
+  }).then(async (bytes) => (await addReplay(new File([bytes], `${replayName.replace(/\.rep$/i, "")}${game.startFrame ? " continued" : ""}.rep`))).record);
   return kept;
 }
 
 function showEnd() {
+  renderSeating();
   const panel = $("end");
   panel.hidden = false;
   panel.innerHTML = `<div class="end-actions"><button id="share" class="primary">Copy link</button><button id="save">Download</button><button id="exit">Leave</button></div>
@@ -239,9 +321,20 @@ function handlers() {
       if (game) {
         game.names = namesBySide();
         const side = me()?.side ?? null;
-        if (!lobby.started && game.side !== side) game.setSide(side);
+        if (game.side !== side) {
+          // The host let this player join a running match.
+          if (lobby.started && game.started && side !== null) {
+            picking = false;
+            document.body.removeAttribute("data-picking");
+            noteSeating(`You joined ${sideNames[side]}.`);
+          }
+          game.setSide(side);
+        }
       }
+      // Whoever arrives after the start chooses a side or to watch.
+      if (first && message.started && me()?.side === null) setPicking(true);
       if (!lobby.started || !game?.started) renderLobby();
+      renderSeating();
       if (first && room.replay) void startGame(room.replay);
     },
     replay(bytes) {
@@ -250,6 +343,10 @@ function handlers() {
     start(message) {
       document.body.dataset.screen = "match";
       game?.start(message.delay);
+      renderSeating();
+    },
+    declined({ side }) {
+      noteSeating(`The host declined your request to join ${sideNames[side] ?? "the match"}.`);
     },
     log({ turns }) {
       // A page that joins a running match replays every turn so far.
@@ -263,6 +360,7 @@ function handlers() {
         document.body.dataset.screen = "match";
       }
       for (const turn of turns) game.addTurn(turn);
+      renderSeating();
     },
     turn(turn) {
       if (game) game.addTurn(turn);
@@ -278,6 +376,7 @@ function handlers() {
     },
     closed(reason) {
       if (game?.ended) return;
+      seating.innerHTML = "";
       document.body.dataset.screen = "lobby";
       ui.innerHTML = `<h1>Disconnected</h1><p class="status">${escape(reason || "The connection to the match was lost.")}</p><div class="actions"><button id="again" class="primary">Reconnect</button></div>`;
       $("again").onclick = () => location.reload();

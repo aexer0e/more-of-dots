@@ -4,6 +4,23 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** The engine file for a replay: mass-sim, made for thousands of units, for a replay
+ * whose map names its own battlefield size (the site's big maps), else replay-sim. */
+export async function engineFile(replay) {
+  try {
+    const bytes = replay instanceof Uint8Array ? replay : new Uint8Array(replay),
+      data =
+      bytes[0] === 0x1f && bytes[1] === 0x8b
+        ? new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer())
+        : bytes;
+    const text = new TextDecoder().decode(data);
+    if (!text.includes('"size"')) return "replay-sim.wasm";
+    return Array.isArray(JSON.parse(text).map?.size) ? "mass-sim.wasm" : "replay-sim.wasm";
+  } catch {
+    return "replay-sim.wasm";
+  }
+}
+
 export async function loadEngine(wasm, write) {
   let exports;
   const view = (ptr, len) => new Uint8Array(exports.memory.buffer, ptr, len);

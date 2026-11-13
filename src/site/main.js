@@ -21,6 +21,7 @@ import { downloadLink, fetchShared, unshareReplay } from "./share.js";
 import { copyShareLink, downloadKept, mapPicture, publishedMaps, replayTroops } from "./sharing.js";
 import { box, connect, layout, nextMatches, roundName, sides } from "./bracket.js";
 import { troopLinesMarkup } from "../replays/troop-lines";
+import { leave as leaveForPlay } from "../play/handoff.js";
 
 const base = new URL(import.meta.env.BASE_URL, document.baseURI).href;
 // The site's folder as a path, such as /wod-replay-player/; every page is under it.
@@ -274,10 +275,12 @@ function showHome() {
         <div id="mine"></div>
       </section>
       <section class="stack" id="tournaments" aria-labelledby="tournaments-title"></section>
+      <button type="button" class="world-egg" id="world-egg" title="Play the world map" aria-label="Play the world map"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><ellipse cx="8" cy="8" rx="2.8" ry="6.4"/><path d="M1.6 8h12.8"/></svg></button>
     </main>`,
   );
   if (fresh) {
     $("#choose").onclick = choose;
+    $("#world-egg").onclick = (event) => void openWorldRoom(event.currentTarget);
     $("#link-form").onsubmit = (event) => {
       event.preventDefault();
       void openLink($("#link").value);
@@ -441,6 +444,25 @@ function prepare(t) {
   t.sides = sides(t.matches);
   return t;
 }
+// The world map (written by scripts/big-maps.py) is not listed yet: a faint globe at
+// the foot of the home page opens a room for it, as Play from here does for a replay.
+async function openWorldRoom(button) {
+  button.disabled = true;
+  try {
+    const list = await fetch(`${base}play-assets/maps/index.json`, revalidate).then((response) => (response.ok ? response.json() : []));
+    const map = list[0],
+      layout = map?.layouts?.[0];
+    if (!layout) throw new Error("The world map is not available.");
+    const response = await fetch(`${base}play-assets/maps/${layout.id}.rep`);
+    if (!response.ok) throw new Error("The world map could not be loaded.");
+    const id = await leaveForPlay({ replay: await response.arrayBuffer(), frame: 0, name: `${map.name}, ${layout.name}` });
+    location.href = new URL(`play?from=${id}`, document.baseURI).href;
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message);
+  }
+}
+
 async function renderTournaments() {
   const element = $("#tournaments");
   const list = await tournamentIndex();

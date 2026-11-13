@@ -25,10 +25,7 @@ export function iconFor(dot) {
   return null;
 }
 export function drawBars(renderer, dot, options) {
-  if (!options.health && !options.morale) return;
-  const [x, y] = dot.position,
-    both = options.health && options.morale;
-  const rect = (x1, y1, x2, y2, color) =>
+  barRects(dot, options, (x1, y1, x2, y2, color) =>
     renderer.polygon(
       [
         [x1, y1],
@@ -37,7 +34,15 @@ export function drawBars(renderer, dot, options) {
         [x2, y1],
       ],
       color,
-    );
+    ),
+  );
+}
+/** A unit's health and morale bars as rectangles, in drawing order:
+ * `rect(x1, y1, x2, y2, color)` for each. */
+export function barRects(dot, options, rect) {
+  if (!options.health && !options.morale) return;
+  const [x, y] = dot.position,
+    both = options.health && options.morale;
   const top = y - (both ? 22.8 : 20.8),
     bottom = y - (both ? 10.8 : 12.8);
   rect(x - 14.4, top, x + 14.4, bottom, [0, 0, 0, 1]);

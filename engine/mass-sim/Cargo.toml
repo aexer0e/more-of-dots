@@ -1,0 +1,28 @@
+[package]
+name = "mass-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The replay simulator for the site's big maps, made fast for thousands of units"
+
+[lib]
+name = "mass_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mass-patches"
+path = "src/bin/patches.rs"
+
+[[bin]]
+name = "mass-bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+# preserve_order keeps replay commands in file order; float_roundtrip parses numbers exactly.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+sha2 = "0.10"
+base64 = "0.22"
+num-bigint = "0.4"
+num-traits = "0.2"
+ryu = "1"

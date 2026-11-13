@@ -97,7 +97,9 @@ export class Renderer extends NativeRenderer {
           } else {
             // Widths use the native renderer's 1920-pixel reference viewport.
             // Keep them proportional to the map when resizing or zooming.
-            ctx.lineWidth = Math.max(draw.width, 1) * mw / 1920;
+            // A larger map (the site's big maps) keeps the lines' width beside the units
+            // as on a 1920 map.
+            ctx.lineWidth = Math.max(draw.width, 1) * Math.min(mw, 1920) / 1920;
             ctx.lineJoin = "round";
             ctx.stroke();
           }

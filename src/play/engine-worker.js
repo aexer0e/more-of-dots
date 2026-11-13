@@ -1,7 +1,7 @@
 // Runs a match's simulation: the WebAssembly engine in live mode
 // (engine/replay-sim-web/src/live.rs). The page sends one message per tick with
 // that tick's commands; the worker answers with the frame to draw.
-import { loadEngine } from "../player/wasm-engine.js";
+import { engineFile, loadEngine } from "../player/wasm-engine.js";
 import { RecordReader } from "../player/frames.js";
 
 let engine = null,
@@ -19,7 +19,7 @@ const text = new TextDecoder();
 async function open(bytes, base) {
   // The engine's address never changes between releases, so the browser checks
   // with the server for a newer copy instead of using one it kept.
-  const wasm = await fetch(`${base}engine/replay-sim.wasm`, { cache: "no-cache" });
+  const wasm = await fetch(`${base}engine/${await engineFile(bytes)}`, { cache: "no-cache" });
   if (!wasm.ok) throw new Error("The game engine could not be loaded.");
   engine = await loadEngine(await wasm.arrayBuffer(), (part) => output.push(part));
   if (!engine.live) throw new Error("This page loaded an older game engine. Reload the page to update it.");
@@ -55,17 +55,27 @@ function frame() {
   return chunk.buffer;
 }
 
-let fogVersion = null;
-function fog(side, territory, ships) {
-  // The fog follows the territory and the side's ships.
-  const key = `${territory}:${ships}`;
+// A fog grid larger than any of the game's maps (the site's big maps: 1600x900 cells)
+// takes tens of milliseconds, and their territory changes almost every tick, so their
+// fog follows it at most once a turn.
+const LARGE_FOG = 400_000,
+  FOG_TICKS = 15;
+let fogVersion = null,
+  fogTick = -Infinity,
+  fogCells = 0;
+function fog(side, territory, ships, tick) {
+  // The fog follows the side, its territory and its ships.
+  const key = `${side}:${territory}:${ships}`;
   if (side === null || key === fogVersion) return null;
+  if (fogCells > LARGE_FOG && tick - fogTick < FOG_TICKS && fogVersion?.endsWith(`:${ships}`)) return null;
   fogVersion = key;
+  fogTick = tick;
   engine.liveFog(side);
   const bytes = take(),
     view = new DataView(bytes.buffer),
     width = view.getUint32(0, true),
     height = view.getUint32(4, true);
+  fogCells = width * height;
   return {
     width,
     height,
@@ -91,7 +101,7 @@ self.onmessage = async ({ data }) => {
           kind: "frame",
           info: state,
           chunk: data.draw ? frame() : null,
-          fog: data.draw ? fog(data.side, state.territory, data.ships) : null,
+          fog: data.draw ? fog(data.side, state.territory, data.ships, state.tick) : null,
         },
       );
     }

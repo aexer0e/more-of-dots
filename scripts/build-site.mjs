@@ -22,9 +22,11 @@ const tournaments = folder('--tournaments');
 const run = (command, parameters) => execFileSync(command, parameters, { cwd: project, stdio: 'inherit' });
 
 // The engine needs Rust's wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown).
+// mass-sim is the engine for the big maps, made for thousands of units (engine/mass-sim).
 const engine = at('engine/target/wasm32-unknown-unknown/release/replay_sim_web.wasm');
+const massEngine = at('engine/target/wasm32-unknown-unknown/release/mass_sim_web.wasm');
 if (!args.includes('--skip-engine'))
-  run('cargo', ['build', '--release', '--manifest-path', at('engine/Cargo.toml'), '-p', 'replay-sim-web', '--target', 'wasm32-unknown-unknown']);
+  run('cargo', ['build', '--release', '--manifest-path', at('engine/Cargo.toml'), '-p', 'replay-sim-web', '-p', 'mass-sim-web', '--target', 'wasm32-unknown-unknown']);
 
 const site = at('build/site');
 run(process.execPath, [at('node_modules/vite/bin/vite.js'), 'build', '--config', 'vite.site.config.ts']);
@@ -32,6 +34,7 @@ fs.renameSync(path.join(site, 'site.html'), path.join(site, 'index.html'));
 
 fs.mkdirSync(path.join(site, 'engine'), { recursive: true });
 fs.copyFileSync(engine, path.join(site, 'engine/replay-sim.wasm'));
+fs.copyFileSync(massEngine, path.join(site, 'engine/mass-sim.wasm'));
 // Web addresses are case-sensitive; replays name maps in lower case. The game's
 // own images, when given, replace the engine's copies of the same maps.
 const published = new Set();

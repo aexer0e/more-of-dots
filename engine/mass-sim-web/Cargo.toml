@@ -1,0 +1,13 @@
+[package]
+name = "mass-sim-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The big-map simulator for the hosted player, as a WebAssembly module"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mass-sim = { path = "../mass-sim" }
+serde_json = "1"

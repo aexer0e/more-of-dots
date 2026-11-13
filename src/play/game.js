@@ -6,10 +6,12 @@ import { decodeChunk } from "../player/frames.js";
 import { prepareMap } from "../player/map.js";
 import { frontLines } from "../player/frontline.js";
 import { Renderer } from "../player/local-renderer.js";
-import { iconFor, drawBars, drawStats } from "../player/overlays.js";
+import { iconFor, drawBars, barRects, drawStats } from "../player/overlays.js";
 import {
   PICK_RADIUS,
   clickOrders,
+  packOrders,
+  unpackGroups,
   extendGesture,
   formationOrders,
   gatherOrders,
@@ -19,6 +21,8 @@ import {
   stopOrders,
 } from "./orders.js";
 import { MatchSound } from "./sound.js";
+import { SpriteBatch, SpriteCache } from "./sprites.js";
+import { UnitLayer, FLIP, DARK, TWICE, HEALTH, MORALE } from "./gl-units.js";
 
 export const TURN_TICKS = 15;
 const TICK_MS = 1000 / 30;
@@ -27,6 +31,8 @@ const PEACE_COOLDOWN = 1800;
 // A press on a unit that moves this many screen pixels draws an arrow, even one
 // shorter than the spacing between waypoints; less is a click that selects.
 const ARROW_DRAG_PX = 4;
+// A right press that moves less than this is a click (confirm), not a pan.
+const RIGHT_CLICK_PX = 5;
 export const colors = ["blue", "red", "purple", "orange"];
 export const sideRgb = [
   [0, 0, 255],
@@ -40,6 +46,23 @@ const unitSprite = (dot) =>
 const unitSize = (dot) => {
   const scale = dot.ship_timer > 0 ? 1 + Math.sin(dot.ship_timer / 4) / 12 : 1;
   return (dot.ship ? [36, 18] : [24, 24]).map((value) => value * scale);
+};
+// The sprites a unit or a dead unit can have, in the order of `unitArt`'s indices.
+const unitArt = colors.flatMap((color) => [
+  `${color}_ship`,
+  `${color}_heavy_ship`,
+  ...["infantry", "tank", "motorised"].flatMap((type) => [100, 50, 15].map((health) => `${color}_${type}_${health}`)),
+]);
+const unitArtIndex = new Map(unitArt.map((name, i) => [name, i]));
+const deadSprite = (dot) => (dot.ship ? `${colors[dot.color]}_${dot.type === "tank" ? "heavy_ship" : "ship"}` : `${colors[dot.color]}_${dot.type}_15`);
+const unitTypes = { infantry: 0, tank: 1, motorised: 2 };
+/** A unit's sprite as an index into `unitArt`: what `unitSprite` names. */
+const unitLayer = (dot) => {
+  const base = dot.color * 11;
+  if (dot.ship) return base + (dot.type === "tank" ? 1 : 0);
+  const type = unitTypes[dot.type],
+    health = dot.health / dot.max_health;
+  return type === undefined ? -1 : base + 2 + type * 3 + (health > 0.5 ? 0 : health > 0.15 ? 1 : 2);
 };
 const artwork = () => {
   const names = ["capital", "ship_icon", "water_icon", "city_icon", "healing_icon", "forest_icon"];
@@ -102,6 +125,58 @@ async function bitmap(url) {
 // The replay player's canvas renderer, drawing on the page instead of a worker,
 // with the fog of war and darkened selected units.
 class PlayRenderer extends Renderer {
+  constructor(canvas) {
+    super(canvas);
+    this.baseContext = this.context;
+  }
+  /** The big maps' units on the GPU, in a canvas of their own (see gl-units.js), or
+   * false where WebGL 2 is missing. */
+  get units() {
+    if (this.unitGl === undefined) {
+      const element = this.element("units");
+      this.unitGl = UnitLayer.create(element, unitArt) || false;
+      if (!this.unitGl) this.removeLayers();
+    }
+    return this.unitGl;
+  }
+  /** Starts a layer of its own (the big maps): what is drawn from here to the next layer
+   * goes into a canvas element stacked over the page's canvas, which the browser puts
+   * together. A layer is drawn again only when `version` (a list, compared item by
+   * item) or the view changed, or on every frame when `version` is null. The first
+   * layer is the page's canvas. Returns whether the layer is drawn this frame. */
+  layer(name, version) {
+    this.layerState ??= new Map();
+    const { vw, vh, ox, oy } = this.frame,
+      { zoom, x, y } = this.view,
+      stamp = [this.canvas.width, this.canvas.height, vw, vh, ox, oy, zoom, x, y].join(),
+      last = this.layerState.get(name),
+      same = !!version && !!last?.version && last.stamp === stamp && last.version.length === version.length && last.version.every((item, i) => item === version[i]);
+    if (!same) this.layerState.set(name, { stamp, version });
+    this.draws.push({ type: "layer", name, skip: same });
+    return !same;
+  }
+  /** The canvas element of the layer `name`, stacked above the layers made before it. */
+  element(name) {
+    this.elements ??= new Map();
+    let element = this.elements.get(name);
+    if (!element) {
+      element = document.createElement("canvas");
+      element.className = "game-layer";
+      element.setAttribute("aria-hidden", "true");
+      (this.lastElement ?? this.canvas).after(element);
+      this.lastElement = element;
+      this.elements.set(name, element);
+    }
+    if (element.width !== this.canvas.width || element.height !== this.canvas.height) {
+      element.width = this.canvas.width;
+      element.height = this.canvas.height;
+    }
+    return element;
+  }
+  removeLayers() {
+    for (const element of this.elements?.values() || []) element.remove();
+    this.elements = this.lastElement = this.layerState = null;
+  }
   texture(name, source) {
     this.sources.set(name, source);
     this.textures.set(name, true);
@@ -109,7 +184,204 @@ class PlayRenderer extends Renderer {
   fog(polygons) {
     this.draws.push({ type: "fog", polygons });
   }
+  /** Many lines of one colour and width, stroked as one path: `entries` holds
+   * `[points, smooth]` as `line` takes them. */
+  lines(polylines, color, width) {
+    if (polylines.starts.length) this.draws.push({ type: "lines", xy: polylines.xy, length: polylines.length, starts: polylines.starts, color, width });
+  }
+  /** A sprite at half brightness, made once (a canvas filter on every draw is slow). */
+  darkened(name) {
+    this.dark ??= new Map();
+    if (!this.dark.has(name)) {
+      const source = this.sources.get(name);
+      if (!source) return null;
+      const canvas = new OffscreenCanvas(source.width, source.height),
+        context = canvas.getContext("2d");
+      context.filter = "brightness(50%)";
+      context.drawImage(source, 0, 0);
+      this.dark.set(name, canvas);
+    }
+    return this.dark.get(name);
+  }
+  /** The cache of units' sprites at their size on screen (see sprites.js). */
+  get spriteCache() {
+    return (this.unitCache ??= new SpriteCache(unitArt, barRects));
+  }
+  /** Units and bars drawn through the sprite cache. */
+  sprites(batch) {
+    this.draws.push({ type: "sprites", batch });
+  }
+  /** Draws each layer (see `layer`) that changed into its own canvas. Leaves `context`
+   * on the last, for what is drawn over everything. */
+  drawLayers() {
+    const [mw, mh] = this.mapSize,
+      { ox, oy, vw, vh } = this.frame,
+      { zoom, x, y } = this.view,
+      view = { mw, mh, ox, oy, vw, vh, zoom, x, y },
+      draws = this.draws;
+    for (let i = 0; i < draws.length; ) {
+      const marker = draws[i++];
+      let end = i;
+      while (end < draws.length && draws[end].type !== "layer") end++;
+      const from = i;
+      i = end;
+      if (marker.name === "units") {
+        if (marker.skip) continue;
+        const draw = draws.slice(from, end).find((d) => d.type === "units");
+        this.units.draw(this.sources, (vw / mw) * zoom, ox + x * vw, oy + y * vh, draw?.between ?? 1, [ox, oy, vw, vh]);
+        continue;
+      }
+      const ctx = marker.name === "ground" ? this.baseContext : this.element(marker.name).getContext("2d");
+      this.context = ctx;
+      if (marker.skip) continue;
+      ctx.resetTransform();
+      ctx.globalAlpha = 1;
+      if (ctx === this.baseContext) {
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+      } else ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(ox, oy, vw, vh);
+      ctx.clip();
+      ctx.setTransform((vw / mw) * zoom, 0, 0, (vh / mh) * zoom, ox + x * vw, oy + y * vh);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "low";
+      for (let k = from; k < end; k++) {
+        const draw = draws[k];
+        if (draw.type === "text") this.drawText(draw, ox, oy, vw, vh);
+        else if (draw.type === "cached") this.drawCached(ctx, draw, view);
+        else this.drawWorld(ctx, draw, view);
+      }
+      ctx.restore();
+    }
+  }
+
+  /** A layer drawn into a canvas of its own and copied in, drawn again only when its
+   * content or the view changes (see `cached`). */
+  drawCached(ctx, draw, view) {
+    const { vw, vh, ox, oy } = view,
+      layer = this.layers.get(draw.key);
+    if (draw.draws) {
+      layer.canvas.width = vw;
+      layer.canvas.height = vh;
+      const context = layer.canvas.getContext("2d");
+      context.setTransform((vw / view.mw) * view.zoom, 0, 0, (vh / view.mh) * view.zoom, view.x * vw, view.y * vh);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "low";
+      for (const inner of draw.draws) this.drawWorld(context, inner, view);
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(layer.canvas, ox, oy);
+    ctx.restore();
+  }
+
+  /** Draws a layer whose content is `version` (any object: the same object, the same
+   * content) through a canvas of its own: `build` adds its draws, and runs only when the
+   * content or the view changed since the layer was last drawn. */
+  cached(key, version, build) {
+    this.layers ??= new Map();
+    const { vw, vh } = this.frame,
+      { zoom, x, y } = this.view,
+      stamp = [vw, vh, zoom, x, y].join();
+    let layer = this.layers.get(key);
+    if (!layer) this.layers.set(key, (layer = { canvas: new OffscreenCanvas(1, 1), version: null, stamp: null, draws: [] }));
+    if (layer.version === version && layer.stamp === stamp) {
+      this.draws.push({ type: "cached", key, draws: null });
+      return;
+    }
+    // The draws are kept until the content changes; a new view only draws them again.
+    if (layer.version !== version) {
+      const start = this.draws.length;
+      build();
+      layer.draws = this.draws.splice(start);
+      layer.version = version;
+    }
+    layer.stamp = stamp;
+    this.draws.push({ type: "cached", key, draws: layer.draws });
+  }
+
+  /** One draw in map coordinates, on `ctx` with the view's transform set. */
+  drawWorld(ctx, draw, view) {
+    const { mw, ox, oy, vw, vh, zoom, x, y } = view;
+    if (draw.type === "image") {
+      const image = draw.dark ? this.darkened(draw.name) : this.sources.get(draw.name);
+      if (!image) return;
+      const [dx, dy] = draw.direction || [1, 0];
+      if (dx === 1 && dy === 0 && !draw.flipY && draw.name !== "map") {
+        // Not turned (flags, icons): the same as below without saving the state.
+        const alpha = draw.alpha ?? 1,
+          [width, height] = draw.size;
+        if (alpha !== 1) ctx.globalAlpha = alpha;
+        ctx.drawImage(image, draw.position[0] - width / 2, draw.position[1] - height / 2, width, height);
+        if (alpha !== 1) ctx.globalAlpha = 1;
+        return;
+      }
+      ctx.save();
+      ctx.translate(...draw.position);
+      ctx.transform(dx, dy, -dy, dx, 0, 0);
+      if (draw.flipY) ctx.scale(1, -1);
+      ctx.globalAlpha = draw.alpha ?? 1;
+      ctx.imageSmoothingEnabled = draw.name !== "map";
+      ctx.drawImage(image, -draw.size[0] / 2, -draw.size[1] / 2, ...draw.size);
+      ctx.restore();
+    } else if (draw.type === "sprites") {
+      const transform = ctx.getTransform(),
+        source = (index, dark) => (dark ? this.darkened(unitArt[index]) : this.sources.get(unitArt[index]));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      this.spriteCache.draw(ctx, draw.batch, source, transform.a, transform.d, transform.e, transform.f);
+      ctx.setTransform(transform);
+    } else if (draw.type === "lines") {
+      const [r, g, b, a] = draw.color;
+      ctx.strokeStyle = `rgba(${r * 255},${g * 255},${b * 255},${a})`;
+      ctx.lineWidth = (Math.max(draw.width, 1) * Math.min(mw, 1920)) / 1920;
+      ctx.lineJoin = ctx.lineCap = "round";
+      ctx.beginPath();
+      const { xy, starts } = draw;
+      for (let i = 0; i < starts.length; i++) {
+        const end = i + 1 < starts.length ? starts[i + 1] : draw.length;
+        ctx.moveTo(xy[starts[i]], xy[starts[i] + 1]);
+        for (let k = starts[i] + 2; k < end; k += 2) ctx.lineTo(xy[k], xy[k + 1]);
+      }
+      ctx.stroke();
+    } else if (draw.type === "fog") {
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.beginPath();
+      for (const polygon of draw.polygons) {
+        polygon.forEach((point, index) => (index ? ctx.lineTo(...point) : ctx.moveTo(...point)));
+        ctx.closePath();
+      }
+      ctx.fill("evenodd");
+    } else {
+      const [r, g, b, a] = draw.color;
+      ctx.fillStyle = ctx.strokeStyle = `rgba(${r * 255},${g * 255},${b * 255},${a})`;
+      ctx.beginPath();
+      if (draw.type === "circle") {
+        ctx.arc(...draw.position, draw.radius, 0, Math.PI * 2);
+        if (draw.ring) {
+          ctx.lineWidth = draw.ring;
+          ctx.stroke();
+        } else ctx.fill();
+      } else {
+        draw.points.forEach((point, index) => (index ? ctx.lineTo(...point) : ctx.moveTo(...point)));
+        if (draw.type === "polygon") {
+          ctx.closePath();
+          ctx.fill();
+        } else {
+          // Widths use a 1920-pixel reference; a larger map (the site's big maps) keeps
+          // the lines' width beside the units as on a 1920 map.
+          ctx.lineWidth = (Math.max(draw.width, 1) * Math.min(mw, 1920)) / 1920;
+          ctx.lineJoin = ctx.lineCap = "round";
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
   drawLocal() {
+    if (this.draws[0]?.type === "layer") return this.drawLayers();
+    this.context = this.baseContext;
     const ctx = this.context,
       [mw, mh] = this.mapSize,
       { ox, oy, vw, vh } = this.frame;
@@ -126,53 +398,95 @@ class PlayRenderer extends Renderer {
     ctx.setTransform((vw / mw) * zoom, 0, 0, (vh / mh) * zoom, ox + x * vw, oy + y * vh);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "low";
+    const view = { mw, mh, ox, oy, vw, vh, zoom, x, y };
     for (const draw of this.draws) {
       if (draw.type === "text") this.drawText(draw, ox, oy, vw, vh);
-      else if (draw.type === "image") {
-        const image = this.sources.get(draw.name);
-        if (!image) continue;
-        const [dx, dy] = draw.direction || [1, 0];
-        ctx.save();
-        ctx.translate(...draw.position);
-        ctx.transform(dx, dy, -dy, dx, 0, 0);
-        if (draw.flipY) ctx.scale(1, -1);
-        ctx.globalAlpha = draw.alpha ?? 1;
-        if (draw.dark) ctx.filter = "brightness(50%)";
-        ctx.imageSmoothingEnabled = draw.name !== "map";
-        ctx.drawImage(image, -draw.size[0] / 2, -draw.size[1] / 2, ...draw.size);
-        ctx.restore();
-      } else if (draw.type === "fog") {
-        ctx.fillStyle = "rgba(0,0,0,0.5)";
-        ctx.beginPath();
-        for (const polygon of draw.polygons) {
-          polygon.forEach((point, index) => (index ? ctx.lineTo(...point) : ctx.moveTo(...point)));
-          ctx.closePath();
-        }
-        ctx.fill("evenodd");
-      } else {
-        const [r, g, b, a] = draw.color;
-        ctx.fillStyle = ctx.strokeStyle = `rgba(${r * 255},${g * 255},${b * 255},${a})`;
-        ctx.beginPath();
-        if (draw.type === "circle") {
-          ctx.arc(...draw.position, draw.radius, 0, Math.PI * 2);
-          if (draw.ring) {
-            ctx.lineWidth = draw.ring;
-            ctx.stroke();
-          } else ctx.fill();
-        } else {
-          draw.points.forEach((point, index) => (index ? ctx.lineTo(...point) : ctx.moveTo(...point)));
-          if (draw.type === "polygon") {
-            ctx.closePath();
-            ctx.fill();
-          } else {
-            ctx.lineWidth = (Math.max(draw.width, 1) * mw) / 1920;
-            ctx.lineJoin = ctx.lineCap = "round";
-            ctx.stroke();
-          }
-        }
-      }
+      else if (draw.type === "cached") this.drawCached(ctx, draw, view);
+      else this.drawWorld(ctx, draw, view);
     }
     ctx.restore();
+  }
+}
+
+/** Lines smoothed as `line` smooths them (each pass puts points a quarter and three
+ * quarters along every segment), kept as one flat array of x, y with where each line
+ * starts: thousands of arrows a frame without an array for every point. */
+class Polylines {
+  /** `coarse`: lines this small on screen keep their corners (arrowheads a few pixels
+   * across look the same). */
+  constructor(coarse = false) {
+    this.xy = new Float64Array(16384);
+    this.length = 0;
+    this.starts = [];
+    this.coarse = coarse;
+  }
+  room(count) {
+    if (this.length + count <= this.xy.length) return;
+    const grown = new Float64Array(Math.max(this.xy.length * 2, this.length + count));
+    grown.set(this.xy);
+    this.xy = grown;
+  }
+  /** Adds the line through `points` ([x, y] each), smoothed once. */
+  add(points) {
+    const n = points.length;
+    if (n < 2) return;
+    this.room(4 * n);
+    const xy = this.xy;
+    let k = this.length;
+    this.starts.push(k);
+    if (n === 2) {
+      // A straight line smoothed is the same straight line.
+      xy[k++] = points[0][0];
+      xy[k++] = points[0][1];
+      xy[k++] = points[1][0];
+      xy[k++] = points[1][1];
+      this.length = k;
+      return;
+    }
+    xy[k++] = points[0][0];
+    xy[k++] = points[0][1];
+    for (let i = 0; i < n - 1; i++) {
+      const [ax, ay] = points[i],
+        [bx, by] = points[i + 1];
+      xy[k++] = ax * 0.75 + bx * 0.25;
+      xy[k++] = ay * 0.75 + by * 0.25;
+      xy[k++] = ax * 0.25 + bx * 0.75;
+      xy[k++] = ay * 0.25 + by * 0.75;
+    }
+    xy[k++] = points[n - 1][0];
+    xy[k++] = points[n - 1][1];
+    this.length = k;
+  }
+  /** Adds the line through three points a, b, c, smoothed twice. */
+  add3(ax, ay, bx, by, cx, cy) {
+    if (this.coarse) {
+      this.room(6);
+      this.starts.push(this.length);
+      this.xy.set([ax, ay, bx, by, cx, cy], this.length);
+      this.length += 6;
+      return;
+    }
+    // Once: a, 3/4 a + 1/4 b, 1/4 a + 3/4 b, 3/4 b + 1/4 c, 1/4 b + 3/4 c, c.
+    const once = [ax, ay, 0.75 * ax + 0.25 * bx, 0.75 * ay + 0.25 * by, 0.25 * ax + 0.75 * bx, 0.25 * ay + 0.75 * by, 0.75 * bx + 0.25 * cx, 0.75 * by + 0.25 * cy, 0.25 * bx + 0.75 * cx, 0.25 * by + 0.75 * cy, cx, cy];
+    this.room(24);
+    const xy = this.xy;
+    let k = this.length;
+    this.starts.push(k);
+    xy[k++] = ax;
+    xy[k++] = ay;
+    for (let i = 0; i < 10; i += 2) {
+      const px = once[i],
+        py = once[i + 1],
+        qx = once[i + 2],
+        qy = once[i + 3];
+      xy[k++] = px * 0.75 + qx * 0.25;
+      xy[k++] = py * 0.75 + qy * 0.25;
+      xy[k++] = px * 0.25 + qx * 0.75;
+      xy[k++] = py * 0.25 + qy * 0.75;
+    }
+    xy[k++] = cx;
+    xy[k++] = cy;
+    this.length = k;
   }
 }
 
@@ -300,10 +614,19 @@ export class Game {
 
   // Simulation ------------------------------------------------------------------
 
+  /** Before the match, or when the host lets a watcher join a running one. */
   setSide(side) {
+    if (side === this.side) return;
     this.side = side;
     this.fogState = null;
-    this.request([]);
+    this.mineFor = null;
+    this.selected.clear();
+    this.gesture = null;
+    this.staged.clear();
+    this.inflight.clear();
+    this.panel = this.production = false;
+    this.chat = null;
+    if (this.worker && !this.busy) this.request([]);
   }
 
   /** The match starts `delay` ms from now; its first turn arrives then. */
@@ -313,7 +636,19 @@ export class Game {
     this.sound.start();
   }
 
+  /** On a big map, orders share whole offsets and travel in groups (see packOrders). */
+  get shared() {
+    return this.mapSize?.[0] > 1920;
+  }
+
   addTurn({ turn, commands }) {
+    // Packed groups become ordinary orders here, before anything reads the turn: the
+    // simulation, the inflight orders and the saved replay all see `orders`.
+    for (const entry of commands || [])
+      if (entry.groups) {
+        entry.orders = [...(entry.orders || []), ...unpackGroups(entry.groups)];
+        delete entry.groups;
+      }
     this.turns.set(turn, commands);
     this.received = Math.max(this.received, turn + 1);
     this.lastTurnAt = performance.now();
@@ -340,7 +675,13 @@ export class Game {
       this.fogState = { ...data.fog, outlines };
     }
     if (data.chunk) {
-      const { frames } = await decodeChunk(data.chunk, this.staticRecord);
+      // A big map keeps one object per unit between frames (see decodeChunk), and its
+      // units move smoothly between frames, which come less often than the screen's.
+      const big = this.mapSize[0] > 1920;
+      const { frames } = await decodeChunk(data.chunk, this.staticRecord, big ? (this.reuse ??= {}) : null);
+      // The ticks of the previous frame and this one, between which units are drawn.
+      this.fromTick = this.toTick ?? frames[0].frame;
+      this.toTick = frames[0].frame;
       this.state = frames[0];
       this.sound.frame(this.state, this.side);
     }
@@ -393,6 +734,7 @@ export class Game {
     for (const entry of commands) {
       if (entry.orders && (entry.side === this.side))
         for (const [id] of entry.orders) this.inflight.delete(id);
+        this.inflightVersion = (this.inflightVersion || 0) + 1;
       if (entry.message) this.messages.push({ side: entry.side, text: entry.message, at: performance.now() });
       if (entry.surrender) this.surrendered.add(entry.side);
       if (entry.peace) this.peaceOffers.set(entry.side, this.queuedTicks);
@@ -426,8 +768,10 @@ export class Game {
 
   send(orders) {
     if (!orders.size || this.side === null || this.ended) return;
-    this.room.send({ type: "command", orders: [...orders].map(([id, points]) => [id, points]) });
+    const packed = packOrders(orders);
+    this.room.send({ type: "command", orders: packed.orders, ...(packed.groups.length ? { groups: packed.groups } : {}) });
     for (const [id, points] of orders) this.inflight.set(id, points);
+    this.inflightVersion = (this.inflightVersion || 0) + 1;
   }
 
   confirm() {
@@ -503,8 +847,10 @@ export class Game {
       { ox, oy, vw, vh } = this.renderer.frame,
       [mw, mh] = this.mapSize,
       world = this.toWorld(point);
-    // The game zooms by 1.2 a notch, between 1 and 3, about the pointer.
-    const zoom = Math.max(1, Math.min(3, view.zoom * 1.2 ** steps));
+    // The game zooms by 1.2 a notch, between 1 and 3, about the pointer. A map larger than
+    // the game's (the site's big maps) zooms further, to the units' size at 3 on a 1080p map.
+    const most = mw > 1920 ? (3 * mw) / 1920 : 3,
+      zoom = Math.max(1, Math.min(most, view.zoom * 1.2 ** steps));
     if (zoom === 1) return (this.renderer.view = { zoom, x: 0, y: 0 });
     const x = (point[0] - ox) / vw - (world[0] / mw) * zoom,
       y = (point[1] - oy) / vh - (world[1] / mh) * zoom;
@@ -520,8 +866,13 @@ export class Game {
 
   // Input -----------------------------------------------------------------------
 
+  /** The player's living units, worked out once for each frame. */
   myUnits() {
-    return (this.state?.dots || []).filter((dot) => dot.health > 0 && dot.color === this.side);
+    if (this.mineFor !== this.state) {
+      this.mineFor = this.state;
+      this.mine = (this.state?.dots || []).filter((dot) => dot.health > 0 && dot.color === this.side);
+    }
+    return this.mine;
   }
 
   unitAt(world) {
@@ -577,11 +928,14 @@ export class Game {
     }
     if (event.button === 1) {
       this.panning = point;
+      this.rightPan = null;
       return;
     }
     if (event.button === 2) {
-      // Right-click confirms withheld orders.
-      if (this.started) this.confirm();
+      // Holding the right button pans, as the middle one does; a right click that
+      // barely moves confirms withheld orders when it is released.
+      this.panning = point;
+      this.rightPan = { client: [event.clientX, event.clientY], travel: 0 };
       return;
     }
     if (event.button !== 0) return;
@@ -613,6 +967,10 @@ export class Game {
     if (this.panning) {
       this.pan(point[0] - this.panning[0], point[1] - this.panning[1]);
       this.panning = point;
+      if (this.rightPan) {
+        const [cx, cy] = this.rightPan.client;
+        this.rightPan.travel = Math.max(this.rightPan.travel, Math.hypot(event.clientX - cx, event.clientY - cy));
+      }
       return;
     }
     if (this.rateDrag) {
@@ -628,7 +986,12 @@ export class Game {
   }
 
   pointerUp(event) {
-    if (this.panning) return void (this.panning = null);
+    if (this.panning) {
+      const right = this.rightPan;
+      this.panning = this.rightPan = null;
+      if (right && right.travel < RIGHT_CLICK_PX && this.started) this.confirm();
+      return;
+    }
     if (this.rateDrag) {
       this.rateDrag = null;
       this.sendProduction({ production_rate: this.ratePreview, production_type: this.productionState().type });
@@ -644,7 +1007,7 @@ export class Game {
     if (this.shortArrow(gesture)) {
       if (!units.length) return;
       if (gesture.formation) return this.give(formationOrders(units, [gesture.points[0], gesture.end]), withhold);
-      return this.give(routeOrders(units, [gesture.points[0], gesture.end]), withhold);
+      return this.give(routeOrders(units, [gesture.points[0], gesture.end], this.shared), withhold);
     }
     const dragged = gesture.points.length > 1;
     if (!dragged) {
@@ -653,18 +1016,18 @@ export class Game {
         if (!gesture.onUnit && !gesture.shift) this.selected.clear();
         return;
       }
-      return this.give((gesture.withhold || event.altKey ? gatherOrders : clickOrders)(units, gesture.end), withhold);
+      return this.give((gesture.withhold || event.altKey ? gatherOrders : clickOrders)(units, gesture.end, this.shared), withhold);
     }
     const loop = [...gesture.points, gesture.end];
     if (this.selecting(gesture, units)) {
       // A loop selects the units inside it.
       if (!gesture.shift) this.selected.clear();
-      for (const dot of this.myUnits()) if (inside(dot.position, loop)) this.selected.add(dot.id);
+      for (const dot of this.inLoop(loop)) this.selected.add(dot.id);
       return;
     }
     if (!units.length) return;
     if (gesture.formation) return this.give(formationOrders(units, loop), withhold);
-    this.give(routeOrders(units, gesture.points), withhold);
+    this.give(routeOrders(units, gesture.points, this.shared), withhold);
   }
 
   /** Whether a gesture is an arrow drawn from a unit that ends before its first
@@ -680,17 +1043,44 @@ export class Game {
     if (!units.length || gesture.shift) return true;
     if (gesture.formation) return false;
     const loop = [...gesture.points, gesture.end];
-    return isLoop(loop) && this.myUnits().some((dot) => inside(dot.position, loop));
+    return isLoop(loop) && this.inLoop(loop, true).length > 0;
+  }
+
+  /** The player's units inside a drawn loop (only the first with `any`), testing the
+   * loop's bounding box before the loop itself. */
+  inLoop(loop, any = false) {
+    let left = Infinity,
+      right = -Infinity,
+      top = Infinity,
+      bottom = -Infinity;
+    for (const [x, y] of loop) (left = Math.min(left, x)), (right = Math.max(right, x)), (top = Math.min(top, y)), (bottom = Math.max(bottom, y));
+    const found = [];
+    for (const dot of this.myUnits()) {
+      const [x, y] = dot.position;
+      if (x < left || x > right || y < top || y > bottom || !inside(dot.position, loop)) continue;
+      found.push(dot);
+      if (any) break;
+    }
+    return found;
   }
 
   /** The orders a gesture would give if released now, to draw while it is held. */
   preview(gesture) {
+    // The same gesture over the same frame gives the same orders: worked out once.
+    const key = [this.state?.frame, this.selected.size, gesture.points.length, gesture.end?.[0], gesture.end?.[1], gesture.formation, gesture.withhold, gesture.onUnit, gesture.travel, gesture.shift, this.keys.has("AltLeft") || this.keys.has("AltRight")].join();
+    if (this.previewKey === key && this.previewFor === gesture) return this.previewed;
+    this.previewKey = key;
+    this.previewFor = gesture;
+    return (this.previewed = this.plan(gesture));
+  }
+
+  plan(gesture) {
     const units = this.myUnits().filter((dot) => this.selected.has(dot.id));
     if (!units.length || this.selecting(gesture, units)) return null;
-    if (this.shortArrow(gesture)) return (gesture.formation ? formationOrders : routeOrders)(units, [gesture.points[0], gesture.end]);
-    if (gesture.points.length < 2) return gesture.onUnit ? null : (gesture.withhold || this.keys.has("AltLeft") || this.keys.has("AltRight") ? gatherOrders : clickOrders)(units, gesture.end);
+    if (this.shortArrow(gesture)) return (gesture.formation ? formationOrders : routeOrders)(units, [gesture.points[0], gesture.end], this.shared);
+    if (gesture.points.length < 2) return gesture.onUnit ? null : (gesture.withhold || this.keys.has("AltLeft") || this.keys.has("AltRight") ? gatherOrders : clickOrders)(units, gesture.end, this.shared);
     if (gesture.formation) return formationOrders(units, [...gesture.points, gesture.end]);
-    return routeOrders(units, [...gesture.points, gesture.end]);
+    return routeOrders(units, [...gesture.points, gesture.end], this.shared);
   }
 
   keyDown(event) {
@@ -836,85 +1226,284 @@ export class Game {
     return !(at(x - 1, y) && at(x + 1, y) && at(x, y - 1) && at(x, y + 1));
   }
 
+  /** Asks the lines worker for a big map's front lines; until they come, the previous
+   * ones show (src/play/lines-worker.js). */
+  requestLines(state, previous = []) {
+    if (!this.linesWorker) {
+      this.linesWorker = new Worker(new URL("./lines-worker.js", import.meta.url), { type: "module" });
+      this.linesWorker.onmessage = ({ data }) => {
+        if (data.id !== this.linesId || this.paintCache?.contours !== this.linesFor) return;
+        this.paintCache.lines = data.lines;
+      };
+    }
+    const dots = state.dots,
+      positions = new Float32Array(2 * dots.length),
+      sides = new Uint8Array(dots.length),
+      health = new Float32Array(dots.length),
+      ships = new Uint8Array(dots.length);
+    dots.forEach((dot, i) => {
+      positions[2 * i] = dot.position[0];
+      positions[2 * i + 1] = dot.position[1];
+      sides[i] = dot.color;
+      health[i] = dot.health;
+      ships[i] = dot.ship ? 1 : 0;
+    });
+    this.linesId = (this.linesId ?? 0) + 1;
+    this.linesFor = state.render?.contours;
+    this.linesWorker.postMessage(
+      { id: this.linesId, contours: state.render?.contours || [], mapSize: this.mapSize, positions, sides, health, ships },
+      [positions.buffer, sides.buffer, health.buffer, ships.buffer],
+    );
+    return previous;
+  }
+
+  /** Sends a big map's units and bars to the GPU: where each was in the previous frame
+   * and where it is now, which the GPU moves between on every repaint. */
+  buildUnits(gl, cache, options, mine) {
+    const state = cache.state,
+      still = [0, 0];
+    gl.begin();
+    for (const dot of cache.dead) {
+      const alpha = 0.75 - (state.frame - dot.frame) * 0.01;
+      if (alpha > 0) gl.sprite(unitArtIndex.get(deadSprite(dot)) ?? -1, dot.position, dot.position, still, unitSize(dot), [1, 0], 0, alpha);
+    }
+    // The game draws every unit twice: all of them, then all of them again. Where both
+    // look the same, one instance is drawn twice over.
+    for (let pass = 0; pass < 2; pass++)
+      for (const dot of cache.dots) {
+        const visual = cache.directions.get(dot.id),
+          first = visual?.first_vibration || 0,
+          second = visual?.second_vibration || 0,
+          firstTurn = visual?.first_visual || visual?.visual || [1, 0],
+          turn = visual?.visual || [1, 0],
+          same = first === second && firstTurn[0] === turn[0] && firstTurn[1] === turn[1];
+        if (same && pass === 1) continue;
+        const vibration = pass === 0 ? first : second,
+          facing = visual?.facing;
+        gl.sprite(
+          unitLayer(dot),
+          dot.from || dot.position,
+          dot.position,
+          [(facing?.[0] || 0) * vibration, (facing?.[1] || 0) * vibration],
+          unitSize(dot),
+          pass === 0 ? firstTurn : turn,
+          FLIP | (this.selected.has(dot.id) ? DARK : 0) | (same ? TWICE : 0),
+        );
+      }
+    const bars = (options.health ? HEALTH : 0) | (options.morale ? MORALE : 0);
+    if (bars)
+      for (const dot of cache.dots) if (mine(dot)) gl.bars(dot.from || dot.position, dot.position, dot.health / dot.max_health, dot.morale, bars);
+    gl.end();
+  }
+
   paint(now) {
     this.layout();
     const r = this.renderer,
       state = this.state,
       [mw, mh] = this.mapSize,
       mine = (dot) => this.side === null || dot.color === this.side,
-      shows = (dot) => mine(dot) || this.visible(dot.position),
-      dots = state.dots.filter((dot) => dot.health > 0 && shows(dot)),
       options = this.options;
+    // What depends only on the worker's frame and the fog is worked out once for each,
+    // not on every repaint: the units that show, their directions and the front lines.
+    let cache = this.paintCache;
+    const fresh = !cache || cache.state !== state || cache.fog !== this.fogState;
+    if (fresh) {
+      const shows = (dot) => mine(dot) || this.visible(dot.position);
+      cache = this.paintCache = {
+        state,
+        fog: this.fogState,
+        dots: state.dots.filter((dot) => dot.health > 0 && shows(dot)),
+        dead: (state.core.dead_dots || []).filter(shows),
+        byId: new Map(state.dots.map((dot) => [dot.id, dot])),
+        directions: new Map((state.render?.directions || []).map((d) => [d.id, d])),
+        // The front lines follow the outlines, which a big map's frames send only
+        // when they change; a big map's are worked out in a worker of their own.
+        contours: state.render?.contours,
+        lines:
+          cache?.contours === state.render?.contours
+            ? cache.lines
+            : this.reuse
+              ? this.requestLines(state, cache?.lines)
+              : frontLines(state.render?.contours || [], state.dots, this.mapSize),
+      };
+    }
+    // A big map's units are drawn at a clock that runs at the game's 30 ticks a second a
+    // tick and a half behind the newest frame, between where the frames on either side
+    // of it had them: they move at an even pace however unevenly the frames come.
+    let between = 1;
+    if (this.reuse && this.toTick !== undefined) {
+      const latest = this.toTick,
+        elapsed = this.shownAt === undefined ? 0 : (now - this.shownAt) / TICK_MS;
+      this.shownAt = now;
+      this.shownTick = this.shownTick === undefined ? latest : this.shownTick + elapsed + (latest - 1.5 - this.shownTick) * Math.min(1, elapsed * 0.1);
+      this.shownTick = Math.min(latest, Math.max(this.shownTick, latest - 6));
+      const span = latest - this.fromTick;
+      between = span > 0 ? Math.min(1, Math.max(0, (this.shownTick - this.fromTick) / span)) : 1;
+    }
+    const at = (dot) =>
+      between < 1 && dot.from ? [dot.from[0] + (dot.position[0] - dot.from[0]) * between, dot.from[1] + (dot.position[1] - dot.from[1]) * between] : dot.position;
+    // Only what is on screen is drawn.
+    const { zoom, x: viewX, y: viewY } = r.view,
+      margin = 60,
+      left = (-viewX / zoom) * mw - margin,
+      right = ((1 - viewX) / zoom) * mw + margin,
+      top = (-viewY / zoom) * mh - margin,
+      bottom = ((1 - viewY) / zoom) * mh + margin,
+      onScreen = (p) => p[0] >= left && p[0] <= right && p[1] >= top && p[1] <= bottom;
+    let shown;
+    const visible = () => (shown ??= cache.dots.filter((dot) => onScreen(dot.position)));
+    // A big map is drawn in layers of their own, each drawn again only when it changes,
+    // with the units on the GPU (see drawLayers and gl-units.js).
+    const gl = this.reuse && r.units,
+      part = (name, version) => !gl || r.layer(name, version),
+      routeOf = (id, points) => {
+        const dot = cache.byId.get(id);
+        return dot && dot.health > 0 && points.length > 1 ? [dot.position, ...points.slice(1)] : null;
+      };
     r.begin(this.mapSize);
-    r.image("map", [mw / 2, mh / 2], this.mapSize);
-    for (const line of frontLines(state.render?.contours || [], state.dots, this.mapSize)) r.line(line);
-    for (const city of state.core.capitals || []) if (city.position) r.image("capital", [city.position[0], city.position[1] - 2], [35, 33]);
-    for (const dot of (state.core.dead_dots || []).filter(shows)) {
-      const alpha = 0.75 - (state.frame - dot.frame) * 0.01;
-      if (alpha <= 0) continue;
-      const name = dot.ship ? `${colors[dot.color]}_${dot.type === "tank" ? "heavy_ship" : "ship"}` : `${colors[dot.color]}_${dot.type}_15`;
-      r.image(name, dot.position, unitSize(dot), alpha);
+    if (part("ground", [cache.lines, state.core.capitals])) {
+      r.image("map", [mw / 2, mh / 2], this.mapSize);
+      if (this.reuse && !gl) r.cached("lines", cache.lines, () => cache.lines.forEach((line) => r.line(line)));
+      else for (const line of cache.lines) r.line(line);
+      for (const city of state.core.capitals || []) if (city.position) r.image("capital", [city.position[0], city.position[1] - 2], [35, 33]);
     }
-    const directions = new Map((state.render?.directions || []).map((d) => [d.id, d]));
-    for (let pass = 0; pass < 2; pass++)
-      for (const dot of dots) {
-        const visual = directions.get(dot.id),
-          vibration = (pass === 0 ? visual?.first_vibration : visual?.second_vibration) || 0,
-          position = [dot.position[0] + (visual?.facing?.[0] || 0) * vibration, dot.position[1] + (visual?.facing?.[1] || 0) * vibration],
-          direction = (pass === 0 ? visual?.first_visual : visual?.visual) || visual?.visual || [1, 0];
-        r.image(unitSprite(dot), position, unitSize(dot), 1, direction, false, true);
-        if (this.selected.has(dot.id)) r.draws.at(-1).dark = true;
+    const directions = cache.directions;
+    if (gl) {
+      r.layer("units", null);
+      let selection = this.selected.size;
+      for (const id of this.selected) selection = (selection * 31 + id) | 0;
+      const key = [cache, selection, options.health, options.morale];
+      if (!this.unitKey || this.unitKey.some((item, i) => item !== key[i])) {
+        this.unitKey = key;
+        this.buildUnits(gl, cache, options, mine);
       }
-    if (options.orders)
-      for (const dot of dots) {
-        if (!mine(dot) || !dot.path?.length || this.inflight.has(dot.id)) continue;
-        arrow(r, [dot.position, ...dot.path], [0, 0, 0, 0.5], 5);
+      r.draws.push({ type: "units", between });
+    } else {
+      // A big map's units and bars without WebGL: sprites cached at their size on screen.
+      const sprites = this.reuse ? r.spriteCache : null,
+        batch = sprites ? (this.spriteBatch ??= new SpriteBatch()) : null;
+      batch?.clear();
+      for (const dot of cache.dead) {
+        if (!onScreen(dot.position)) continue;
+        const alpha = 0.75 - (state.frame - dot.frame) * 0.01;
+        if (alpha <= 0) continue;
+        const name = deadSprite(dot);
+        if (batch) batch.sprite(sprites.sprite(name), dot.position[0], dot.position[1], ...unitSize(dot), [1, 0], false, alpha, false);
+        else r.image(name, dot.position, unitSize(dot), alpha);
       }
-    for (const dot of dots) if (mine(dot)) drawBars(r, dot, options);
-    if (this.fogState && this.side !== null && !this.ended) r.fog(this.fogState.outlines);
-    if (options.flags)
-      for (const city of state.core.cities || []) r.image(`${colors[city.color]}_flag`, [city.position[0] + 9, city.position[1] - 13], [21, 27]);
-    if (options.icons)
-      for (const dot of dots) {
-        const icon = mine(dot) && iconFor(dot);
-        if (icon) r.image(icon[0], [dot.position[0] + 20, dot.position[1] - 10], icon[1]);
-      }
-    if (this.production && this.side !== null && !this.ended) {
-      // The cities that produce, joined within each connected group.
-      const cities = state.core.city_positions || [],
-        zone = new Set(this.productionState().zone),
-        groups = state.core.economy?.fields?.city_enc?.[this.side] || [[...zone]];
-      for (const group of groups) {
-        const producing = group.filter((index) => zone.has(index));
-        if (producing.length === 1) r.circle(cities[producing[0]], 10, [0.2, 0.2, 0.2, 0.8]);
-        for (let i = 0; i < producing.length; i++)
-          for (let j = i + 1; j < producing.length; j++) r.line([cities[producing[i]], cities[producing[j]]], [0.2, 0.2, 0.2, 0.8], 10, 2);
+      if (batch) {
+        // The game draws every unit twice; where both look the same, one cached sprite
+        // holds both.
+        for (let pass = 0; pass < 2; pass++)
+          for (const dot of visible()) {
+            const visual = directions.get(dot.id),
+              first = visual?.first_vibration || 0,
+              second = visual?.second_vibration || 0,
+              firstTurn = visual?.first_visual || visual?.visual || [1, 0],
+              turn = visual?.visual || [1, 0],
+              same = first === second && firstTurn[0] === turn[0] && firstTurn[1] === turn[1];
+            if (same && pass === 1) continue;
+            const vibration = pass === 0 ? first : second,
+              direction = pass === 0 ? firstTurn : turn,
+              now = at(dot),
+              [width, height] = unitSize(dot);
+            batch.sprite(unitLayer(dot), now[0] + (visual?.facing?.[0] || 0) * vibration, now[1] + (visual?.facing?.[1] || 0) * vibration, width, height, direction, true, 1, this.selected.has(dot.id), same ? 2 : 1);
+          }
+        for (const dot of visible()) {
+          if (!mine(dot)) continue;
+          const [x, y] = at(dot);
+          batch.bars(x, y, dot.health / dot.max_health, dot.morale, options);
+        }
+        r.sprites(batch);
+      } else {
+        for (let pass = 0; pass < 2; pass++)
+          for (const dot of visible()) {
+            const visual = directions.get(dot.id),
+              vibration = (pass === 0 ? visual?.first_vibration : visual?.second_vibration) || 0,
+              now = at(dot),
+              position = [now[0] + (visual?.facing?.[0] || 0) * vibration, now[1] + (visual?.facing?.[1] || 0) * vibration],
+              direction = (pass === 0 ? visual?.first_visual : visual?.visual) || visual?.visual || [1, 0];
+            r.image(unitSprite(dot), position, unitSize(dot), 1, direction, false, true);
+            if (this.selected.has(dot.id)) r.draws.at(-1).dark = true;
+          }
+        for (const dot of visible()) if (mine(dot)) drawBars(r, between < 1 ? { ...dot, position: at(dot) } : dot, options);
       }
     }
-    // Orders: given ones look like the units' own routes; withheld ones and the
-    // order being drawn are solid black.
-    const routeOf = (id, points) => {
-      const dot = state.dots.find((d) => d.id === id);
-      return dot && dot.health > 0 && points.length > 1 ? [dot.position, ...points.slice(1)] : null;
-    };
-    if (options.orders)
-      for (const [id, points] of this.inflight) {
-        const route = routeOf(id, points);
-        if (route) arrow(r, route, [0, 0, 0, 0.5], 5);
+    const fogOn = this.fogState && this.side !== null && !this.ended;
+    if (part("over", [fogOn ? this.fogState.outlines : null, options.flags, state.core.cities])) {
+      if (fogOn) {
+        if (this.reuse && !gl) r.cached("fog", this.fogState.outlines, () => r.fog(this.fogState.outlines));
+        else r.fog(this.fogState.outlines);
       }
+      if (options.flags)
+        for (const city of state.core.cities || [])
+          if (onScreen(city.position)) r.image(`${colors[city.color]}_flag`, [city.position[0] + 9, city.position[1] - 13], [21, 27]);
+    }
+    const productionOn = this.production && this.side !== null && !this.ended;
+    // On a big map the icons and routes follow a new frame one repaint later, so that
+    // their work does not fall on the repaint that takes in the frame.
+    const marked = gl && fresh && this.markedState ? this.markedState : state;
+    this.markedState = state;
+    if (part("marks", [marked, options.icons, options.orders, this.inflightVersion, productionOn ? this.productionState() : null])) {
+      if (options.icons)
+        for (const dot of visible()) {
+          const icon = mine(dot) && iconFor(dot);
+          if (icon) r.image(icon[0], [dot.position[0] + 20, dot.position[1] - 10], icon[1]);
+        }
+      if (productionOn) {
+        // The cities that produce, joined within each connected group.
+        const cities = state.core.city_positions || [],
+          zone = new Set(this.productionState().zone),
+          groups = state.core.economy?.fields?.city_enc?.[this.side] || [[...zone]];
+        for (const group of groups) {
+          const producing = group.filter((index) => zone.has(index));
+          if (producing.length === 1) r.circle(cities[producing[0]], 10, [0.2, 0.2, 0.2, 0.8]);
+          for (let i = 0; i < producing.length; i++)
+            for (let j = i + 1; j < producing.length; j++) r.line([cities[producing[i]], cities[producing[j]]], [0.2, 0.2, 0.2, 0.8], 10, 2);
+        }
+      }
+      // Routes, the units' own and the orders on their way: every arrow is one path
+      // (thousands of units may have one), kept until the frame, the orders or the view
+      // change.
+      if (options.orders) {
+        const key = [this.inflightVersion, left, right, top, bottom].join();
+        if (this.routeDraw?.state !== state || this.routeDraw.key !== key) {
+          const routes = new Polylines(((r.frame.vw / mw) * zoom) * 12 < 8);
+          for (const dot of visible()) {
+            if (!mine(dot) || !dot.path?.length || this.inflight.has(dot.id)) continue;
+            arrowInto(routes, [dot.position, ...dot.path]);
+          }
+          for (const [id, points] of this.inflight) {
+            const route = routeOf(id, points);
+            if (route) arrowInto(routes, route);
+          }
+          const start = r.draws.length;
+          r.lines(routes, [0, 0, 0, 0.5], 5);
+          this.routeDraw = { state, key, draw: r.draws.splice(start)[0] || null };
+        }
+        const draw = this.routeDraw.draw;
+        if (draw && this.reuse && !gl) r.cached("routes", this.routeDraw, () => r.draws.push(draw));
+        else if (draw) r.draws.push(draw);
+      }
+    }
+    // Withheld orders and the order being drawn are solid black. These and what follows
+    // are drawn on every frame.
+    if (gl) r.layer("top", null);
+    const held = new Polylines(((r.frame.vw / mw) * zoom) * 12 < 8);
     for (const [id, points] of this.staged) {
       const route = routeOf(id, points);
-      if (route) arrow(r, route, [0, 0, 0, 1], 3);
+      if (route) arrowInto(held, route);
     }
     if (this.gesture) {
       const orders = this.preview(this.gesture);
       if (orders)
         for (const [id, points] of orders) {
           const route = routeOf(id, points);
-          if (route) arrow(r, route, [0, 0, 0, 1], 3);
+          if (route) arrowInto(held, route);
         }
       else if (this.gesture.points.length > 1) r.line([...this.gesture.points, this.gesture.end], [0, 0, 0, 0.5], 5, 2);
     }
+    r.lines(held, [0, 0, 0, 1], 3);
     if (options.stats) drawStats(r, state);
     if (options.players)
       for (let side = 0, line = 0; side < this.sides; side++)
@@ -1065,6 +1654,8 @@ export class Game {
   destroy() {
     clearInterval(this.clock);
     this.worker?.terminate();
+    this.linesWorker?.terminate();
+    this.renderer.removeLayers();
     this.sound.stop();
   }
 }
@@ -1086,9 +1677,10 @@ function onRateLine(point) {
 }
 
 /** A route with the replay player's arrowhead at its end. */
-function arrow(renderer, path, color, width, head = true) {
+/** Adds an arrow's lines to `lines` (Polylines): the path, then its head. */
+function arrowInto(lines, path, head = true) {
   if (path.length < 2) return;
-  renderer.line(path, color, width, 1);
+  lines.add(path);
   if (!head) return;
   const end = path.at(-1),
     previous = path.at(-2),
@@ -1098,5 +1690,6 @@ function arrow(renderer, path, color, width, head = true) {
     ux = dx / length,
     uy = dy / length;
   for (const side of [-1, 1])
-    renderer.line([end, [end[0] + 9 * ux - side * 6 * uy, end[1] + 9 * uy + side * 6 * ux], [end[0] + 12 * ux - side * 12 * uy, end[1] + 12 * uy + side * 12 * ux]], color, width, 2);
+    lines.add3(end[0], end[1], end[0] + 9 * ux - side * 6 * uy, end[1] + 9 * uy + side * 6 * ux, end[0] + 12 * ux - side * 12 * uy, end[1] + 12 * uy + side * 12 * ux);
 }
+

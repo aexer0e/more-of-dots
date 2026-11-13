@@ -2,7 +2,9 @@
 // chunk as it was written and answer `replay_chunk` with it; the render worker
 // inflates and decodes it into the state records the player draws.
 export const BINARY_FRAMES = 1,
-  JSON_LINES = 2;
+  JSON_LINES = 2,
+  // The big-map engine's live frames (engine/mass-sim: live_lite_chunk), uncompressed.
+  LITE_FRAMES = 3;
 const MAGIC = "WODFRM1\n",
   STATIC_RECORD = 1,
   CHUNK_RECORD = 2,
@@ -84,20 +86,135 @@ export async function jsonChunk(lines, frames, fighting, produced) {
 }
 
 /// `replay_chunk` answers with the index of the chunk's first frame, then the chunk.
-export async function decodeChunk(buffer, staticRecord) {
+/// `reuse`, kept by the caller between live frames of a big map, keeps one object per
+/// unit and updates it in place (with `from`, its position in the previous frame), and
+/// keeps the outlines a frame leaves out. Thousands of new objects a frame stall the page.
+export async function decodeChunk(buffer, staticRecord, reuse = null) {
   const start = new DataView(buffer).getUint32(0, true),
     payload = new Uint8Array(buffer, 4),
-    header = chunkHeader(payload),
-    data = await piped(payload.subarray(header.data), new DecompressionStream("deflate-raw"));
+    header = chunkHeader(payload);
+  if (header.encoding === LITE_FRAMES) {
+    const data = payload.subarray(header.data);
+    return { start, frames: [decodeLite(data, header, staticRecord, reuse ?? {})], bytes: data.length };
+  }
+  const data = await piped(payload.subarray(header.data), new DecompressionStream("deflate-raw"));
   const frames =
     header.encoding === JSON_LINES
       ? text.decode(data).split("\n").filter(Boolean).map((line) => JSON.parse(line))
-      : decodeFrames(data, header, staticRecord);
+      : decodeFrames(data, header, staticRecord, reuse);
   if (frames.length !== header.frames.length) throw new Error("Replay chunk frames do not match its index.");
   return { start, frames, bytes: data.length };
 }
 
-function decodeFrames(bytes, header, staticRecord) {
+// Directions in the lite frames are a byte: 256 steps of a turn.
+const COS = Float64Array.from({ length: 256 }, (_, i) => Math.cos((i / 256) * 2 * Math.PI)),
+  SIN = Float64Array.from({ length: 256 }, (_, i) => Math.sin((i / 256) * 2 * Math.PI));
+
+/// A lite live frame into the objects kept in `reuse` (see decodeChunk): what the frame
+/// leaves out (routes, deaths, outlines, core) stays as the previous frames left it.
+function decodeLite(bytes, header, staticRecord, reuse) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    cityPositions = staticRecord.static_core?.city_positions || [];
+  let at = 0;
+  const u8 = () => bytes[at++],
+    i8 = () => view.getInt8(at++),
+    u16 = () => ((at += 2), view.getUint16(at - 2, true)),
+    u32 = () => ((at += 4), view.getUint32(at - 4, true)),
+    f32 = () => ((at += 4), view.getFloat32(at - 4, true)),
+    f64 = () => ((at += 8), view.getFloat64(at - 8, true));
+  const units = (reuse.dots ??= new Map()),
+    turns = (reuse.directions ??= new Map()),
+    frame = u32(),
+    count = u32(),
+    dots = new Array(count),
+    directions = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const id = u32(),
+      color = u8(),
+      type = unitTypes[u8()],
+      flags = u8(),
+      terrain = terrains[u8()],
+      x = f32(),
+      y = f32();
+    let dot = units.get(id);
+    if (!dot) units.set(id, (dot = { id, position: [x, y], from: [x, y], path: [] }));
+    dot.from[0] = dot.position[0];
+    dot.from[1] = dot.position[1];
+    dot.position[0] = x;
+    dot.position[1] = y;
+    dot.color = color;
+    dot.type = type;
+    dot.health = f32();
+    dot.max_health = f32();
+    dot.morale = u8();
+    dot.water_timer = u16();
+    dot.ship_timer = u16();
+    dot.in_city = !!(flags & 2);
+    dot.healing = !!(flags & 4);
+    dot.zrtyqz = terrain;
+    dot.ship = !!(flags & 1);
+    let turn = turns.get(id);
+    if (!turn) turns.set(id, (turn = { id, facing: [1, 0], first_visual: [1, 0], visual: [1, 0] }));
+    const facing = u8(),
+      first = u8(),
+      visual = u8();
+    turn.facing[0] = COS[facing];
+    turn.facing[1] = SIN[facing];
+    turn.first_visual[0] = COS[first];
+    turn.first_visual[1] = SIN[first];
+    turn.visual[0] = COS[visual];
+    turn.visual[1] = SIN[visual];
+    turn.first_vibration = i8() / 40;
+    turn.second_vibration = i8() / 40;
+    if (flags & 8) {
+      const length = u16();
+      if (dot.path.length !== length) dot.path = Array.from({ length }, () => [0, 0]);
+      for (const point of dot.path) (point[0] = f32()), (point[1] = f32());
+    }
+    dots[i] = dot;
+    directions[i] = turn;
+  }
+  const deaths = (reuse.deaths ??= []);
+  for (let i = 0, n = u16(); i < n; i++)
+    deaths.push({ frame: u32(), color: u8(), type: unitTypes[u8()], ship: !!u8(), position: [f32(), f32()] });
+  reuse.deaths = deaths.filter((death) => frame - death.frame < DEATH_WINDOW);
+  const changes = u8();
+  if (changes & 1)
+    reuse.contours = Array.from({ length: u8() }, () =>
+      Array.from({ length: u16() }, () => Array.from({ length: u32() }, () => [f64(), f64()])),
+    );
+  if (changes & 2) {
+    const length = u32();
+    reuse.core = JSON.parse(text.decode(bytes.subarray(at, at + length)));
+    at += length;
+  }
+  if (at !== bytes.length) throw new Error("Replay chunk has unread data.");
+  const core = reuse.core;
+  if (!core) throw new Error("Replay chunk does not start with a complete frame.");
+  if (reuse.coreFor !== core) {
+    reuse.coreFor = core;
+    reuse.cities = cityPositions.map((position, i) => ({ position, color: core.city_colors[i] }));
+  }
+  return {
+    kind: "state",
+    frame,
+    audio: [header.fighting[0], header.produced[0]],
+    dots,
+    core: {
+      frame,
+      economy: core.economy,
+      troop_casualties: core.troop_casualties,
+      strength: core.strength,
+      capitals: core.capitals,
+      city_positions: cityPositions,
+      cities: reuse.cities,
+      dead_dots: reuse.deaths,
+    },
+    render: { contours: reuse.contours ?? [], directions },
+  };
+}
+
+function decodeFrames(bytes, header, staticRecord, reuse) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
     cityPositions = staticRecord.static_core?.city_positions || [];
   let at = 0;
@@ -111,8 +228,12 @@ function decodeFrames(bytes, header, staticRecord) {
   const paths = new Map(),
     deaths = [],
     states = [];
-  let contours = [],
+  let contours = reuse?.contours ?? [],
     core = null;
+  if (reuse) {
+    reuse.dots ??= new Map();
+    reuse.directions ??= new Map();
+  }
   for (let n = 0; n < header.frames.length; n++) {
     const frame = u32(),
       dots = [],
@@ -125,10 +246,46 @@ function decodeFrames(bytes, header, staticRecord) {
         terrain = terrains[u8()],
         water_timer = u16(),
         ship_timer = u16(),
-        position = vec(f32),
+        x = f32(),
+        y = f32(),
         health = f64(),
         max_health = f32(),
         morale = f32();
+      if (reuse) {
+        let direction = reuse.directions.get(id);
+        if (!direction) reuse.directions.set(id, (direction = { id, facing: [0, 0], first_visual: [0, 0], visual: [0, 0] }));
+        direction.facing[0] = f32(), direction.facing[1] = f32();
+        direction.first_visual[0] = f32(), direction.first_visual[1] = f32();
+        direction.visual[0] = f32(), direction.visual[1] = f32();
+        direction.first_vibration = f32();
+        direction.second_vibration = f32();
+        directions.push(direction);
+        let dot = reuse.dots.get(id);
+        if (!dot) reuse.dots.set(id, (dot = { id, position: [x, y], from: [x, y], path: [] }));
+        dot.from[0] = dot.position[0], dot.from[1] = dot.position[1];
+        dot.position[0] = x, dot.position[1] = y;
+        const length = u16();
+        if (length !== 0xffff) {
+          if (dot.path.length !== length) dot.path = Array.from({ length }, () => [0, 0]);
+          for (const point of dot.path) (point[0] = f32()), (point[1] = f32());
+        }
+        Object.assign(dot, {
+          color,
+          type,
+          health,
+          max_health,
+          morale,
+          water_timer,
+          ship_timer,
+          in_city: !!(flags & 2),
+          healing: !!(flags & 4),
+          zrtyqz: terrain,
+          ship: !!(flags & 1),
+        });
+        dots.push(dot);
+        continue;
+      }
+      const position = [x, y];
       directions.push({
         id,
         facing: vec(f32),
@@ -188,5 +345,6 @@ function decodeFrames(bytes, header, staticRecord) {
     });
   }
   if (at !== bytes.length) throw new Error("Replay chunk has unread data.");
+  if (reuse) reuse.contours = contours;
   return states;
 }

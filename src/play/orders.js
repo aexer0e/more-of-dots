@@ -25,25 +25,38 @@ export function extendGesture(gesture, point) {
   if (distance(gesture.at(-1), point) >= WAYPOINT_SPACING) gesture.push(point);
 }
 
-/** Orders for units following a drawn route; `route[0]` is where the drag began. */
-export function routeOrders(units, route) {
+/** Orders for units following a drawn route; `route[0]` is where the drag began.
+ * With `shared` (the big maps) every unit's waypoints are its whole position plus the
+ * same whole offsets, at most a pixel from the game's rounding, so that a big group
+ * travels as one route and a list of units (see packOrders). */
+export function routeOrders(units, route, shared = false) {
   const orders = new Map();
   const [ox, oy] = route[0];
+  const offsets = shared ? route.slice(1).map(([x, y]) => whole([x - ox, y - oy])) : null;
   for (const unit of units) {
     const [ux, uy] = unit.position;
-    orders.set(unit.id, [whole(unit.position), ...route.slice(1).map(([x, y]) => whole([x + ux - ox, y + uy - oy]))]);
+    if (shared) {
+      const [sx, sy] = whole(unit.position);
+      orders.set(unit.id, [[sx, sy], ...offsets.map(([dx, dy]) => [sx + dx, sy + dy])]);
+    } else orders.set(unit.id, [whole(unit.position), ...route.slice(1).map(([x, y]) => whole([x + ux - ox, y + uy - oy]))]);
   }
   return orders;
 }
 
-/** Orders for units sent to a clicked point, keeping the group's shape. */
-export function clickOrders(units, target) {
+/** Orders for units sent to a clicked point, keeping the group's shape (with `shared`,
+ * the same whole offset for every unit, as in routeOrders). */
+export function clickOrders(units, target, shared = false) {
   const orders = new Map();
   if (!units.length) return orders;
   const cx = units.reduce((sum, unit) => sum + unit.position[0], 0) / units.length,
     cy = units.reduce((sum, unit) => sum + unit.position[1], 0) / units.length;
-  for (const unit of units)
-    orders.set(unit.id, [whole(unit.position), whole([target[0] + unit.position[0] - cx, target[1] + unit.position[1] - cy])]);
+  const [dx, dy] = whole([target[0] - cx, target[1] - cy]);
+  for (const unit of units) {
+    if (shared) {
+      const [sx, sy] = whole(unit.position);
+      orders.set(unit.id, [[sx, sy], [sx + dx, sy + dy]]);
+    } else orders.set(unit.id, [whole(unit.position), whole([target[0] + unit.position[0] - cx, target[1] + unit.position[1] - cy])]);
+  }
   return orders;
 }
 
@@ -108,13 +121,86 @@ export function assign(cost) {
   return columns;
 }
 
+/** The most units a formation assigns exactly. */
+const MOST_ASSIGNED = 150;
+
 /** Orders for units spread along a formation line. */
 export function formationOrders(units, line) {
   const orders = new Map(),
     slots = spread(line, units.length);
   if (!slots.length) return orders;
+  if (units.length > MOST_ASSIGNED) {
+    // The exact assignment takes time with the cube of the units (the big maps have
+    // thousands), so many units take the slots in their order along the line's
+    // direction, which is close to the shortest total for a line.
+    const [first, last] = [line[0], line.at(-1)],
+      along = [last[0] - first[0], last[1] - first[1]],
+      key = (p) => (p[0] - first[0]) * along[0] + (p[1] - first[1]) * along[1];
+    [...units].sort((a, b) => key(a.position) - key(b.position) || a.id - b.id)
+      .forEach((unit, i) => orders.set(unit.id, [whole(unit.position), whole(slots[i])]));
+    return orders;
+  }
   const columns = assign(units.map((unit) => slots.map((slot) => distance(unit.position, slot))));
   units.forEach((unit, row) => orders.set(unit.id, [whole(unit.position), whole(slots[columns[row]])]));
+  return orders;
+}
+
+/** The fewest units that make a group worth sending as one (see packOrders). */
+const GROUP_SIZE = 4;
+
+/** Orders for the room, as `{ orders, groups }`: units whose waypoints are their start
+ * plus the same offsets, or who go to the same waypoints, travel as one group with the
+ * route once and each unit's id and start, `{ r: [dx, dy, ...] or a: [x, y, ...],
+ * u: [id, x, y, ...] }`; the rest stay `[id, points]`. A thousand units' route fits in a
+ * message a fraction of the size. unpackGroups gives the orders back. */
+export function packOrders(orders) {
+  const relative = new Map(),
+    absolute = new Map(),
+    plain = [];
+  for (const [id, points] of orders) {
+    if (points.length < 2) {
+      plain.push([id, points]);
+      continue;
+    }
+    const [sx, sy] = points[0],
+      key = points.slice(1).map(([x, y]) => `${x - sx},${y - sy}`).join(";");
+    if (!relative.has(key)) relative.set(key, []);
+    relative.get(key).push([id, points]);
+  }
+  const groups = [];
+  for (const members of relative.values()) {
+    if (members.length >= GROUP_SIZE) {
+      const [sx, sy] = members[0][1][0];
+      groups.push({ r: members[0][1].slice(1).flatMap(([x, y]) => [x - sx, y - sy]), u: members.flatMap(([id, points]) => [id, ...points[0]]) });
+      continue;
+    }
+    for (const [id, points] of members) {
+      const key = points.slice(1).join(";");
+      if (!absolute.has(key)) absolute.set(key, []);
+      absolute.get(key).push([id, points]);
+    }
+  }
+  for (const members of absolute.values()) {
+    if (members.length >= GROUP_SIZE) groups.push({ a: members[0][1].slice(1).flat(), u: members.flatMap(([id, points]) => [id, ...points[0]]) });
+    else plain.push(...members);
+  }
+  return { orders: plain, groups };
+}
+
+/** The orders of packed groups, `[id, points]` each (see packOrders). */
+export function unpackGroups(groups) {
+  const orders = [];
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const units = Array.isArray(group?.u) ? group.u : [],
+      route = Array.isArray(group?.r) ? group.r : Array.isArray(group?.a) ? group.a : [],
+      relative = Array.isArray(group?.r);
+    for (let i = 0; i + 2 < units.length; i += 3) {
+      const [id, sx, sy] = [units[i], units[i + 1], units[i + 2]],
+        points = [[sx, sy]];
+      for (let k = 0; k + 1 < route.length; k += 2) points.push(relative ? [sx + route[k], sy + route[k + 1]] : [route[k], route[k + 1]]);
+      orders.push([id, points]);
+    }
+  }
   return orders;
 }
 

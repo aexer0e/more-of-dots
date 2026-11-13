@@ -22,20 +22,47 @@ function smooth(points, loop) {
   return result;
 }
 
-function pushout(points, positions, radius = 18) {
+const PUSH_RADIUS = 18;
+
+/// The units' positions in cells of PUSH_RADIUS, for `pushout`.
+// Cells by number: column times CELL_ROW plus row (rows of a map never reach CELL_ROW).
+const CELL_ROW = 1 << 20;
+const cellKey = (x, y) => x * CELL_ROW + y;
+
+function cellsOf(positions, radius = PUSH_RADIUS) {
+  const cells = new Map();
+  positions.forEach((dot, index) => {
+    const at = cellKey(Math.floor(dot[0] / radius), Math.floor(dot[1] / radius));
+    if (!cells.has(at)) cells.set(at, []);
+    cells.get(at).push(index);
+  });
+  return cells;
+}
+
+function pushout(points, positions, cells = cellsOf(positions), radius = PUSH_RADIUS) {
   if (!positions.length) return points;
+  // Only a unit within the radius moves a point, so each point looks at the units in
+  // the grid cells around it rather than every unit (the big maps have thousands).
+  // Of equally near units the first in order wins, as in a scan of them all.
   return points.map((point) => {
     let closest = null,
-      distance2 = Infinity;
-    for (const dot of positions) {
-      const dx = point[0] - dot[0],
-        dy = point[1] - dot[1],
-        distance = dx * dx + dy * dy;
-      if (distance < distance2) {
-        distance2 = distance;
-        closest = dot;
-      }
-    }
+      distance2 = Infinity,
+      first = Infinity;
+    const cx = Math.floor(point[0] / radius),
+      cy = Math.floor(point[1] / radius);
+    for (let x = cx - 1; x <= cx + 1; x++)
+      for (let y = cy - 1; y <= cy + 1; y++)
+        for (const index of cells.get(cellKey(x, y)) || []) {
+          const dot = positions[index],
+            dx = point[0] - dot[0],
+            dy = point[1] - dot[1],
+            distance = dx * dx + dy * dy;
+          if (distance < distance2 || (distance === distance2 && index < first)) {
+            distance2 = distance;
+            closest = dot;
+            first = index;
+          }
+        }
     if (distance2 >= radius * radius) return point;
     if (distance2 === 0) return [...closest];
     const scale = radius / Math.sqrt(distance2);
@@ -74,6 +101,7 @@ export function frontLines(contours, dots, mapSize = [1600, 900]) {
       .filter((d) => d && d.health > 0 && !d.ship && d.color === color)
       .map((d) => d.position),
   );
+  const cells = positions.map((list) => cellsOf(list));
   // As in the game, a side's polygon is matched against each of the other side's
   // polygons in turn. Points past the map's edge are shared by every polygon that
   // reaches that edge, so matching against all of them at once would join two
@@ -81,19 +109,33 @@ export function frontLines(contours, dots, mapSize = [1600, 900]) {
   const sets = contours.map((polygons) =>
     polygons.map((polygon) => new Set(polygon.map(key))),
   );
+  // The polygons of each side that hold each vertex, so a polygon is matched only
+  // against those it shares a vertex with, in their order.
+  const holders = sets.map((side) => {
+    const index = new Map();
+    side.forEach((set, i) => {
+      for (const k of set) {
+        if (!index.has(k)) index.set(k, []);
+        index.get(k).push(i);
+      }
+    });
+    return index;
+  });
   const adjust = (points, loop, colors) => {
     if (points.length <= 2) return points.map((p) => [...p]);
     extend(points);
     let line = smooth(points, loop);
-    for (const color of colors) line = pushout(line, positions[color]);
+    for (const color of colors) line = pushout(line, positions[color], cells[color]);
     return line;
   };
   for (let side = 0; side < contours.length; side++)
     for (let other = side + 1; other < contours.length; other++)
       contours[side].forEach((polygon, index) => {
-        const own = sets[side][index];
-        for (const set of sets[other]) {
-          if (![...own].some((k) => set.has(k))) continue;
+        const own = sets[side][index],
+          sharing = new Set();
+        for (const k of own) for (const i of holders[other].get(k) || []) sharing.add(i);
+        for (const i of [...sharing].sort((a, b) => a - b)) {
+          const set = sets[other][i];
           const mask = polygon.map((p) => set.has(key(p)));
           if (mask.every(Boolean)) {
             lines.push(adjust(polygon, true, [side, other]));

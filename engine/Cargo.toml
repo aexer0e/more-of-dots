@@ -1,5 +1,5 @@
 [workspace]
-members = ["replay-sim", "replay-sim-web"]
+members = ["replay-sim", "replay-sim-web", "mass-sim", "mass-sim-web"]
 # The browser module is built for wasm32-unknown-unknown by scripts/build-site.mjs.
 default-members = ["replay-sim"]
 resolver = "2"

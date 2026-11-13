@@ -12,10 +12,12 @@
 // Messages are JSON, except the replay, which follows "create" and "replay" as
 // binary pieces of at most PIECE bytes.
 //   page → room: create {name?, frame, sides, side, title, size}, join {name?, token?}, side {side}, name {name},
-//                start, command {orders?, production?, message?, peace?}, surrender, hash {turn, hash}
+//                start, command {orders?, production?, message?, peace?}, surrender, hash {turn, hash},
+//                request {side} (asks the host for a side once the match runs; null withdraws),
+//                answer {player, accept} (the host's reply)
 //   room → page: room {code, you, token, players, frame, sides, title, started},
 //                replay {size}, start {delay}, turn {turn, commands}, log {turns},
-//                desync {turn}, error {error}
+//                desync {turn}, declined {side}, error {error}
 import { MAX_SIZE } from "./replay.js";
 
 export const PIECE = 256 << 10;
@@ -23,7 +25,10 @@ const TURN_MS = 500;
 // The game waits 150 frames before an online match starts.
 const START_DELAY_MS = 5000;
 const MAX_PLAYERS = 8;
-const MAX_MESSAGE = 64 << 10;
+// A big map's orders for thousands of units (packed into groups by the page).
+const MAX_MESSAGE = 1 << 20;
+const MAX_ORDERS = 10000;
+const MAX_GROUPS = 256;
 // Rooms are four digits, easy to read out and type.
 const CODE = /^\d{4}$/;
 
@@ -41,7 +46,7 @@ export class MatchRoom {
     this.replay = null;
     this.frame = 0;
     this.sides = 2;
-    this.players = []; // {id, token, name, side, socket, host}
+    this.players = []; // {id, token, name, side, socket, host, request}
     this.nextId = 1;
     this.started = false;
     this.turns = [];
@@ -115,7 +120,8 @@ export class MatchRoom {
             if (clean(message.name)) player.name = clean(message.name);
           } else {
             if (this.players.filter((p) => p.socket).length >= MAX_PLAYERS) return fail("This room is full.");
-            player = this.add(socket, message.name, false, null);
+            // Once the match runs a newcomer watches, and asks the host for a side.
+            player = this.add(socket, message.name, false, this.started ? null : undefined);
           }
           this.sendReplay(socket);
           if (this.started) {
@@ -136,6 +142,24 @@ export class MatchRoom {
           if (side !== null && !(side >= 0 && side < this.sides)) return;
           player.side = side;
           this.broadcastRoom();
+        } else if (message.type === "request") {
+          if (!this.started) return;
+          const side = message.side === null ? null : Math.trunc(Number(message.side));
+          if (side !== null && !(side >= 0 && side < this.sides)) return;
+          if (side !== null && side === player.side) return;
+          // The host needs nobody's leave.
+          if (player.host && side !== null) player.side = side;
+          else player.request = side;
+          this.broadcastRoom();
+        } else if (message.type === "answer") {
+          if (!player.host) return;
+          const asking = this.players.find((p) => p.id === message.player);
+          if (asking?.request === undefined || asking.request === null) return;
+          const side = asking.request;
+          asking.request = null;
+          if (message.accept === true) asking.side = side;
+          else this.send(asking.socket, { type: "declined", side });
+          this.broadcastRoom();
         } else if (message.type === "start") {
           if (!player.host || this.started || !this.replay) return;
           if (!this.everySideSeated()) return send({ type: "error", error: "Each side needs a player." });
@@ -143,7 +167,8 @@ export class MatchRoom {
         } else if (message.type === "command") {
           if (!this.started || player.side === null) return;
           const entry = { side: player.side };
-          if (Array.isArray(message.orders) && message.orders.length) entry.orders = message.orders.slice(0, 512);
+          if (Array.isArray(message.orders) && message.orders.length) entry.orders = message.orders.slice(0, MAX_ORDERS);
+          if (Array.isArray(message.groups) && message.groups.length) entry.groups = message.groups.slice(0, MAX_GROUPS);
           if (Array.isArray(message.production) && message.production.length) entry.production = message.production.slice(0, 8);
           if (typeof message.message === "string" && message.message.trim()) entry.message = message.message.trim().slice(0, 200);
           if (message.peace === true) entry.peace = true;
@@ -160,6 +185,7 @@ export class MatchRoom {
     const leave = () => {
       if (!player || player.socket !== socket) return;
       player.socket = null;
+      player.request = null;
       // Before the match a player who leaves gives up their seat.
       if (!this.started) this.players = this.players.filter((p) => p !== player);
       if (!this.players.some((p) => p.socket)) this.stop();
@@ -169,13 +195,14 @@ export class MatchRoom {
     socket.addEventListener("error", leave);
   }
 
+  /** `side` is the player's side, null to watch, or undefined for the first side
+   * nobody has yet. */
   add(socket, name, host, side) {
-    // A player who joins takes the first side nobody has yet.
     const taken = new Set(this.players.filter((p) => p.socket).map((p) => p.side));
     const open = [...Array(this.sides).keys()].find((s) => !taken.has(s)) ?? null;
-    const seat = Number.isInteger(side) && side >= 0 && side < this.sides ? side : open;
+    const seat = side === null ? null : Number.isInteger(side) && side >= 0 && side < this.sides ? side : open;
     const id = this.nextId++;
-    const player = { id, token: token(), name: clean(name) || this.numbered(), side: seat, socket, host };
+    const player = { id, token: token(), name: clean(name) || this.numbered(), side: seat, socket, host, request: null };
     this.players.push(player);
     return player;
   }
@@ -204,7 +231,7 @@ export class MatchRoom {
       const next = this.players.find((p) => p.socket);
       for (const player of this.players) player.host = player === next;
     }
-    const players = this.players.map(({ id, name, side, host, socket }) => ({ id, name, side, host, online: !!socket }));
+    const players = this.players.map(({ id, name, side, host, socket, request }) => ({ id, name, side, host, online: !!socket, request: request ?? null }));
     for (const player of this.players)
       this.send(player.socket, {
         type: "room",

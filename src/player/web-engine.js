@@ -2,7 +2,7 @@
 // chunks (docs/replay-frames.md). The simulation is one long synchronous call, so a
 // replay is cancelled by terminating this worker.
 import { RecordReader, jsonChunk } from "./frames.js";
-import { loadEngine } from "./wasm-engine.js";
+import { engineFile, loadEngine } from "./wasm-engine.js";
 
 const post = {
   static: (record) => postMessage({ kind: "static", record }),
@@ -11,7 +11,7 @@ const post = {
 
 async function open(bytes, base, write) {
   // Revalidated: the address is the same for every release of the engine.
-  const wasm = await fetch(`${base}engine/replay-sim.wasm`, { cache: "no-cache" });
+  const wasm = await fetch(`${base}engine/${await engineFile(bytes)}`, { cache: "no-cache" });
   if (!wasm.ok) throw new Error("The replay engine could not be loaded.");
   const engine = await loadEngine(await wasm.arrayBuffer(), write);
   // Official maps are hosted beside the page and fetched only when a replay names one.

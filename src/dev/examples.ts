@@ -2,6 +2,8 @@ import type { Snapshot, History, Board } from '../leaderboard/client';
 import type { StoredMap } from '../map-editor/lib/types';
 
 type Examples = { generatedAt: number; identity: string; replays: { filePath: string }[]; maps: StoredMap[]; leaderboard: { latest: Snapshot; history: Snapshot[] } };
+// New maps in example mode, by id, until their first save (as in the desktop app).
+const exampleNewMaps = new Map<string, StoredMap>();
 let pending: Promise<Examples> | undefined;
 export function examples() {
   return pending ??= fetch('/__examples/data.json').then(async (response) => {
@@ -156,14 +158,17 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
     case 'list_maps': result = data.maps; break;
     case 'read_map': result = data.maps.find((m) => m.id === args.fileName); break;
     case 'save_map': {
-      const map = data.maps.find((m) => m.id === args.fileName);
-      if (!map) throw new Error('Example map not found.');
       const incoming = args.data as StoredMap['data'];
-      if (args.publish && incoming.infantry.some((units, i) => units.length + incoming.tanks[i].length === 0)) {
-        throw new Error('Each team needs at least one unit before saving to the game. You can save this map as a draft.');
+      if (incoming.infantry.some((units, i) => units.length + incoming.tanks[i].length === 0)) {
+        throw new Error('Each team needs at least one unit before the map can be saved to the game.');
       }
+      // A new map gets its file on its first save.
+      const fresh = String(args.fileName).startsWith('new:');
+      const map = fresh ? { ...exampleNewMaps.get(String(args.fileName))!, id: `example-${Date.now()}.txt` } : data.maps.find((m) => m.id === args.fileName);
+      if (!map) throw new Error('Example map not found.');
+      if (fresh) data.maps.unshift(map);
       map.data = args.data as StoredMap['data'];
-      map.status = args.publish ? 'published' : 'draft';
+      map.status = 'published';
       const header = Uint8Array.from(atob(map.data.map_surface).slice(0, 24), (char) => char.charCodeAt(0));
       if (header.length >= 24) { const view = new DataView(header.buffer); map.width = view.getUint32(16); map.height = view.getUint32(20); }
       map.teamCount = Math.max(2, map.data.infantry.length, map.data.tanks.length);
@@ -171,14 +176,13 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
     }
     case 'create_map': {
       const { emptyMapData } = await import('../map-editor/lib/mapCodec');
-      const id = `example-${Date.now()}.txt`;
+      const id = `new:${String(args.name)}.txt`;
       const [width, height] = args.large ? [1920, 1080] : [960, 540];
-      const map: StoredMap = { id, fileName: `${String(args.name)}.txt`, name: String(args.name), data: emptyMapData(Number(args.teams) || 2, width, height), width, height, teamCount: Number(args.teams) || 2, createdAt: Date.now(), updatedAt: Date.now() };
-      map.status = 'draft';
-      data.maps.unshift(map); result = map; break;
+      const map: StoredMap = { id, fileName: `${String(args.name)}.txt`, name: String(args.name), data: emptyMapData(Number(args.teams) || 2, width, height), width, height, teamCount: Number(args.teams) || 2, status: 'unsaved', createdAt: Date.now(), updatedAt: Date.now() };
+      exampleNewMaps.set(id, map); result = map; break;
     }
     case 'rename_map': {
-      const map = data.maps.find((m) => m.id === args.fileName);
+      const map = data.maps.find((m) => m.id === args.fileName) ?? exampleNewMaps.get(String(args.fileName));
       if (!map) throw new Error('Map not found.');
       const name = String(args.name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 64);
       if (!name) throw new Error('Enter a map name with letters or numbers.');
@@ -186,6 +190,27 @@ export async function exampleInvoke<T>(command: string, args: Record<string, unk
       map.name = name;
       map.fileName = `${name}.txt`;
       map.updatedAt = Date.now(); result = map; break;
+    }
+    // Only a map hub map ({"map": {...}}, from the Map code tab) imports here; replays need the desktop app.
+    case 'import_map_from_replay': {
+      let shared: StoredMap['data'] | undefined;
+      try { shared = JSON.parse(atob(String(args.replayBase64 ?? ''))).map; } catch { shared = undefined; }
+      if (!shared || typeof shared !== 'object' || !shared.map_surface) throw new Error('This action needs the desktop app. Example mode never launches the game or changes your Steam files.');
+      const header = Uint8Array.from(atob(shared.map_surface).slice(0, 24), (char) => char.charCodeAt(0));
+      const view = new DataView(header.buffer);
+      const [width, height] = header.length >= 24 ? [view.getUint32(16), view.getUint32(20)] : [960, 540];
+      const name = String(args.name);
+      const map: StoredMap = { id: `example-${Date.now()}.txt`, fileName: `${name}.txt`, name, data: shared, width, height, teamCount: Math.max(2, shared.infantry?.length ?? 0), status: 'published', createdAt: Date.now(), updatedAt: Date.now() };
+      data.maps.unshift(map); result = map; break;
+    }
+    case 'duplicate_map': {
+      const source = data.maps.find((m) => m.id === args.fileName);
+      if (!source) throw new Error('Map not found.');
+      const base = `${source.name} copy`;
+      let name = base;
+      for (let n = 2; data.maps.some((m) => m.name.toLowerCase() === name.toLowerCase()); n++) name = `${base} ${n}`;
+      const map: StoredMap = { ...structuredClone(source), id: `example-${Date.now()}.txt`, fileName: `${name}.txt`, name, status: 'published', createdAt: Date.now(), updatedAt: Date.now() };
+      data.maps.unshift(map); result = map; break;
     }
     case 'delete_maps': data.maps = data.maps.filter((m) => !(args.fileNames as string[]).includes(m.id)); result = args.fileNames; break;
     // A pretend running game; example mode never touches the real one.

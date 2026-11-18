@@ -855,23 +855,6 @@ fn map_file_stem(name: &str) -> Result<String, String> {
     Ok(stem)
 }
 
-fn safe_map_name_slug(name: &str) -> String {
-    let slug = name
-        .trim()
-        .chars()
-        .filter_map(|character| {
-            if character.is_ascii_alphanumeric() {
-                Some(character.to_ascii_lowercase())
-            } else if matches!(character, ' ' | '-' | '_') {
-                Some('_')
-            } else {
-                None
-            }
-        })
-        .collect::<String>();
-    slug.trim_matches('_').chars().take(32).collect()
-}
-
 fn validate_game_map_value(value: &Value) -> Result<(), String> {
     if !value.is_object() {
         return Err("Map data must be a JSON object.".to_string());
@@ -2328,8 +2311,8 @@ fn read_map(app: AppHandle, file_name: String) -> Result<GameMapRecord, String> 
 }
 
 #[tauri::command]
-fn save_map(app: AppHandle, file_name: String, data: Value, publish: Option<bool>) -> Result<GameMapRecord, String> {
-    map_store(&app)?.save(&file_name, data, publish.unwrap_or(false))
+fn save_map(app: AppHandle, file_name: String, data: Value) -> Result<GameMapRecord, String> {
+    map_store(&app)?.save(&file_name, data)
 }
 
 /// A new map; `large` gives a 1920 x 1080 terrain instead of 960 x 540.
@@ -2340,11 +2323,17 @@ fn create_map(app: AppHandle, name: String, teams: Option<usize>, large: Option<
 
 /// Gives a map a new name, which is its file name. The record's id can change.
 #[tauri::command]
-fn rename_map(app: AppHandle, file_name: String, name: String) -> Result<GameMapRecord, String> {
-    map_store(&app)?.rename(&file_name, &name)
+fn rename_map(app: AppHandle, file_name: String, name: String, data: Option<Value>) -> Result<GameMapRecord, String> {
+    map_store(&app)?.rename(&file_name, &name, data)
 }
 
-/// Adds a map file from elsewhere (gzip JSON, or plain JSON) as a draft.
+/// A copy of a map in the game, named "<name> copy".
+#[tauri::command]
+fn duplicate_map(app: AppHandle, file_name: String) -> Result<GameMapRecord, String> {
+    map_store(&app)?.duplicate(&file_name)
+}
+
+/// Adds a map file from elsewhere (gzip JSON, or plain JSON) to the game.
 #[tauri::command]
 async fn import_map_file(app: AppHandle, file_name: String, map_base64: String) -> Result<GameMapRecord, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2378,7 +2367,7 @@ async fn replay_map_preview(file_path: String) -> Result<Value, String> {
     .map_err(|error| format!("Map preview task failed: {error}"))?
 }
 
-/// Makes a draft from the map a replay was played on: a replay in the library
+/// Adds the map a replay was played on to the game: a replay in the library
 /// (`file_path`) or one the person chose (`replay_base64`).
 #[tauri::command]
 async fn import_map_from_replay(app: AppHandle, name: String, file_path: Option<String>, replay_base64: Option<String>) -> Result<GameMapRecord, String> {
@@ -2641,6 +2630,7 @@ pub fn run() {
             save_map,
             create_map,
             rename_map,
+            duplicate_map,
             import_map_file,
             import_map_from_replay,
             replay_map_preview,

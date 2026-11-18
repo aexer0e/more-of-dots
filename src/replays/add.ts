@@ -114,7 +114,7 @@ export function openAddReplays() {
     <div class="add-replays-backdrop" role="presentation">
       <section class="add-replays-dialog" role="dialog" aria-modal="true" aria-labelledby="addReplaysTitle">
         <header class="add-replays-header">
-          <h2 id="addReplaysTitle">Add replays</h2>
+          <h2 id="addReplaysTitle">Import replays</h2>
           <button class="recording-setup-close" type="button" data-add-action="close" aria-label="Close">${ICONS.close}</button>
         </header>
         <div class="add-replays-dropzone">

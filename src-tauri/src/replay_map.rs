@@ -114,6 +114,21 @@ mod tests {
     }
 
     #[test]
+    fn map_hub_maps_import_as_a_recorded_map() {
+        // The map editor sends a map from the game's map hub as `{"map": ...}`.
+        let shared = json!({
+            "map": {
+                "version": null, "map_surface": png(), "mode": "v3",
+                "infantry": [[[100, 100]], [[200, 200]], [[300, 300]]], "tanks": [[], [], []],
+                "cities": [[10, 10]], "capitals": [0, 1], "bridges": []
+            }
+        });
+        let map = map_from_replay(shared.to_string().as_bytes(), None, &[]).unwrap();
+        assert_eq!(map["infantry"].as_array().unwrap().len(), 3);
+        assert!(map.get("version").is_none() && map.get("mode").is_none());
+    }
+
+    #[test]
     fn experiment_replays_put_shock_units_back_among_the_infantry() {
         // Six infantry per side: the engine turns index 5 into a shock unit.
         let infantry = |x: i32| (0..6).map(|i| json!([x, 100 + 10 * i])).collect::<Vec<_>>();

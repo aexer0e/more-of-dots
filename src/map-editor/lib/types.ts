@@ -25,7 +25,8 @@ export interface StoredMap {
   width: number;
   height: number;
   teamCount: number;
-  status?: 'draft' | 'published' | 'invalid';
+  /** In the game, unreadable, or new with no file yet. */
+  status?: 'published' | 'invalid' | 'unsaved';
   issue?: string | null;
   gameFilePath?: string | null;
 }

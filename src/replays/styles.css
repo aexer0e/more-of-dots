@@ -123,13 +123,51 @@ button.winner-name { font-weight: var(--fw-bold); }
 .add-replays-drop.is-empty { border-color: var(--line-strong); }
 .add-replays-drop.is-empty > svg { stroke: var(--muted); }
 
-/* Import from .rep (map editor): the add-replays dialog with two tabs. */
+/* Import (map editor): the add-replays dialog with three tabs. */
 .map-import-dialog { max-width: 600px; }
 .map-import-note { margin: -8px 0 0; color: var(--muted); font-size: var(--fs-sm); }
 .map-import-tabs { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
 .map-import-tabs button { flex: 1; height: 32px; border: 0; border-radius: calc(var(--r-md) - 2px); background: transparent; color: var(--muted); font: inherit; font-weight: var(--fw-medium); cursor: pointer; }
 .map-import-tabs button[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--line-strong); }
 .map-import-library { display: flex; flex-direction: column; gap: var(--s-2); }
+.map-import-dialog:has(.map-import-code) { max-width: 640px; }
+.map-import-code { display: flex; gap: var(--s-2); }
+.map-import-code .add-replays-link-field { height: 38px; }
+.map-import-code input { font-size: var(--fs-lg); font-weight: var(--fw-bold); letter-spacing: 0.08em; }
+.map-import-code input::placeholder { font-size: var(--fs-md); font-weight: normal; letter-spacing: 0; }
+.map-import-code .add-replays-choose { height: 38px; }
+.map-import-code .add-replays-choose:disabled { cursor: default; opacity: 0.55; }
+/* One fixed size for the map code card in every state; titles keep to two lines. */
+.map-code-result { display: grid; height: 204px; }
+.map-code-card { display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+.map-code-thumb { margin: 0; border-radius: 6px; overflow: hidden; }
+.map-code-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.map-code-heading { display: flex; flex-direction: column; gap: 3px; }
+.map-code-heading h3 { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.map-code-heading p { margin: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-code-facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; color: var(--muted); font-size: var(--fs-sm); }
+.map-code-facts dd { margin: 0; color: var(--text); }
+.map-code-actions { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* A fixed width, so Import, Importing... and Imported never move the card. */
+.map-code-actions .map-code-import { height: 36px; min-width: 112px; padding: 0 18px; }
+.map-code-actions .map-code-import:disabled { opacity: 1; cursor: progress; }
+.map-code-votes { display: flex; gap: 14px; }
+.map-code-vote { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: var(--fs-sm); font-weight: var(--fw-medium); font-variant-numeric: tabular-nums; }
+.map-code-vote svg { width: 15px; height: 15px; fill: none; stroke: var(--muted); stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+/* Imported is a status, not a control: the same width as Import, so nothing moves. */
+.map-code-imported { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 112px; height: 36px; color: #6fcf8f; font-weight: var(--fw-bold); }
+.map-code-imported svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.map-code-card { overflow: hidden; }
+.map-code-card.is-placeholder .map-code-heading { gap: 8px; }
+.map-code-card.is-placeholder .map-code-body { gap: 16px; padding-top: 2px; }
+.map-code-card.is-placeholder .map-code-thumb .map-import-thumb-note { padding: 12px; text-align: center; }
+.map-code-card.is-failed .map-code-thumb .map-import-thumb-note { color: #f3a29e; }
+.map-code-card.is-placeholder .map-code-import:disabled { opacity: 0.4; cursor: default; }
+.map-code-skeleton { display: block; height: 12px; border-radius: 4px; background: rgba(238, 244, 240, 0.07); }
+.map-code-card.is-loading .map-code-skeleton { animation: map-code-pulse 1s ease-in-out infinite alternate; }
+@keyframes map-code-pulse { from { opacity: 0.55; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .map-code-skeleton { animation: none; } }
+@media (max-width: 560px) { .map-code-result { height: auto; } .map-code-card { grid-template-columns: minmax(0, 1fr); } }
 .map-import-library .add-replays-link-field input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; }
 .map-import-list { margin: 0; padding: 0; list-style: none; max-height: 340px; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
 .map-import-list li + li { border-top: 1px solid var(--line); }
@@ -153,3 +191,94 @@ button.winner-name { font-weight: var(--fw-bold); }
 .map-import-teams { position: absolute; right: 6px; top: 6px; padding: 1px 7px; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 11px; }
 .map-import-card .map-import-meta { grid-column: auto; grid-row: auto; color: var(--muted); font-size: var(--fs-sm); }
 .map-import-count { position: absolute; left: 6px; top: 6px; padding: 1px 7px; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 11px; }
+
+/* Shown after maps are deleted in the map library: Undo brings them back until the bar runs out. */
+.map-delete-toast {
+  align-items: center;
+  animation: map-delete-toast-enter 160ms ease-out;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  bottom: 18px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  display: flex;
+  gap: 16px;
+  left: 50%;
+  max-width: min(460px, calc(100vw - 36px));
+  min-height: 46px;
+  overflow: hidden;
+  padding: 6px 6px 6px 16px;
+  position: fixed;
+  transform: translateX(-50%);
+  z-index: 1000;
+}
+
+.map-delete-toast-copy {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-delete-toast-copy strong {
+  font-weight: 600;
+}
+
+.map-delete-toast button {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  flex: none;
+  font: inherit;
+  font-weight: 600;
+  min-height: 32px;
+  padding: 0 14px;
+}
+
+.map-delete-toast button:hover,
+.map-delete-toast button:focus-visible {
+  background: var(--accent-line);
+  outline: none;
+}
+
+.map-delete-toast-timer {
+  animation: map-delete-toast-timer linear forwards;
+  background: var(--accent);
+  bottom: 0;
+  height: 2px;
+  left: 0;
+  position: absolute;
+  transform-origin: left;
+  width: 100%;
+}
+
+@keyframes map-delete-toast-enter {
+  from { transform: translate(-50%, 8px); }
+  to { transform: translate(-50%, 0); }
+}
+
+@keyframes map-delete-toast-timer {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-delete-toast { animation: none; }
+}
+
+/* The New map tab of the map editor's Import dialog. */
+.map-import-dialog:has(.map-new) { max-width: 520px; }
+.map-new { display: flex; flex-direction: column; gap: 14px; }
+.map-new-field { display: flex; flex-direction: column; gap: 6px; }
+.map-new-field > span:first-child { color: var(--muted); font-size: var(--fs-sm); font-weight: var(--fw-medium); }
+.map-new-field .add-replays-link-field { flex: none; height: 38px; }
+.map-new-field input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; }
+.map-new-choice { display: grid; grid-auto-columns: 1fr; grid-auto-flow: column; gap: 6px; }
+.map-new-choice button { display: grid; gap: 2px; justify-items: center; min-height: 38px; padding: 7px 6px; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--bg); color: var(--muted); font: inherit; font-weight: var(--fw-medium); cursor: pointer; }
+.map-new-choice button:hover { color: var(--text); }
+.map-new-choice button[aria-checked="true"] { background: var(--accent-soft); border-color: var(--accent-line); color: var(--text); }
+.map-new-choice small { color: var(--muted); font-size: var(--fs-xs); font-weight: normal; }
+.map-new-actions { display: flex; justify-content: flex-end; }

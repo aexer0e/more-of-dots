@@ -1,13 +1,12 @@
-//! Drafts never live in the game's map scan directory. Publishing is explicit.
+//! Maps in the game's map folder. Only maps the game can load are ever written there.
 use super::{
     blank_game_map_value, default_game_map_value, display_name_for_map_file, map_dimensions,
-    map_file_stem, map_team_count, read_gzip_json_file, safe_map_file_name, safe_map_name_slug,
+    map_file_stem, map_team_count, read_gzip_json_file, safe_map_file_name,
     validate_game_map_value, write_gzip_json_file, GameMapRecord,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Cursor, Write},
@@ -139,7 +138,7 @@ fn validate_content(data: &Value) -> Result<(), String> {
         }
     }
     if let Some(team) = unit_counts.iter().position(|count| *count == 0) {
-        return Err(format!("Team {} needs at least one unit before saving to the game. You can save this map as a draft.", team + 1));
+        return Err(format!("Team {} needs at least one unit before the map can be saved to the game.", team + 1));
     }
     let cities = data["cities"].as_array().unwrap();
     for city in cities {
@@ -171,35 +170,28 @@ fn validate_content(data: &Value) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
-struct Draft {
+/// A draft from an older version of More of Dots, which kept maps outside the
+/// game until they were published. Read once, to move it into the game folder.
+#[derive(Deserialize)]
+struct LegacyDraft {
     file_name: String,
     source: Option<PathBuf>,
     data: Value,
-    published: bool,
 }
 
+/// Maps live in the game's map folder only. Every write is checked first
+/// (`validate_publish`) and replaces the file atomically, so the game never sees
+/// a map it cannot load. A new map has no file until its first valid save: until
+/// then it exists only in the editor, under a `new:` id.
 pub(super) struct MapStore {
-    drafts: PathBuf,
+    /// Where older versions kept drafts; read once to move them into the game.
+    legacy_drafts: PathBuf,
     game_dirs: Vec<PathBuf>,
 }
 
 impl MapStore {
-    pub fn new(drafts: PathBuf, game_dirs: Vec<PathBuf>) -> Result<Self, String> {
-        fs::create_dir_all(&drafts).map_err(|e| e.to_string())?;
-        Ok(Self { drafts, game_dirs })
-    }
-
-    fn draft_path(&self, id: &str) -> Result<PathBuf, String> {
-        let name = id.strip_prefix("draft:").ok_or("Invalid draft ID.")?;
-        if !name.ends_with(".json") || name.contains(['/', '\\', ':']) || name.starts_with('.') {
-            return Err("Invalid draft ID.".into());
-        }
-        let path = self.drafts.join(name);
-        if path.exists() {
-            Self::check_parent(&path, &self.drafts)?;
-        }
-        Ok(path)
+    pub fn new(legacy_drafts: PathBuf, game_dirs: Vec<PathBuf>) -> Result<Self, String> {
+        Ok(Self { legacy_drafts, game_dirs })
     }
 
     fn check_parent(path: &Path, parent: &Path) -> Result<(), String> {
@@ -229,82 +221,95 @@ impl MapStore {
         Err("Map path is outside the War of Dots map folders.".into())
     }
 
-    fn load_draft(&self, id: &str) -> Result<Draft, String> {
-        let bytes = fs::read(self.draft_path(id)?).map_err(|e| e.to_string())?;
-        serde_json::from_slice(&bytes).map_err(|e| format!("Could not read draft: {e}"))
+    fn game_root(&self) -> Result<&PathBuf, String> {
+        self.game_dirs
+            .first()
+            .ok_or_else(|| "The War of Dots map folder was not found. Install War of Dots to save maps.".to_string())
     }
 
-    fn write_draft(&self, id: &str, draft: &Draft) -> Result<(), String> {
-        atomic_write(
-            &self.draft_path(id)?,
-            &serde_json::to_vec(draft).map_err(|e| e.to_string())?,
-        )
+    fn game_id(path: &Path) -> String {
+        format!("game:{}", path.to_string_lossy())
     }
 
-    fn draft_id_for_source(path: &Path) -> String {
-        format!(
-            "draft:map_{:x}.json",
-            Sha256::digest(path.to_string_lossy().as_bytes())
-        )
+    /// A file name for `name` that no map in the game's folders has yet: the
+    /// name itself, or the name with a number added.
+    fn free_file_name(&self, name: &str) -> String {
+        let stem = map_file_stem(name).unwrap_or_else(|_| "Untitled map".into());
+        (1..)
+            .map(|n| if n == 1 { format!("{stem}.txt") } else { format!("{stem} {n}.txt") })
+            .find(|candidate| self.name_is_free(candidate))
+            .unwrap()
     }
 
-    /// A new empty map: 960 x 540 terrain, or 1920 x 1080 when `large`.
+    /// Whether no map in the game's folders has this file name. Names differing
+    /// only in case count as taken.
+    fn name_is_free(&self, file_name: &str) -> bool {
+        !self.game_dirs.iter().any(|root| {
+            fs::read_dir(root).is_ok_and(|entries| {
+                entries.flatten().any(|entry| entry.file_name().to_string_lossy().eq_ignore_ascii_case(file_name))
+            })
+        })
+    }
+
+    /// Checks a map and writes it to a new file in the game's map folder.
+    fn write_new(&self, name: &str, mut data: Value) -> Result<GameMapRecord, String> {
+        to_game_format(&mut data);
+        validate_publish(&data)?;
+        let target = self.game_root()?.join(safe_map_file_name(&self.free_file_name(name))?);
+        write_gzip_json_file(&target, &data)?;
+        self.read(&Self::game_id(&target))
+    }
+
+    /// A new empty map: 960 x 540 terrain, or 1920 x 1080 when `large`. It has
+    /// no file: a map without units cannot be loaded by the game, so the first
+    /// save that passes the check creates the file.
     pub fn create(&self, name: &str, teams: usize, large: bool) -> Result<GameMapRecord, String> {
         let (width, height) = if large { (1920, 1080) } else { (960, 540) };
-        self.new_draft(name, blank_game_map_value(teams, width, height)?)
+        let data = blank_game_map_value(teams, width, height)?;
+        let file_name = self.free_file_name(name);
+        Ok(Self::unsaved_record(&file_name, data))
     }
 
-    /// A draft made from a map file or a replay's map.
-    pub fn import(&self, name: &str, mut data: Value) -> Result<GameMapRecord, String> {
-        to_game_format(&mut data);
-        validate_game_map_value(&data)?;
-        validate_terrain(&data)?;
-        self.new_draft(name, data)
-    }
-
-    fn new_draft(&self, name: &str, data: Value) -> Result<GameMapRecord, String> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos();
-        let id = format!("draft:map_{}_{stamp}.json", safe_map_name_slug(name));
-        // The file is named after the map, with a number added when that name is taken.
-        let stem = map_file_stem(name).unwrap_or_else(|_| "Untitled map".into());
-        let file_name = (1..)
-            .map(|n| if n == 1 { format!("{stem}.txt") } else { format!("{stem} {n}.txt") })
-            .find(|candidate| self.name_is_free(candidate, None))
-            .unwrap();
-        self.write_draft(
-            &id,
-            &Draft {
-                file_name,
-                source: None,
-                data,
-                published: false,
-            },
-        )?;
-        self.read(&id)
-    }
-
-    /// Whether no map in the game's folders or among the drafts (other than
-    /// `except`) has this file name. Names differing only in case count as taken.
-    fn name_is_free(&self, file_name: &str, except: Option<&str>) -> bool {
-        if self.game_dirs.iter().any(|root| root.join(file_name).exists()) {
-            return false;
+    /// The record of a new map that has no file yet.
+    fn unsaved_record(file_name: &str, data: Value) -> GameMapRecord {
+        let (width, height) = map_dimensions(&data);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
+        GameMapRecord {
+            id: format!("new:{file_name}"),
+            file_name: file_name.into(),
+            file_path: String::new(),
+            name: display_name_for_map_file(file_name),
+            team_count: map_team_count(&data),
+            data,
+            created_at: now,
+            updated_at: now,
+            width,
+            height,
+            status: "unsaved".into(),
+            issue: None,
+            game_file_path: None,
         }
-        let Ok(entries) = fs::read_dir(&self.drafts) else { return true };
-        !entries.flatten().any(|entry| {
-            let id = format!("draft:{}", entry.file_name().to_string_lossy());
-            Some(id.as_str()) != except
-                && entry.path().extension().and_then(|e| e.to_str()) == Some("json")
-                && self.load_draft(&id).is_ok_and(|draft| draft.file_name.eq_ignore_ascii_case(file_name))
-        })
+    }
+
+    /// A map from a map file or a replay's map, saved to the game.
+    pub fn import(&self, name: &str, data: Value) -> Result<GameMapRecord, String> {
+        self.write_new(name, data)
+    }
+
+    /// A copy of a map in the game, named "<name> copy" (with a number added
+    /// when that name is taken). The map itself is left as it is.
+    pub fn duplicate(&self, id: &str) -> Result<GameMapRecord, String> {
+        let record = self.read(id)?;
+        if record.status == "invalid" {
+            return Err(record.issue.unwrap_or_else(|| "This map cannot be read, so it cannot be duplicated.".into()));
+        }
+        self.write_new(&format!("{} copy", record.name), record.data)
     }
 
     /// Renames a map file in a game folder, with the preview image the game keeps
     /// beside it.
     fn rename_game_file(&self, source: &Path, file_name: &str) -> Result<PathBuf, String> {
-        let source = self.game_path(&format!("game:{}", source.to_string_lossy()))?;
+        let source = self.game_path(&Self::game_id(source))?;
         let target = source.with_file_name(safe_map_file_name(file_name)?);
         let same = |a: &Path, b: &Path| a.canonicalize().ok().is_some_and(|a| b.canonicalize().ok() == Some(a));
         if target.exists() && !same(&source, &target) {
@@ -318,93 +323,44 @@ impl MapStore {
         Ok(target)
     }
 
-    /// Gives a map a new name, which is its file name. A map in the game's folder
-    /// is renamed there, and a draft that edits it keeps following it, so the
-    /// returned record can have a new id.
-    pub fn rename(&self, id: &str, name: &str) -> Result<GameMapRecord, String> {
+    /// Gives a map a new name, which is its file name, so the returned record has
+    /// a new id. A new map without a file only takes the name; `data` is its map.
+    pub fn rename(&self, id: &str, name: &str, data: Option<Value>) -> Result<GameMapRecord, String> {
         let file_name = format!("{}.txt", map_file_stem(name)?);
-        let current = self.read(id)?.file_name;
+        if let Some(current) = id.strip_prefix("new:") {
+            if !current.eq_ignore_ascii_case(&file_name) && !self.name_is_free(&file_name) {
+                return Err(format!("A map named {} already exists.", display_name_for_map_file(&file_name)));
+            }
+            let data = data.ok_or("The new map's contents are missing.")?;
+            return Ok(Self::unsaved_record(&file_name, data));
+        }
+        let source = self.game_path(id)?;
+        let current = source.file_name().unwrap().to_string_lossy().to_string();
         if current == file_name {
             return self.read(id);
         }
-        let draft_of_game = |path: &Path| Self::draft_id_for_source(path);
-        let except = if id.starts_with("draft:") { id.to_string() } else { draft_of_game(&self.game_path(id)?) };
-        if !current.eq_ignore_ascii_case(&file_name) && !self.name_is_free(&file_name, Some(&except)) {
+        if !current.eq_ignore_ascii_case(&file_name) && !self.name_is_free(&file_name) {
             return Err(format!("A map named {} already exists.", display_name_for_map_file(&file_name)));
         }
-        if id.starts_with("draft:") {
-            let mut draft = self.load_draft(id)?;
-            let mut draft_id = id.to_string();
-            if let Some(source) = draft.source.clone().filter(|source| source.is_file()) {
-                let target = self.rename_game_file(&source, &file_name)?;
-                // A draft made from a game file is found by that file's path.
-                if id == draft_of_game(&source) {
-                    draft_id = draft_of_game(&target);
-                }
-                draft.source = Some(target);
-            }
-            draft.file_name = file_name;
-            self.write_draft(&draft_id, &draft)?;
-            if draft_id != id {
-                fs::remove_file(self.draft_path(id)?).map_err(|e| e.to_string())?;
-            }
-            self.read(&draft_id)
-        } else {
-            let source = self.game_path(id)?;
-            let target = self.rename_game_file(&source, &file_name)?;
-            let old = draft_of_game(&source);
-            if let Ok(mut draft) = self.load_draft(&old) {
-                draft.source = Some(target.clone());
-                draft.file_name = file_name;
-                self.write_draft(&draft_of_game(&target), &draft)?;
-                fs::remove_file(self.draft_path(&old)?).map_err(|e| e.to_string())?;
-            }
-            self.read(&format!("game:{}", target.to_string_lossy()))
-        }
+        let target = self.rename_game_file(&source, &file_name)?;
+        self.read(&Self::game_id(&target))
     }
 
     pub fn read(&self, id: &str) -> Result<GameMapRecord, String> {
-        let (path, file_name, source, result, published) = if id.starts_with("draft:") {
-            let path = self.draft_path(id)?;
-            match self.load_draft(id) {
-                Ok(draft) => {
-                    let published = draft.published
-                        && draft.source.as_ref().is_some_and(|source| {
-                            read_gzip_json_file(source).ok().as_ref() == Some(&draft.data)
-                        });
-                    (
-                        path,
-                        draft.file_name,
-                        draft.source,
-                        Ok(draft.data),
-                        published,
-                    )
-                }
-                Err(error) => {
-                    let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-                    (path, file_name, None, Err(error), false)
-                }
-            }
-        } else {
-            let path = self.game_path(id)?;
-            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-            let result = read_gzip_json_file(&path);
-            (path.clone(), file_name, Some(path), result, true)
-        };
-        let result = result.and_then(|mut data| {
+        let path = self.game_path(id)?;
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let result = read_gzip_json_file(&path).and_then(|mut data| {
             to_game_format(&mut data);
             validate_game_map_value(&data)?;
             validate_terrain(&data)?;
             Ok(data)
         });
+        // A map the game can open but would refuse to play (a team without
+        // units, say) is listed with what to fix.
         let (data, status, issue) = match result {
             Ok(data) => {
-                let issue = if published {
-                    validate_content(&data).err()
-                } else {
-                    None
-                };
-                (data, if published { "published" } else { "draft" }, issue)
+                let issue = validate_content(&data).err();
+                (data, "published", issue)
             }
             Err(error) => (default_game_map_value(2)?, "invalid", Some(error)),
         };
@@ -429,36 +385,17 @@ impl MapStore {
             team_count,
             status: status.into(),
             issue,
-            game_file_path: source
-                .filter(|p| p.is_file())
-                .map(|p| p.to_string_lossy().into()),
+            game_file_path: path.is_file().then(|| path.to_string_lossy().into()),
         })
     }
 
     pub fn list(&self) -> Result<Vec<GameMapRecord>, String> {
+        self.move_legacy_drafts();
         let mut maps = Vec::new();
-        let mut published_sources = std::collections::HashSet::new();
-        for entry in fs::read_dir(&self.drafts)
-            .map_err(|e| e.to_string())?
-            .flatten()
-        {
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let id = format!("draft:{}", entry.file_name().to_string_lossy());
-            let record = self.read(&id)?;
-            if record.status == "published" {
-                if let Some(source) = &record.game_file_path {
-                    published_sources.insert(PathBuf::from(source));
-                }
-            }
-            maps.push(record);
-        }
         for root in &self.game_dirs {
             for entry in fs::read_dir(root).map_err(|e| e.to_string())?.flatten() {
                 let path = entry.path();
                 if !path.is_file()
-                    || published_sources.contains(&path)
                     || !path
                         .extension()
                         .and_then(|e| e.to_str())
@@ -466,7 +403,7 @@ impl MapStore {
                 {
                     continue;
                 }
-                maps.push(self.read(&format!("game:{}", path.to_string_lossy()))?);
+                maps.push(self.read(&Self::game_id(&path))?);
             }
         }
         maps.sort_by(|a, b| {
@@ -477,94 +414,96 @@ impl MapStore {
         Ok(maps)
     }
 
-    pub fn save(&self, id: &str, data: Value, publish: bool) -> Result<GameMapRecord, String> {
+    /// Saves a map to the game. The editor sends the map's fields; fields it does
+    /// not know about stay as the file has them. A new map (`new:` id) gets its
+    /// file here. Nothing is written unless the whole map passes the check.
+    pub fn save(&self, id: &str, data: Value) -> Result<GameMapRecord, String> {
         validate_game_map_value(&data)?;
-        let (draft_id, mut draft) = if id.starts_with("draft:") {
-            (id.to_string(), self.load_draft(id)?)
-        } else {
-            let source = self.game_path(id)?;
-            let existing = read_gzip_json_file(&source)?;
-            (
-                Self::draft_id_for_source(&source),
-                Draft {
-                    file_name: source.file_name().unwrap().to_string_lossy().into(),
-                    source: Some(source),
-                    data: existing,
-                    published: false,
-                },
-            )
-        };
+        if let Some(file_name) = id.strip_prefix("new:") {
+            return self.write_new(&display_name_for_map_file(file_name), data);
+        }
+        let target = self.game_path(id)?;
+        let mut stored = read_gzip_json_file(&target).unwrap_or_else(|_| Value::Object(Default::default()));
         // The editor was given the stored map in the game's format, so the stored
         // copy is brought to it before the edits replace its fields; otherwise an
         // older `motorised` list would be added to the infantry a second time.
-        to_game_format(&mut draft.data);
+        to_game_format(&mut stored);
         let mut data = data;
         to_game_format(&mut data);
-        if let (Some(existing), Some(incoming)) = (draft.data.as_object_mut(), data.as_object()) {
+        if let (Some(existing), Some(incoming)) = (stored.as_object_mut(), data.as_object()) {
             existing.extend(incoming.clone());
         } else {
-            draft.data = data;
+            stored = data;
         }
-        draft.published = false;
-        if publish {
-            validate_publish(&draft.data)?;
-            let target = match &draft.source {
-                Some(source) => self.game_path(&format!("game:{}", source.to_string_lossy()))?,
-                None => {
-                    let root = self.game_dirs.first().ok_or(
-                        "War of Dots map_editor folder was not found. Save a draft instead.",
-                    )?;
-                    let target = root.join(safe_map_file_name(&draft.file_name)?);
-                    if target.exists() {
-                        return Err("A game map with this filename already exists. It has not been overwritten.".into());
-                    }
-                    target
-                }
-            };
-            // Keep the editable copy even if writing to the game fails.
-            self.write_draft(&draft_id, &draft)?;
-            write_gzip_json_file(&target, &draft.data)?;
-            draft.source = Some(target);
-            draft.published = true;
-        }
-        self.write_draft(&draft_id, &draft)?;
-        self.read(&draft_id)
+        validate_publish(&stored)?;
+        write_gzip_json_file(&target, &stored)?;
+        self.read(id)
     }
 
     pub fn delete(&self, ids: &[String]) -> Result<Vec<String>, String> {
         let mut paths = Vec::new();
         for id in ids {
-            let (path, game) = if id.starts_with("draft:") {
-                let record = self.read(id)?;
-                let game = if record.status == "published" {
-                    record.game_file_path.map(PathBuf::from)
-                } else {
-                    None
-                };
-                (self.draft_path(id)?, game)
-            } else {
-                let path = self.game_path(id)?;
-                (path.clone(), Some(path))
-            };
-            if let Some(game) = game.filter(|p| p.exists()) {
-                let game = self.game_path(&format!("game:{}", game.to_string_lossy()))?;
-                let png = game.with_extension("png");
-                if png.exists() {
-                    Self::check_parent(&png, game.parent().unwrap())?;
-                    paths.push(png);
-                }
-                paths.push(game);
-            }
-            paths.push(path);
-        }
-        let mut deleted = std::collections::HashSet::new();
-        for path in paths {
-            if !deleted.insert(path.clone()) {
+            if id.starts_with("new:") {
                 continue;
             }
+            let game = self.game_path(id)?;
+            if !game.exists() {
+                continue;
+            }
+            let png = game.with_extension("png");
+            if png.exists() {
+                Self::check_parent(&png, game.parent().unwrap())?;
+                paths.push(png);
+            }
+            paths.push(game);
+        }
+        for path in paths {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
         Ok(ids.to_vec())
+    }
+
+    /// Moves drafts left by older versions into the game's map folder, once.
+    /// A draft of a game map replaces that map; any other becomes a new map. Only
+    /// drafts that pass the check are written. Each draft file is then moved into
+    /// `moved` (written to the game) or `not-moved` (the game could not load it)
+    /// beside it, so nothing is lost and none is moved twice.
+    fn move_legacy_drafts(&self) {
+        let Ok(entries) = fs::read_dir(&self.legacy_drafts) else { return };
+        if self.game_dirs.is_empty() {
+            return;
+        }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let moved = self.move_legacy_draft(&path);
+            let folder = self.legacy_drafts.join(if moved { "moved" } else { "not-moved" });
+            if fs::create_dir_all(&folder).is_ok() {
+                let _ = fs::rename(&path, folder.join(entry.file_name()));
+            }
+        }
+    }
+
+    fn move_legacy_draft(&self, path: &Path) -> bool {
+        let Some(mut draft) = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<LegacyDraft>(&bytes).ok()) else {
+            return false;
+        };
+        to_game_format(&mut draft.data);
+        if validate_publish(&draft.data).is_err() {
+            return false;
+        }
+        let source = draft.source.filter(|source| source.is_file()).and_then(|source| self.game_path(&Self::game_id(&source)).ok());
+        match source {
+            Some(source) => {
+                if read_gzip_json_file(&source).ok().as_ref() == Some(&draft.data) {
+                    return true;
+                }
+                write_gzip_json_file(&source, &draft.data).is_ok()
+            }
+            None => self.write_new(&display_name_for_map_file(&draft.file_name), draft.data).is_ok(),
+        }
     }
 }
 
@@ -590,71 +529,90 @@ mod tests {
         map
     }
 
-    #[test]
-    fn empty_draft_never_enters_game_folder_even_after_save_or_rejected_publish() {
-        let (_root, store) = store();
-        let draft = store.create("Unfinished", 2, false).unwrap();
-        assert_eq!(draft.status, "draft");
-        assert!(draft.game_file_path.is_none());
-        store.save(&draft.id, draft.data.clone(), false).unwrap();
-        assert!(store
-            .save(&draft.id, draft.data, true)
-            .unwrap_err()
-            .contains("needs at least one unit"));
-        assert_eq!(fs::read_dir(&store.game_dirs[0]).unwrap().count(), 0);
-        assert_eq!(store.list().unwrap().len(), 1);
+    fn game_files(store: &MapStore) -> usize {
+        fs::read_dir(&store.game_dirs[0]).unwrap().count()
     }
 
     #[test]
-    fn drafts_work_without_a_game_installation() {
+    fn new_maps_have_no_file_until_a_valid_save() {
+        let (_root, store) = store();
+        let new = store.create("Island war", 2, false).unwrap();
+        assert_eq!((new.status.as_str(), new.file_name.as_str()), ("unsaved", "Island war.txt"));
+        assert!(new.id.starts_with("new:"));
+        assert_eq!(game_files(&store), 0);
+        // A map the game cannot play is refused and nothing is written.
+        assert!(store.save(&new.id, new.data.clone()).unwrap_err().contains("needs at least one unit"));
+        assert_eq!(game_files(&store), 0);
+        let saved = store.save(&new.id, playable()).unwrap();
+        assert_eq!(saved.status, "published");
+        assert!(saved.id.starts_with("game:") && saved.file_path.ends_with("Island war.txt"));
+        assert_eq!(read_gzip_json_file(Path::new(&saved.file_path)).unwrap(), playable());
+        let large = store.create("Island war", 3, true).unwrap();
+        assert_eq!(large.file_name, "Island war 2.txt");
+        assert_eq!((large.width, large.height, large.team_count), (1920, 1080, 3));
+    }
+
+    #[test]
+    fn saving_without_a_game_installation_fails_cleanly() {
         let root = tempfile::tempdir().unwrap();
         let store = MapStore::new(root.path().join("drafts"), vec![]).unwrap();
-        let draft = store.create("offline", 2, false).unwrap();
-        let saved = store.save(&draft.id, playable(), false).unwrap();
-        assert!(store
-            .save(&saved.id, saved.data, true)
-            .unwrap_err()
-            .contains("folder was not found"));
-        assert_eq!(store.list().unwrap().len(), 1);
+        let new = store.create("offline", 2, false).unwrap();
+        assert!(store.save(&new.id, playable()).unwrap_err().contains("map folder was not found"));
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
-    fn incomplete_edits_and_failed_publish_preserve_last_published_bytes() {
+    fn invalid_edits_never_replace_the_game_file() {
         let (_root, store) = store();
-        let draft = store.create("test", 2, false).unwrap();
-        let published = store.save(&draft.id, playable(), true).unwrap();
-        let path = PathBuf::from(published.game_file_path.unwrap());
+        let saved = store.save(&store.create("test", 2, false).unwrap().id, playable()).unwrap();
+        let path = PathBuf::from(&saved.file_path);
         let bytes = fs::read(&path).unwrap();
-        let incomplete = default_game_map_value(2).unwrap();
-        store.save(&draft.id, incomplete.clone(), false).unwrap();
-        assert!(store.save(&draft.id, incomplete, true).is_err());
+        let mut incomplete = playable();
+        incomplete["infantry"] = json!([[], [[1400, 800]]]);
+        assert!(store.save(&saved.id, incomplete).is_err());
+        let mut outside = playable();
+        outside["cities"] = json!([[5000, 5000]]);
+        assert!(store.save(&saved.id, outside).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(store.list().unwrap().len(), 2); // draft and last published copy
         let mut changed = playable();
         changed["infantry"][0][0] = json!([250, 100]);
-        store.save(&draft.id, changed.clone(), true).unwrap();
+        store.save(&saved.id, changed.clone()).unwrap();
         assert_eq!(read_gzip_json_file(&path).unwrap(), changed);
         assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[test]
-    fn existing_map_edits_are_saved_outside_game_and_keep_unknown_fields() {
+    fn saving_keeps_fields_the_editor_does_not_know() {
         let (_root, store) = store();
         let path = store.game_dirs[0].join("old.txt");
-        let original = playable();
-        write_gzip_json_file(&path, &original).unwrap();
-        let id = format!("game:{}", path.to_string_lossy());
-        let draft = store
-            .save(&id, default_game_map_value(2).unwrap(), false)
-            .unwrap();
-        assert_eq!(read_gzip_json_file(&path).unwrap(), original);
-        assert_eq!(draft.data["future_field"], original["future_field"]);
-        store.delete(&[draft.id]).unwrap();
-        assert!(path.exists());
+        write_gzip_json_file(&path, &playable()).unwrap();
+        let mut edited = playable();
+        edited.as_object_mut().unwrap().remove("future_field");
+        edited["infantry"][0][0] = json!([300, 300]);
+        store.save(&MapStore::game_id(&path), edited).unwrap();
+        let written = read_gzip_json_file(&path).unwrap();
+        assert_eq!(written["future_field"], json!({"keep": true}));
+        assert_eq!(written["infantry"][0][0], json!([300, 300]));
     }
 
     #[test]
-    fn malformed_and_unfinished_game_maps_can_be_deleted_without_backups() {
+    fn imports_and_duplicates_go_to_the_game_only_when_valid() {
+        let (_root, store) = store();
+        let imported = store.import("Coast", playable()).unwrap();
+        assert_eq!((imported.status.as_str(), imported.name.as_str()), ("published", "Coast"));
+        let copy = store.duplicate(&imported.id).unwrap();
+        assert_eq!(copy.file_name, "Coast copy.txt");
+        assert_eq!(copy.data, imported.data);
+        assert_eq!(store.duplicate(&imported.id).unwrap().file_name, "Coast copy 2.txt");
+        let mut empty = playable();
+        empty["infantry"] = json!([[], []]);
+        assert!(store.import("Empty", empty).is_err());
+        assert_eq!(game_files(&store), 3);
+        assert_eq!(store.read(&imported.id).unwrap().data, playable());
+    }
+
+    #[test]
+    fn malformed_and_unfinished_game_maps_are_listed_and_can_be_deleted() {
         let (_root, store) = store();
         for (name, malformed) in [("broken", true), ("empty", false)] {
             let path = store.game_dirs[0].join(format!("{name}.txt"));
@@ -665,33 +623,17 @@ mod tests {
             }
             let png = path.with_extension("png");
             fs::write(&png, b"original thumbnail").unwrap();
-            let id = format!("game:{}", path.to_string_lossy());
+            let id = MapStore::game_id(&path);
             let entry = store.list().unwrap().into_iter().find(|m| m.id == id).unwrap();
             assert!(entry.issue.is_some());
             assert_eq!(entry.status == "invalid", malformed);
+            assert!(store.duplicate(&id).is_err() || !malformed);
             store.delete(&[id]).unwrap();
             assert!(!path.exists());
             assert!(!png.exists());
         }
         assert!(store.list().unwrap().is_empty());
-        assert_eq!(fs::read_dir(&store.drafts).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(&store.game_dirs[0]).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn deleting_a_game_map_preserves_an_existing_unsaved_draft() {
-        let (_root, store) = store();
-        let draft = store.create("test", 2, false).unwrap();
-        let published = store.save(&draft.id, playable(), true).unwrap();
-        let empty = default_game_map_value(2).unwrap();
-        store.save(&draft.id, empty.clone(), false).unwrap();
-        let game_id = format!("game:{}", published.game_file_path.unwrap());
-        store.delete(&[game_id]).unwrap();
-        let maps = store.list().unwrap();
-        assert_eq!(maps.len(), 1);
-        assert_eq!(maps[0].data["infantry"], empty["infantry"]);
-        assert!(maps[0].game_file_path.is_none());
-        assert_eq!(fs::read_dir(&store.drafts).unwrap().count(), 1);
+        assert_eq!(game_files(&store), 0);
     }
 
     #[test]
@@ -737,13 +679,13 @@ mod tests {
         old["motorised"] = json!([[[50, 50]], []]);
         let path = store.game_dirs[0].join("old.txt");
         write_gzip_json_file(&path, &old).unwrap();
-        let read = store.read(&format!("game:{}", path.display())).unwrap();
+        let read = store.read(&MapStore::game_id(&path)).unwrap();
         assert!(read.data.get("mode").is_none() && read.data.get("motorised").is_none());
         assert_eq!(read.data["infantry"][0].as_array().unwrap().len(), 6);
         assert_eq!(read.data["infantry"][0][5], json!([50, 50]));
         assert_eq!(read.data["future_field"], json!({"keep": true}));
         // Saving the map as the editor read it does not add the shock unit again.
-        let saved = store.save(&read.id, read.data.clone(), true).unwrap();
+        let saved = store.save(&read.id, read.data.clone()).unwrap();
         let written = read_gzip_json_file(&path).unwrap();
         assert_eq!(written["infantry"], read.data["infantry"]);
         assert!(written.get("mode").is_none() && written.get("motorised").is_none());
@@ -760,76 +702,40 @@ mod tests {
         let (root, store) = store();
         let outside = root.path().join("outside.txt");
         fs::write(&outside, b"keep").unwrap();
-        let id = format!("game:{}", outside.to_string_lossy());
+        let id = MapStore::game_id(&outside);
         assert!(store.delete(&[id.clone()]).is_err());
-        assert!(store
-            .save("draft:../outside.json", playable(), false)
-            .is_err());
-        let draft = store.create("test", 2, false).unwrap();
-        let target = store.game_dirs[0].join(&draft.file_name);
-        fs::write(&target, b"another map").unwrap();
-        assert!(store.save(&draft.id, playable(), true).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"another map");
+        assert!(store.save(&id, playable()).is_err());
+        // A new map never takes the name of a map that appeared after it was made.
+        let new = store.create("test", 2, false).unwrap();
+        let taken = store.game_dirs[0].join(&new.file_name);
+        fs::write(&taken, b"another map").unwrap();
+        let saved = store.save(&new.id, playable()).unwrap();
+        assert!(saved.file_path.ends_with("test 2.txt"));
+        assert_eq!(fs::read(&taken).unwrap(), b"another map");
         assert_eq!(fs::read(&outside).unwrap(), b"keep");
     }
 
     #[test]
-    fn deletion_of_published_draft_removes_game_and_thumbnail() {
+    fn renaming_moves_game_files_and_names_new_maps() {
         let (_root, store) = store();
-        let draft = store.create("test", 2, false).unwrap();
-        let published = store.save(&draft.id, playable(), true).unwrap();
-        let path = PathBuf::from(published.game_file_path.unwrap());
-        fs::write(path.with_extension("png"), b"thumbnail").unwrap();
-        store.delete(&[draft.id]).unwrap();
-        assert!(!path.exists());
-        assert!(!path.with_extension("png").exists());
-        assert!(store.list().unwrap().is_empty());
-        assert_eq!(fs::read_dir(&store.drafts).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(&store.game_dirs[0]).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn new_maps_are_named_after_the_map_and_can_be_large() {
-        let (_root, store) = store();
-        let first = store.create("Island war", 2, false).unwrap();
-        let second = store.create("Island war", 3, true).unwrap();
-        assert_eq!(first.file_name, "Island war.txt");
-        assert_eq!(first.name, "Island war");
-        assert_eq!((first.width, first.height), (960, 540));
-        assert_eq!(second.file_name, "Island war 2.txt");
-        assert_eq!((second.width, second.height, second.team_count), (1920, 1080, 3));
-    }
-
-    #[test]
-    fn renaming_moves_game_files_and_keeps_drafts_attached() {
-        let (_root, store) = store();
-        // A draft that is not in the game yet.
-        let draft = store.create("test", 2, false).unwrap();
-        let renamed = store.rename(&draft.id, "  Coast / line  ").unwrap();
-        assert_eq!((renamed.id.as_str(), renamed.name.as_str()), (draft.id.as_str(), "Coast line"));
-        // Publishing uses the new name, and renaming again renames the game file and its preview.
-        let published = store.save(&draft.id, playable(), true).unwrap();
-        let path = PathBuf::from(published.game_file_path.unwrap());
+        let new = store.create("test", 2, false).unwrap();
+        let renamed = store.rename(&new.id, "  Coast / line  ", Some(new.data.clone())).unwrap();
+        assert_eq!((renamed.id.as_str(), renamed.name.as_str()), ("new:Coast line.txt", "Coast line"));
+        assert_eq!(game_files(&store), 0);
+        let saved = store.save(&renamed.id, playable()).unwrap();
+        let path = PathBuf::from(&saved.file_path);
         assert!(path.ends_with("Coast line.txt"));
         fs::write(path.with_extension("png"), b"thumbnail").unwrap();
-        let moved = store.rename(&draft.id, "Coast").unwrap();
-        let moved_path = PathBuf::from(moved.game_file_path.unwrap());
+        let moved = store.rename(&saved.id, "Coast", None).unwrap();
+        let moved_path = PathBuf::from(&moved.file_path);
         assert!(moved_path.ends_with("Coast.txt") && !path.exists());
         assert_eq!(fs::read(moved_path.with_extension("png")).unwrap(), b"thumbnail");
-        assert_eq!(moved.status, "published");
-        // A map only in the game folder, with an unsaved draft of it.
-        let game = store.game_dirs[0].join("old.txt");
-        write_gzip_json_file(&game, &playable()).unwrap();
-        let edited = store.save(&format!("game:{}", game.to_string_lossy()), playable(), false).unwrap();
-        let record = store.rename(&format!("game:{}", game.to_string_lossy()), "New").unwrap();
-        assert!(record.id.ends_with("New.txt") && !game.exists());
-        assert!(store.load_draft(&edited.id).is_err());
-        let draft = store.load_draft(&MapStore::draft_id_for_source(&store.game_dirs[0].join("New.txt"))).unwrap();
-        assert_eq!(draft.file_name, "New.txt");
         // Taken names and empty names are refused.
-        assert!(store.rename(&record.id, "coast").unwrap_err().contains("already exists"));
-        assert!(store.rename(&record.id, "  ///  ").is_err());
-        assert_eq!(store.list().unwrap().len(), 3);
+        store.import("Other", playable()).unwrap();
+        assert!(store.rename(&moved.id, "other", None).unwrap_err().contains("already exists"));
+        assert!(store.rename(&moved.id, "  ///  ", None).is_err());
+        assert!(store.rename(&store.create("x", 2, false).unwrap().id, "Other", Some(playable())).is_err());
+        assert_eq!(store.list().unwrap().len(), 2);
     }
 
     #[test]
@@ -839,43 +745,7 @@ mod tests {
         atomic_write(&path, b"old").unwrap();
         atomic_write(&path, b"new").unwrap();
         assert_eq!(fs::read(path).unwrap(), b"new");
-        assert_eq!(fs::read_dir(&store.game_dirs[0]).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn corrupt_draft_does_not_hide_other_maps_and_can_be_deleted() {
-        let (_root, store) = store();
-        store.create("good", 2, false).unwrap();
-        fs::write(store.drafts.join("broken.json"), b"broken json").unwrap();
-        let maps = store.list().unwrap();
-        assert_eq!(maps.len(), 2);
-        assert_eq!(
-            maps.iter()
-                .find(|m| m.id == "draft:broken.json")
-                .unwrap()
-                .status,
-            "invalid"
-        );
-        store.delete(&["draft:broken.json".into()]).unwrap();
-        assert_eq!(store.list().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn external_game_changes_are_visible_and_not_deleted_with_the_older_draft() {
-        let (_root, store) = store();
-        let draft = store.create("test", 2, false).unwrap();
-        let published = store.save(&draft.id, playable(), true).unwrap();
-        let path = PathBuf::from(published.game_file_path.unwrap());
-        fs::write(&path, b"externally damaged").unwrap();
-        let maps = store.list().unwrap();
-        assert_eq!(maps.len(), 2);
-        assert_eq!(
-            maps.iter().find(|m| m.id == draft.id).unwrap().status,
-            "draft"
-        );
-        assert!(maps.iter().any(|m| m.status == "invalid"));
-        store.delete(&[draft.id]).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"externally damaged");
+        assert_eq!(game_files(&store), 1);
     }
 
     #[test]
@@ -890,13 +760,39 @@ mod tests {
         let maps = store.list().unwrap();
         assert_eq!(maps.len(), 2);
         assert_ne!(maps[0].id, maps[1].id);
-        store
-            .delete(&[format!(
-                "game:{}",
-                second.join("map.txt").to_string_lossy()
-            )])
-            .unwrap();
+        store.delete(&[MapStore::game_id(&second.join("map.txt"))]).unwrap();
         assert!(store.game_dirs[0].join("map.txt").exists());
         assert!(!second.join("map.txt").exists());
+    }
+
+    #[test]
+    fn old_drafts_move_into_the_game_once_and_invalid_ones_are_set_aside() {
+        let (root, store) = store();
+        let drafts = root.path().join("drafts");
+        fs::create_dir(&drafts).unwrap();
+        let game_map = store.game_dirs[0].join("Edited.txt");
+        write_gzip_json_file(&game_map, &playable()).unwrap();
+        let mut edit = playable();
+        edit["infantry"][0][0] = json!([600, 600]);
+        let write = |name: &str, value: Value| fs::write(drafts.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+        write("map_edit.json", json!({"file_name": "Edited.txt", "source": game_map, "data": edit, "published": false}));
+        write("map_new.json", json!({"file_name": "Fresh.txt", "source": null, "data": playable(), "published": false}));
+        write("map_empty.json", json!({"file_name": "Empty.txt", "source": null, "data": default_game_map_value(2).unwrap(), "published": false}));
+        fs::write(drafts.join("map_broken.json"), b"not json").unwrap();
+        let maps = store.list().unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(read_gzip_json_file(&game_map).unwrap()["infantry"][0][0], json!([600, 600]));
+        assert!(store.game_dirs[0].join("Fresh.txt").is_file());
+        assert!(!store.game_dirs[0].join("Empty.txt").exists());
+        let names = |folder: &str| {
+            let mut names: Vec<String> = fs::read_dir(drafts.join(folder)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names("moved"), ["map_edit.json", "map_new.json"]);
+        assert_eq!(names("not-moved"), ["map_broken.json", "map_empty.json"]);
+        // Listing again moves nothing twice.
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(game_files(&store), 2);
     }
 }

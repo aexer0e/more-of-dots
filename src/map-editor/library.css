@@ -1,5 +1,8 @@
+/* The map library: a gallery of the maps in the game. Clicking a map opens it;
+   its card shows a menu (Rename, Duplicate, Delete) on hover. Colours follow
+   the Replays page. */
 .map-editor-scope[data-screen='library'] {
-  background: #0a1015;
+  background: #0e1110;
 }
 
 .map-editor-scope[data-screen='library'] .app-shell {
@@ -7,108 +10,293 @@
 }
 
 .map-editor-scope[data-screen='library'] .app-main {
-  padding: 12px 20px 24px;
+  padding: 8px 28px 84px;
 }
 
-.map-editor-scope[data-screen='library'] .library-shell {
-  gap: 12px;
-}
-
-.map-editor-scope[data-screen='library'] .library-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
-  gap: 14px;
-  background: #101920;
-  border-color: #283740;
-  border-radius: 8px;
-  box-shadow: none;
-}
-
-.map-editor-scope[data-screen='library'] .brand-block {
-  min-width: 0;
-  gap: 12px;
-}
-
-.map-editor-scope[data-screen='library'] .brand-block img {
-  width: 36px;
-  height: 36px;
-  border-radius: 6px;
-  box-shadow: none;
-}
-
-.map-editor-scope[data-screen='library'] .brand-block h1 {
-  font-size: 1.2rem;
-}
-
-.map-editor-scope[data-screen='library'] .library-toolbar-copy p {
-  margin: 3px 0 0;
-  color: var(--muted);
-  font-size: 0.8rem;
-}
-
-.map-editor-scope[data-screen='library'] .library-toolbar-actions {
-  gap: 6px;
-  justify-content: flex-end;
-}
-
-.map-editor-scope[data-screen='library'] .library-toolbar-actions button {
-  flex: 0 0 auto;
-  min-height: 32px;
-  padding: 6px 11px;
-  border-radius: 6px;
-  font-size: 0.8rem;
-}
-
-.map-editor-scope[data-screen='library'] .library-toolbar-actions .primary-button {
-  background: #3879b2;
-  border-color: #508dbf;
-  color: #fff;
-}
-
-.map-editor-scope[data-screen='library'] button[aria-pressed='true'] {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-}
-
-.map-editor-scope[data-screen='library'] .map-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.map-editor-scope[data-screen='library'] .map-card {
+.map-editor-scope .ml-shell {
   display: flex;
   flex-direction: column;
-  min-width: 0;
-  padding: 10px;
-  gap: 9px;
-  background: #111b22;
-  border-color: #2a3842;
+  gap: 16px;
+  color: #eef4f0;
+  font-size: 13px;
+}
+
+.map-editor-scope .ml-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.map-editor-scope .ml-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Header: one card with the title, search, the team and sort filters (the
+   Replays page's dropdowns), Refresh and Select. While selecting, the same card
+   holds the selection's actions. */
+.map-editor-scope .ml-header {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  min-height: 64px;
+  box-sizing: border-box;
+  padding: 10px 10px 10px 18px;
+  border: 1px solid rgba(238, 244, 240, 0.1);
+  border-radius: 12px;
+  background: #161a19;
+}
+
+.map-editor-scope .ml-header.is-selecting {
+  padding-left: 14px;
+  border-color: rgba(90, 146, 196, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(90, 146, 196, 0.2);
+}
+
+.map-editor-scope .ml-heading {
+  display: flex;
+  align-items: baseline;
+  white-space: nowrap;
+  gap: 10px;
+  margin-right: auto;
+}
+
+.map-editor-scope .ml-heading h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.map-editor-scope .ml-heading span {
+  color: #97a49d;
+}
+
+.map-editor-scope .ml-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 230px;
+  min-width: 150px;
+  height: 42px;
+  box-sizing: border-box;
+  padding: 0 12px;
+  border: 1px solid rgba(238, 244, 240, 0.12);
   border-radius: 8px;
-  box-shadow: none;
+  background: #0e1110;
+  color: #97a49d;
 }
 
-.map-editor-scope[data-screen='library'] .map-card.selected {
-  border-color: var(--accent-strong);
-  box-shadow: 0 0 0 1px var(--accent-soft) inset;
+.map-editor-scope .ml-search:focus-within {
+  border-color: #5a92c4;
+  box-shadow: 0 0 0 2px rgba(90, 146, 196, 0.16);
 }
 
-.map-editor-scope[data-screen='library'] .map-select-toggle {
-  top: 18px;
-  left: 18px;
+.map-editor-scope .ml-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #eef4f0;
+  font: inherit;
 }
 
-.map-editor-scope[data-screen='library'] .map-thumb {
-  flex: 0 0 auto;
-  border-radius: 6px;
+/* The Replays page's filter dropdowns, on the card's darker inset colour. */
+.map-editor-scope .ml-header .filter-dropdown summary {
+  background: #0e1110;
+  border-color: rgba(238, 244, 240, 0.12);
 }
 
-.map-editor-scope[data-screen='library'] .map-thumb-frame {
+.map-editor-scope .ml-header .filter-dropdown[open] summary,
+.map-editor-scope .ml-header .filter-dropdown summary:hover {
+  border-color: rgba(238, 244, 240, 0.24);
+}
+
+.map-editor-scope .ml-header .filter-menu {
+  min-width: 170px;
+}
+
+.map-editor-scope .ml-icon-button,
+.map-editor-scope .ml-button,
+.map-editor-scope .ml-delete {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 42px;
+  box-sizing: border-box;
+  border: 1px solid rgba(238, 244, 240, 0.12);
+  border-radius: 8px;
+  background: #0e1110;
+  color: #eef4f0;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.map-editor-scope .ml-icon-button {
+  width: 42px;
+  padding: 0;
+}
+
+.map-editor-scope .ml-button,
+.map-editor-scope .ml-delete {
+  padding: 0 14px;
+}
+
+.map-editor-scope .ml-icon-button:hover:not(:disabled),
+.map-editor-scope .ml-button:hover:not(:disabled) {
+  border-color: rgba(238, 244, 240, 0.24);
+}
+
+.map-editor-scope .ml-icon-button:disabled,
+.map-editor-scope .ml-button:disabled,
+.map-editor-scope .ml-delete:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.map-editor-scope .ml-primary {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+  box-sizing: border-box;
+  padding: 0 14px;
+  /* The same faint border as the buttons beside it, with the blue only inside
+     it: a visible blue border made this button read 2px taller than them. */
+  border: 1px solid rgba(238, 244, 240, 0.12);
+  border-radius: 8px;
+  background: rgba(90, 146, 196, 0.3) padding-box;
+  color: #eef4f0;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.map-editor-scope .ml-primary:hover {
+  background-color: rgba(90, 146, 196, 0.42);
+}
+
+/* The font sits low in its line box; trimming to the cap height centres the
+   letters on the icons and in the 42px controls. */
+.map-editor-scope .ml-label {
+  display: block;
+  line-height: 1;
+  text-box: trim-both cap alphabetic;
+}
+
+.map-editor-scope .ml-search input {
+  padding-bottom: 2px;
+}
+
+.map-editor-scope .ml-select-all {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 42px;
+  margin-right: auto;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.map-editor-scope .ml-select-all input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #5a92c4;
+}
+
+.map-editor-scope .ml-select-all strong {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.map-editor-scope .ml-delete {
+  border-color: rgba(239, 107, 102, 0.5);
+  background: rgba(239, 107, 102, 0.12);
+  color: #f3a29e;
+  font-weight: 600;
+}
+
+.map-editor-scope .ml-delete:hover:not(:disabled) {
+  background: rgba(239, 107, 102, 0.2);
+}
+
+.map-editor-scope .ml-empty {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  min-height: 240px;
+  padding: 24px;
+  border: 1px dashed rgba(238, 244, 240, 0.14);
+  border-radius: 12px;
+  color: #97a49d;
+  text-align: center;
+}
+
+.map-editor-scope .ml-empty h2 {
+  margin: 0;
+  color: #eef4f0;
+  font-size: 16px;
+}
+
+.map-editor-scope .ml-empty p {
+  margin: 0;
+}
+
+/* The gallery. */
+.map-editor-scope .ml-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 20px 16px;
+}
+
+.map-editor-scope .ml-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 0;
+}
+
+.map-editor-scope .ml-thumb {
+  position: relative;
+  border-radius: 10px;
+  box-shadow: 0 0 0 1px rgba(238, 244, 240, 0.08);
+}
+
+.map-editor-scope .ml-thumb-open {
+  all: unset;
+  display: block;
+  width: 100%;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0b0e0d;
+  cursor: pointer;
+}
+
+.map-editor-scope .ml-thumb-open:disabled {
+  cursor: default;
+}
+
+.map-editor-scope .ml-thumb .map-thumb-frame {
   aspect-ratio: 16 / 9;
 }
 
-.map-editor-scope[data-screen='library'] .map-thumb-stage {
+.map-editor-scope .ml-thumb .map-thumb-stage {
   top: 50%;
   left: 50%;
   min-width: 0;
@@ -116,146 +304,222 @@
   transform: translate(-50%, -50%);
 }
 
-.map-editor-scope[data-screen='library'] .map-preview-badges {
+/* On hover or keyboard focus: a frame and the menu. */
+.map-editor-scope .ml-actions {
   position: absolute;
-  left: 8px;
-  bottom: 8px;
+  inset: 0;
   display: flex;
-  gap: 5px;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(6, 10, 9, 0.38);
+  box-shadow: inset 0 0 0 2px #5a92c4;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
 }
 
-.map-editor-scope[data-screen='library'] .map-mode-pill,
-.map-editor-scope[data-screen='library'] .map-status-pill {
-  position: static;
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 7px;
-  gap: 5px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 5px;
-  background: rgba(6, 10, 13, 0.88);
-  font-size: 0.72rem;
-  font-weight: 600;
-  line-height: 1;
+.map-editor-scope .ml-card:hover .ml-actions,
+.map-editor-scope .ml-card:focus-within .ml-actions,
+.map-editor-scope .ml-card.has-menu .ml-actions {
+  opacity: 1;
 }
 
-.map-editor-scope[data-screen='library'] .map-status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #72bc8b;
+.map-editor-scope .ml-actions-side,
+.map-editor-scope .ml-menu {
+  pointer-events: auto;
 }
 
-.map-editor-scope[data-screen='library'] [data-status='draft'] .map-status-dot {
-  background: #94a8b1;
-}
-
-.map-editor-scope[data-screen='library'] [data-status='invalid'] .map-status-dot {
-  background: var(--danger);
-}
-
-.map-editor-scope[data-screen='library'] .map-card-body {
-  gap: 5px;
-}
-
-.map-editor-scope[data-screen='library'] .map-card-head {
+.map-editor-scope .ml-actions-side {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-width: 0;
-  gap: 8px;
+  gap: 6px;
 }
 
-.map-editor-scope[data-screen='library'] .map-card-body h4 {
-  min-width: 0;
-  font-size: 0.95rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.map-editor-scope .ml-action {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(14, 17, 16, 0.86);
+  color: #eef4f0;
+  cursor: pointer;
 }
 
-.map-editor-scope[data-screen='library'] .map-card-body p {
-  font-size: 0.74rem;
-  line-height: 1.5;
+.map-editor-scope .ml-action:hover {
+  background: #1f2725;
 }
 
-.map-editor-scope[data-screen='library'] .map-card-meta {
-  min-width: 0;
+.map-editor-scope .ml-action:disabled {
+  cursor: default;
+  opacity: 0.45;
 }
 
-.map-editor-scope[data-screen='library'] .map-card-filename {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.map-editor-scope .ml-more .ml-icon {
+  fill: currentColor;
+  stroke-width: 1.6;
 }
 
-.map-editor-scope[data-screen='library'] .library-action-icon {
-  width: 14px;
-  height: 14px;
+.map-editor-scope .ml-menu {
+  position: absolute;
+  right: 8px;
+  bottom: 44px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid rgba(238, 244, 240, 0.14);
+  border-radius: 9px;
+  background: #161a19;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
 }
 
-.map-editor-scope[data-screen='library'] .map-card-actions {
-  flex: 0 0 auto;
-  flex-wrap: nowrap;
-  gap: 5px;
-}
-
-.map-editor-scope[data-screen='library'] .map-card-actions button {
-  display: inline-flex;
-  align-items: center;
-  min-height: 28px;
-  padding: 5px 7px;
-  gap: 4px;
-  border-radius: 5px;
-  border-color: #3a4d5b;
-  background: #17252f;
-  font-size: 0.74rem;
-  font-weight: 500;
-}
-
-.map-editor-scope[data-screen='library'] .map-card-actions .danger-button {
-  border-color: #62403f;
+.map-editor-scope .ml-menu button {
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
   background: transparent;
-  color: #f18d86;
+  color: #eef4f0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 
-.map-editor-scope[data-screen='library'] .map-card-actions .danger-button:hover {
-  border-color: #a15d59;
-  background: rgba(239, 107, 102, 0.12);
+.map-editor-scope .ml-menu button:hover:not(:disabled),
+.map-editor-scope .ml-menu button:focus-visible {
+  background: rgba(238, 244, 240, 0.08);
+  outline: none;
 }
 
-.map-editor-scope[data-screen='library'] .library-shell button:focus-visible,
-.map-editor-scope[data-screen='library'] .map-select-toggle input:focus-visible {
-  outline: 2px solid var(--accent-strong);
+.map-editor-scope .ml-menu button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.map-editor-scope .ml-menu .ml-danger {
+  color: #f3a29e;
+}
+
+/* Selecting: a check mark in the corner, and a frame on selected maps. */
+.map-editor-scope .ml-check {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 2px solid rgba(238, 244, 240, 0.8);
+  border-radius: 6px;
+  background: rgba(14, 17, 16, 0.6);
+  color: #06192b;
+  pointer-events: none;
+}
+
+.map-editor-scope .ml-card.is-selected .ml-check {
+  border-color: #5a92c4;
+  background: #5a92c4;
+}
+
+.map-editor-scope .ml-card.is-selected .ml-thumb {
+  box-shadow: 0 0 0 2px #5a92c4;
+}
+
+.map-editor-scope .ml-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 0 2px;
+}
+
+.map-editor-scope .ml-card-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.map-editor-scope .ml-card-name {
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.map-editor-scope .ml-badge {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(240, 160, 80, 0.14);
+  color: #f0b070;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.map-editor-scope .ml-badge.is-error {
+  background: rgba(239, 107, 102, 0.14);
+  color: #f3a29e;
+}
+
+.map-editor-scope .ml-card-meta {
+  margin: 0;
+  overflow: hidden;
+  color: #97a49d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-editor-scope .ml-shell button:focus-visible,
+.map-editor-scope .ml-thumb-open:focus-visible {
+  outline: 2px solid #5a92c4;
   outline-offset: 2px;
 }
 
-@media (max-width: 900px) {
-  .map-editor-scope[data-screen='library'] .map-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+@media (hover: none) {
+  .map-editor-scope .ml-actions {
+    opacity: 1;
+    background: none;
+    box-shadow: none;
   }
 }
 
-@media (max-width: 600px) {
+@media (prefers-reduced-motion: reduce) {
+  .map-editor-scope .ml-actions {
+    transition: none;
+  }
+}
+
+/* Narrow windows: the title takes its own row above the controls. */
+@media (max-width: 980px) {
+  .map-editor-scope .ml-header {
+    flex-wrap: wrap;
+  }
+
+  .map-editor-scope .ml-heading {
+    width: 100%;
+    margin: 0 0 2px;
+  }
+
+  .map-editor-scope .ml-search {
+    flex: 1 1 160px;
+  }
+}
+
+@media (max-width: 760px) {
   .map-editor-scope[data-screen='library'] .app-main {
-    padding: 10px 12px 20px;
+    padding: 8px 16px 84px;
   }
 
-  .map-editor-scope[data-screen='library'] .library-toolbar {
-    flex-wrap: wrap;
-    padding: 10px 12px;
-    gap: 10px;
-  }
 
-  .map-editor-scope[data-screen='library'] .library-toolbar-actions {
-    margin-left: auto;
-  }
-
-  .map-editor-scope[data-screen='library'] .map-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .map-editor-scope[data-screen='library'] .library-selection-bar {
-    flex-wrap: wrap;
+  .map-editor-scope .ml-search {
+    flex: 1 1 200px;
+    width: auto;
   }
 }

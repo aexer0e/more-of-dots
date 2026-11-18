@@ -1,28 +1,38 @@
-import { useRef, useState, type KeyboardEvent } from 'react';
-import { CANVAS_HEIGHT, CANVAS_WIDTH, CAPITAL_SIZE, CITY_SIZE, SPRITE_SIZE, teamColorForIndex } from '../lib/constants';
-import { formatUpdatedAt } from '../lib/mapCodec';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { CANVAS_HEIGHT, CANVAS_WIDTH, CAPITAL_SIZE, CITY_SIZE, SPRITE_SIZE, TEAM_COUNTS, teamColorForIndex } from '../lib/constants';
 import type { StoredMap } from '../lib/types';
 import { spriteAssets, uiAssets } from '../lib/assets';
 
 interface MapLibraryProps {
   maps: StoredMap[];
   loading: boolean;
-  onCreate: () => void;
-  onRefresh: () => void;
-  onDeleteSelected: (fileNames: string[]) => void;
+  /** Opens the dialog that makes a new map or imports one. */
+  onAdd: () => void;
+  onDeleteSelected: (fileNames: string[], label: string) => void;
   onEdit: (mapId: string) => void;
   /** Renames a map; rejects with a message when the name cannot be used. */
   onRename: (map: StoredMap, name: string) => Promise<void>;
+  /** Copies a map in the game. */
+  onDuplicate: (map: StoredMap) => void;
 }
 
-/** A map's name; clicking it edits the name in place. Enter or leaving the field
- * saves it, Escape keeps the old one. */
-function MapName({ map, disabled, onRename }: { map: StoredMap; disabled: boolean; onRename: MapLibraryProps['onRename'] }) {
+/** A map's name; clicking it, or Rename in the card's menu (`editRequest`
+ * changes), edits the name in place. Enter or leaving the field saves it,
+ * Escape keeps the old one. */
+function MapName({ map, disabled, editRequest, onRename }: { map: StoredMap; disabled: boolean; editRequest: number; onRename: MapLibraryProps['onRename'] }) {
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   // Enter disables the field, which also blurs it; one rename is sent.
   const sending = useRef(false);
+  // Only a new request opens the field, not one made before this card mounted.
+  const seenRequest = useRef(editRequest);
+  useEffect(() => {
+    if (editRequest === seenRequest.current) return;
+    seenRequest.current = editRequest;
+    setError('');
+    setEditing(true);
+  }, [editRequest]);
 
   async function commit(value: string) {
     if (sending.current) return;
@@ -48,11 +58,11 @@ function MapName({ map, disabled, onRename }: { map: StoredMap; disabled: boolea
 
   if (!editing)
     return (
-      <h4 title={map.name}>
+      <h2 className="ml-card-name" title={map.name}>
         <button className="map-name-button" type="button" disabled={disabled} title="Rename the map" onClick={() => { setError(''); setEditing(true); }}>
           {map.name}
         </button>
-      </h4>
+      </h2>
     );
 
   return (
@@ -184,26 +194,100 @@ function MapThumbnail({ map }: { map: StoredMap }) {
   );
 }
 
-function ActionIcon() {
-  return (
-    <svg aria-hidden="true" className="library-action-icon" viewBox="0 0 24 24">
-      <path d="M4 16.8V20h3.2L18 9.2 14.8 6 4 16.8Z" fill="currentColor" />
-      <path d="m13.9 6.9 3.2 3.2" fill="none" stroke="currentColor" strokeWidth="2" />
-    </svg>
-  );
+/** When a map was last changed, in words: "2 hours ago", "yesterday", a date. */
+function editedLabel(timestamp: number, now = Date.now()) {
+  const minutes = Math.max(0, Math.round((now - timestamp) / 60_000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`;
+  const day = (time: number) => new Date(time).setHours(0, 0, 0, 0);
+  if (day(now) - day(timestamp) <= 86_400_000) return 'yesterday';
+  return new Date(timestamp).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: new Date(timestamp).getFullYear() === new Date(now).getFullYear() ? undefined : 'numeric' });
 }
+
+function mapSummary(map: StoredMap) {
+  if (map.status === 'invalid') return `Edited ${editedLabel(map.updatedAt)}`;
+  const units = map.data.infantry.reduce((total, team) => total + team.length, 0) + map.data.tanks.reduce((total, team) => total + team.length, 0);
+  const cities = map.data.cities.length;
+  return [`${map.teamCount} teams`, `${units} ${units === 1 ? 'unit' : 'units'}`, `${cities} ${cities === 1 ? 'city' : 'cities'}`, `edited ${editedLabel(map.updatedAt)}`].join(' · ');
+}
+
+const ICONS = {
+  search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
+  more: <><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></>,
+  select: <><rect x="4" y="4" width="16" height="16" rx="3" /><path d="m8.5 12 2.5 2.5 4.5-5" /></>,
+  check: <path d="m6 12.5 4 4 8-9" />,
+  plus: <path d="M12 5v14M5 12h14" />,
+  trash: <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13" />,
+  close: <path d="m6 6 12 12M18 6 6 18" />,
+};
+const Icon = ({ name }: { name: keyof typeof ICONS }) => (
+  <svg aria-hidden="true" className="ml-icon" viewBox="0 0 24 24">{ICONS[name]}</svg>
+);
+
+type SortOrder = 'edited' | 'name';
 
 export function MapLibrary({
   maps,
   loading,
-  onCreate,
-  onRefresh,
+  onAdd,
   onDeleteSelected,
   onEdit,
   onRename,
+  onDuplicate,
 }: MapLibraryProps) {
+  const [query, setQuery] = useState('');
+  const [teams, setTeams] = useState<ReadonlySet<number>>(() => new Set(TEAM_COUNTS));
+  const [sort, setSort] = useState<SortOrder>('edited');
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [renameRequests, setRenameRequests] = useState<Record<string, number>>({});
   const [selecting, setSelecting] = useState(false);
   const [selectedMapIds, setSelectedMapIds] = useState<Set<string>>(() => new Set());
+
+  // The card menu closes on a click elsewhere or Escape.
+  useEffect(() => {
+    if (!menuFor) return;
+    const close = (event: Event) => {
+      if (event instanceof window.KeyboardEvent && event.key !== 'Escape') return;
+      if (event instanceof window.MouseEvent && (event.target as Element | null)?.closest('.ml-menu, .ml-more')) return;
+      setMenuFor(null);
+    };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', close);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', close);
+    };
+  }, [menuFor]);
+
+  const shown = useMemo(() => {
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const list = maps.filter((map) => (teams.size === TEAM_COUNTS.length || teams.has(map.teamCount)) && words.every((word) => map.name.toLowerCase().includes(word)));
+    return sort === 'name' ? [...list].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })) : list;
+  }, [maps, query, teams, sort]);
+
+  const teamTotals = useMemo(() => {
+    const totals: Record<number, number> = {};
+    for (const map of maps) totals[map.teamCount] = (totals[map.teamCount] ?? 0) + 1;
+    return totals;
+  }, [maps]);
+
+  function toggleTeams(count: number) {
+    setTeams((current) => {
+      const next = new Set(current);
+      if (next.has(count)) next.delete(count);
+      else next.add(count);
+      return next;
+    });
+  }
+
+  function closeOnEscape(event: KeyboardEvent<HTMLDetailsElement>) {
+    if (event.key !== 'Escape' || !event.currentTarget.open) return;
+    event.currentTarget.open = false;
+    event.currentTarget.querySelector('summary')?.focus();
+  }
+
   const selectedMaps = maps.filter((map) => selectedMapIds.has(map.id));
   const selectedCount = selectedMaps.length;
 
@@ -223,128 +307,120 @@ export function MapLibrary({
     });
   }
 
-  function selectAllMaps() {
-    setSelectedMapIds(new Set(maps.map((map) => map.id)));
-  }
-
-  function clearSelection() {
-    setSelectedMapIds(new Set());
-  }
-
-  function deleteSelectedMaps() {
-    if (!selectedCount) return;
-    const label = selectedCount === 1 ? selectedMaps[0]?.fileName : `${selectedCount} maps`;
-    if (!window.confirm(`Delete ${label}? Published maps will be removed from the game. Deleting a draft keeps any published copy. No backup will be kept. This cannot be undone.`)) return;
-    onDeleteSelected(selectedMaps.map((map) => map.id));
+  function deleteMaps(list: StoredMap[]) {
+    if (!list.length) return;
+    const label = list.length === 1 ? list[0].name : `${list.length} maps`;
+    // No confirmation: the library offers Undo for a few seconds before the files go.
+    onDeleteSelected(list.map((map) => map.id), label);
     setSelectedMapIds(new Set());
     setSelecting(false);
   }
 
+  // The same summary as the Replays page filters: "Teams: All", "Teams: 2, 3".
+  const teamSummary = teams.size === TEAM_COUNTS.length ? 'Teams: All' : !teams.size ? 'Teams: None' : `Teams: ${TEAM_COUNTS.filter((count) => teams.has(count)).join(', ')}`;
+  const allSelected = shown.length > 0 && shown.every((map) => selectedMapIds.has(map.id));
+
   return (
-    <section className="library-shell">
-      <header className="library-toolbar">
-        <div className="brand-block">
-          <img alt="" src={uiAssets.appIcon} />
-          <div className="library-toolbar-copy">
-            <h1>Map Editor</h1>
-            <p>Maps and drafts</p>
-          </div>
-        </div>
-        <div className="library-toolbar-actions">
-          <button className="secondary-button compact" disabled={loading} type="button" onClick={onRefresh}>
-            Refresh
-          </button>
-          <button className="secondary-button compact" aria-pressed={selecting} type="button" onClick={toggleSelecting}>
-            {selecting ? 'Cancel Select' : 'Select'}
-          </button>
-          <button className="primary-button compact" type="button" onClick={onCreate}>
-            New Map
-          </button>
-        </div>
-      </header>
-
+    <section className="ml-shell" aria-labelledby="mapLibraryTitle">
       {selecting ? (
-        <div className="library-selection-bar">
-          <span>{selectedCount} selected</span>
-          <div className="library-selection-actions">
-            <button className="secondary-button compact" type="button" onClick={selectAllMaps}>
-              Select All
-            </button>
-            <button className="secondary-button compact" type="button" onClick={clearSelection}>
-              Clear
-            </button>
-            <button className="danger-button compact" disabled={!selectedCount} type="button" onClick={deleteSelectedMaps}>
-              Delete
-            </button>
-          </div>
-        </div>
-      ) : null}
-
-      {loading ? (
-        <div className="empty-state compact">
-          <div className="loading-pulse" />
-          <p>Loading local maps...</p>
-        </div>
-      ) : maps.length === 0 ? (
-        <div className="empty-state">
-          <img alt="WoD Map Editor logo" src={uiAssets.logo} />
-          <h3>No maps saved yet</h3>
-          <p>Create a map or import one to get started.</p>
-        </div>
+        <header className="ml-header is-selecting" role="region" aria-label="Selected maps">
+          <label className="ml-select-all">
+            <input
+              type="checkbox"
+              aria-label="Select all maps"
+              checked={allSelected}
+              ref={(input) => { if (input) input.indeterminate = selectedCount > 0 && !allSelected; }}
+              onChange={() => setSelectedMapIds(allSelected ? new Set() : new Set(shown.map((map) => map.id)))}
+            />
+            <strong className="ml-label">{selectedCount} selected</strong>
+          </label>
+          <button type="button" className="ml-delete" disabled={!selectedCount} onClick={() => deleteMaps(selectedMaps)}>
+            <Icon name="trash" /><span className="ml-label">Delete</span>
+          </button>
+          <button className="ml-icon-button" type="button" aria-label="Stop selecting" title="Stop selecting" onClick={toggleSelecting}><Icon name="close" /></button>
+        </header>
       ) : (
-        <div className="map-grid">
-          {maps.map((map) => {
+        <header className="ml-header">
+          <div className="ml-heading">
+            <h1 id="mapLibraryTitle">Your maps</h1>
+            <span>{loading ? '' : `${maps.length} ${maps.length === 1 ? 'map' : 'maps'}`}</span>
+          </div>
+          <label className="ml-search">
+            <Icon name="search" />
+            <span className="ml-sr">Search maps</span>
+            <input type="search" placeholder="Search maps" value={query} onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          <details className="filter-dropdown" onKeyDown={closeOnEscape}>
+            <summary aria-label="Team filters"><span className="ml-label">{teamSummary}</span></summary>
+            <div className="filter-menu" role="group" aria-label="Team filters">
+              {TEAM_COUNTS.map((count) => (
+                <label key={count}>
+                  <input type="checkbox" checked={teams.has(count)} onChange={() => toggleTeams(count)} />
+                  <span>{count} teams</span>
+                  <span className="filter-count">{teamTotals[count] ?? 0}</span>
+                </label>
+              ))}
+            </div>
+          </details>
+          <details className="filter-dropdown" onKeyDown={closeOnEscape}>
+            <summary aria-label="Sort order"><span className="ml-label">Sort: {sort === 'name' ? 'Name' : 'Last edited'}</span></summary>
+            <div className="filter-menu" role="radiogroup" aria-label="Sort order">
+              {(['edited', 'name'] as SortOrder[]).map((value) => (
+                <label key={value}>
+                  <input type="radio" name="mapSort" checked={sort === value} onChange={(event) => { setSort(value); event.currentTarget.closest('details')?.removeAttribute('open'); }} />
+                  <span>{value === 'name' ? 'Name' : 'Last edited'}</span>
+                </label>
+              ))}
+            </div>
+          </details>
+          <button className="ml-button" type="button" disabled={!maps.length} onClick={toggleSelecting}><Icon name="select" /><span className="ml-label">Select</span></button>
+          <button className="ml-primary" type="button" onClick={onAdd}><Icon name="plus" /><span className="ml-label">Add map</span></button>
+        </header>
+      )}
+
+      {loading && !maps.length ? (
+        <div className="ml-empty"><div className="loading-pulse" /><p>Loading your maps...</p></div>
+      ) : !maps.length ? (
+        <div className="ml-empty">
+          <h2>No maps yet</h2>
+                  </div>
+      ) : !shown.length ? (
+        <div className="ml-empty"><p>No maps match.</p></div>
+      ) : (
+        <div className="ml-grid">
+          {shown.map((map) => {
             const selected = selectedMapIds.has(map.id);
+            const unreadable = map.status === 'invalid';
             return (
-              <article className={`map-card${selected ? ' selected' : ''}`} key={map.id}>
-                {selecting ? (
-                  <label className="map-select-toggle">
-                    <input checked={selected} type="checkbox" onChange={() => toggleMapSelection(map.id)} />
-                    <span>{selected ? 'Selected' : 'Select map'}</span>
-                  </label>
-                ) : null}
-                <button className="map-thumb" type="button" disabled={!selecting && map.status === 'invalid'} onClick={() => (selecting ? toggleMapSelection(map.id) : onEdit(map.id))}>
-                  <MapThumbnail map={map} />
-                  <span className="map-preview-badges">
-                    <span className="map-status-pill" data-status={map.status ?? 'published'}>
-                      <span aria-hidden="true" className="map-status-dot" />
-                      {map.status === 'draft' ? 'Draft' : map.status === 'invalid' ? 'Unreadable map' : 'In game'}
-                    </span>
-                    <span className="map-mode-pill" title={`${map.teamCount} teams`}>
-                      {map.teamCount} teams
-                    </span>
-                  </span>
-                </button>
-                <div className="map-card-body">
-                  <div className="map-card-head">
-                    <MapName map={map} disabled={selecting || map.status === 'invalid'} onRename={onRename} />
-                    <div className="map-card-actions">
-                      {selecting ? (
-                        <button className="secondary-button compact" type="button" aria-pressed={selected} onClick={() => toggleMapSelection(map.id)}>
-                          {selected ? 'Selected' : 'Select'}
-                        </button>
-                      ) : (
-                        <>
-                          <button className="secondary-button compact" disabled={map.status === 'invalid'} aria-label={`Edit ${map.name}`} type="button" onClick={() => onEdit(map.id)}>
-                            <ActionIcon />Edit
-                          </button>
-                          <button className="danger-button compact" aria-label={`Delete ${map.name}`} type="button" onClick={() => {
-                            const detail = map.status === 'draft' ? ' Any published copy stays in the game.' : map.gameFilePath ? ' Its game file and thumbnail will be deleted.' : '';
-                            if (window.confirm(`Delete ${map.fileName}?${detail} No backup will be kept. This cannot be undone.`)) onDeleteSelected([map.id]);
-                          }}>
-                            <svg aria-hidden="true" className="library-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7" />
-                            </svg>Delete
-                          </button>
-                        </>
-                      )}
+              <article className={`ml-card${selected ? ' is-selected' : ''}${menuFor === map.id ? ' has-menu' : ''}`} key={map.id}>
+                <div className="ml-thumb">
+                  <button className="ml-thumb-open" type="button" aria-label={selecting ? `Select ${map.name}` : `Edit ${map.name}`} aria-pressed={selecting ? selected : undefined} disabled={!selecting && unreadable} onClick={() => (selecting ? toggleMapSelection(map.id) : onEdit(map.id))}>
+                    <MapThumbnail map={map} />
+                  </button>
+                  {selecting ? (
+                    <span className="ml-check" aria-hidden="true">{selected ? <Icon name="check" /> : null}</span>
+                  ) : (
+                    <div className="ml-actions">
+                      <div className="ml-actions-side">
+                        <button className="ml-action ml-more" type="button" aria-label={`More actions for ${map.name}`} title="Rename, duplicate, delete" aria-haspopup="menu" aria-expanded={menuFor === map.id} onClick={() => setMenuFor(menuFor === map.id ? null : map.id)}><Icon name="more" /></button>
+                      </div>
+                      {menuFor === map.id ? (
+                        <div className="ml-menu" role="menu">
+                          <button type="button" role="menuitem" disabled={unreadable} onClick={() => { setMenuFor(null); setRenameRequests((current) => ({ ...current, [map.id]: (current[map.id] ?? 0) + 1 })); }}>Rename</button>
+                          <button type="button" role="menuitem" disabled={unreadable} onClick={() => { setMenuFor(null); onDuplicate(map); }}>Duplicate</button>
+                          <button type="button" role="menuitem" className="ml-danger" onClick={() => { setMenuFor(null); deleteMaps([map]); }}>Delete</button>
+                        </div>
+                      ) : null}
                     </div>
+                  )}
+                </div>
+                <div className="ml-card-body">
+                  <div className="ml-card-title">
+                    <MapName map={map} disabled={selecting || unreadable} editRequest={renameRequests[map.id] ?? 0} onRename={onRename} />
+                    {unreadable ? <span className="ml-badge is-error" title={map.issue ?? undefined}>Unreadable</span>
+                      : map.issue ? <span className="ml-badge" title={map.issue}>Not playable</span> : null}
                   </div>
-                  <div className="map-card-meta">
-                    <p className="map-card-filename" title={map.fileName}>{map.fileName}</p>
-                    <p className="map-card-updated">{map.width}×{map.height} · Updated {formatUpdatedAt(map.updatedAt)}</p>
-                  </div>
-                  {map.issue && <p className="dialog-error">{map.issue}</p>}
+                  <p className="ml-card-meta" title={map.issue ?? map.fileName}>{unreadable ? map.issue : mapSummary(map)}</p>
                 </div>
               </article>
             );

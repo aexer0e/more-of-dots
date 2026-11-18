@@ -1,10 +1,14 @@
-// Makes a map from the map a replay was played on: one of the replays in the
-// library, shown as cards with the map's layout, or a .rep file chosen here. It
-// uses the add-replays dialog's styles.
+// The map editor's Import dialog. Its first tab makes a new, empty map; the
+// others make a map from the map a replay was
+// played on (one of the replays in the library, shown as cards with the map's
+// layout, or a .rep file), from map files (.txt), or from a map shared in the
+// game's map hub, by its code. It uses the add-replays dialog's styles.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '../../platform';
 import { drawMapPreview, type MapPreview } from '../lib/mapPreview';
 import { normalizeMapData } from '../lib/mapCodec';
+import { TEAM_COUNTS } from '../lib/constants';
+import { fetchSharedMap, type MapSource, type SharedMap } from '../lib/storage';
 
 const base = import.meta.env.BASE_URL;
 
@@ -72,6 +76,106 @@ function ReplayCard({ replay, count, busy, onPick }: { replay: ReplayListItem; c
   );
 }
 
+/** The width and height in a PNG's header, read from its base64. */
+function pngSize(base64: string): [number, number] {
+  const bytes = Uint8Array.from(atob(base64.slice(0, 32)), (char) => char.charCodeAt(0));
+  if (bytes.length < 24) return [960, 540];
+  const view = new DataView(bytes.buffer);
+  return [view.getUint32(16), view.getUint32(20)];
+}
+
+const THUMB_UP = (
+  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 11v9H4.5A1.5 1.5 0 0 1 3 18.5v-6A1.5 1.5 0 0 1 4.5 11z" /><path d="M7 11l4-7.5a2 2 0 0 1 3.7 1.4L14 9h5.1a2 2 0 0 1 2 2.4l-1.4 7A2 2 0 0 1 17.8 20H7" /></svg>
+);
+const THUMB_DOWN = (
+  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M17 13V4h2.5A1.5 1.5 0 0 1 21 5.5v6a1.5 1.5 0 0 1-1.5 1.5z" /><path d="M17 13l-4 7.5a2 2 0 0 1-3.7-1.4L10 15H4.9a2 2 0 0 1-2-2.4l1.4-7A2 2 0 0 1 6.2 4H17" /></svg>
+);
+
+function SharedMapCard({ shared, busy, imported, onPick }: { shared: SharedMap; busy: boolean; imported: boolean; onPick: () => void }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const [state, setState] = useState<'waiting' | 'ready' | 'failed'>('waiting');
+  const data = useMemo(() => normalizeMapData(shared.map), [shared]);
+
+  useEffect(() => {
+    const element = canvas.current;
+    if (!element) return;
+    let cancelled = false;
+    setState('waiting');
+    const [width, height] = pngSize(shared.map.map_surface);
+    drawMapPreview(element, { data, width, height, mode: shared.map.mode }, base)
+      .then(() => { if (!cancelled) setState('ready'); })
+      .catch(() => { if (!cancelled) setState('failed'); });
+    return () => { cancelled = true; };
+  }, [shared, data]);
+
+  const title = shared.title || `Map ${shared.code}`;
+  const date = shared.date ? new Date(shared.date * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+  return (
+    <article className="map-code-card" aria-label={title}>
+      <div className="map-import-thumb map-code-thumb" data-state={state}>
+        <canvas ref={canvas} width={640} height={360} aria-hidden="true" />
+        {state === 'waiting' ? <span className="map-import-thumb-note">Loading the map</span> : null}
+        {state === 'failed' ? <span className="map-import-thumb-note">No preview</span> : null}
+      </div>
+      <div className="map-code-body">
+        <div className="map-code-heading">
+          <h3>{title}</h3>
+          <p>{shared.author ? `By ${shared.author}` : 'Unknown author'}</p>
+        </div>
+        <dl className="map-code-facts">
+          <dt>Code</dt><dd>{shared.code}</dd>
+          {shared.map.mode ? <><dt>Mode</dt><dd>{shared.map.mode}</dd></> : null}
+          {date ? <><dt>Shared</dt><dd>{date}</dd></> : null}
+        </dl>
+        <div className="map-code-actions">
+          {/* Votes from the game's map hub; voting happens in the game. */}
+          <div className="map-code-votes" title="Votes in the game's map hub">
+            <span className="map-code-vote" aria-label={`${shared.upvotes} upvotes`}>{THUMB_UP}{shared.upvotes}</span>
+            <span className="map-code-vote" aria-label={`${shared.downvotes} downvotes`}>{THUMB_DOWN}{shared.downvotes}</span>
+          </div>
+          {imported ? (
+            <span className="map-code-imported" title="This map is already in your library">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg>
+              Imported
+            </span>
+          ) : (
+            <button className="add-replays-choose map-code-import" type="button" disabled={busy} onClick={onPick}>
+              {busy ? 'Importing...' : 'Import'}
+            </button>
+          )}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+/** The map code card before a map is shown: the same layout, with the message
+ * in the preview's place, so the dialog keeps one size. */
+function PlaceholderCard({ state, message }: { state: 'empty' | 'loading' | 'failed'; message: string }) {
+  return (
+    <div className={`map-code-card is-placeholder is-${state}`}>
+      <div className="map-import-thumb map-code-thumb">
+        <span className="map-import-thumb-note" role={state === 'failed' ? 'alert' : undefined}>{message}</span>
+      </div>
+      <div className="map-code-body" aria-hidden="true">
+        <div className="map-code-heading">
+          <span className="map-code-skeleton" style={{ width: '72%', height: 18 }} />
+          <span className="map-code-skeleton" style={{ width: '42%' }} />
+        </div>
+        <div className="map-code-heading">
+          <span className="map-code-skeleton" style={{ width: '48%' }} />
+          <span className="map-code-skeleton" style={{ width: '38%' }} />
+          <span className="map-code-skeleton" style={{ width: '56%' }} />
+        </div>
+        <div className="map-code-actions">
+          <span className="map-code-skeleton" style={{ width: 72 }} />
+          <button className="add-replays-choose map-code-import" type="button" disabled tabIndex={-1}>Import</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface ReplayListItem {
   fileName: string;
   filePath: string;
@@ -84,15 +188,69 @@ interface ReplayListItem {
   mapKey?: string | null;
 }
 
-export type ReplaySource = { filePath: string } | { file: File };
+export type ReplaySource = MapSource;
+
+// The two terrain sizes the game's maps use, and the battlefield each plays on.
+const MAP_SIZES = [
+  { large: false, label: '960 × 540', detail: '1600 × 900 battlefield' },
+  { large: true, label: '1920 × 1080', detail: '1920 × 1080 battlefield' },
+];
+
+function NewMapPanel({ onCreate }: { onCreate: (name: string, teams: number, large: boolean) => void }) {
+  const [name, setName] = useState('Untitled map');
+  const [teams, setTeams] = useState(2);
+  const [large, setLarge] = useState(false);
+  const create = () => onCreate(name.trim() || 'Untitled map', teams, large);
+  return (
+    <form className="map-new" role="tabpanel" onSubmit={(event) => { event.preventDefault(); create(); }}>
+      <label className="map-new-field">
+        <span>Name</span>
+        <span className="add-replays-link-field">
+          <input autoFocus type="text" maxLength={64} value={name} onFocus={(event) => event.currentTarget.select()} onChange={(event) => setName(event.target.value)} />
+        </span>
+      </label>
+      <div className="map-new-field">
+        <span id="mapNewTeams">Teams</span>
+        <div className="map-new-choice" role="radiogroup" aria-labelledby="mapNewTeams">
+          {TEAM_COUNTS.map((count) => (
+            <button key={count} type="button" role="radio" aria-checked={teams === count} onClick={() => setTeams(count)}>{count} teams</button>
+          ))}
+        </div>
+      </div>
+      <div className="map-new-field">
+        <span id="mapNewSize">Size</span>
+        <div className="map-new-choice" role="radiogroup" aria-labelledby="mapNewSize">
+          {MAP_SIZES.map((size) => (
+            <button key={size.label} type="button" role="radio" aria-checked={large === size.large} onClick={() => setLarge(size.large)}>
+              {size.label}<small>{size.detail}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="map-new-actions">
+        <button className="add-replays-choose" type="submit">Create map</button>
+      </div>
+    </form>
+  );
+}
 
 interface ReplayImportDialogProps {
   open: boolean;
   busy: boolean;
   error: string;
   onCancel: () => void;
+  /** Makes a new, empty map from the first tab. */
+  onCreate: (name: string, teams: number, large: boolean) => void;
   onImport: (name: string, source: ReplaySource) => void;
+  /** Replays (.rep) and map files (.txt) chosen or dropped on the file tab. */
+  onImportFiles: (files: File[]) => void;
+  /** Map codes imported while the dialog is open; they stay listed so more can be added. */
+  importedCodes: ReadonlySet<string>;
+  /** The terrain of each map in the library; a map hub map with one of them is already imported. */
+  librarySurfaces: ReadonlySet<string>;
 }
+
+const IMPORT_FILE = /\.(rep|json|txt)$/i;
 
 const CLOSE_ICON = (
   <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg>
@@ -109,16 +267,24 @@ function replayPlayers(replay: ReplayListItem) {
   return replay.players.map((player) => player.name).filter(Boolean).join(' vs ') || 'Unknown players';
 }
 
-function fileStem(name: string) {
-  return name.replace(/\.(rep|json)$/i, '');
-}
-
-export function ReplayImportDialog({ open, busy, error, onCancel, onImport }: ReplayImportDialogProps) {
-  const [tab, setTab] = useState<'library' | 'file'>('library');
+export function ReplayImportDialog({ open, busy, error, onCancel, onCreate, onImport, onImportFiles, importedCodes, librarySurfaces }: ReplayImportDialogProps) {
+  const [tab, setTab] = useState<'new' | 'library' | 'file' | 'code'>('new');
+  const [code, setCode] = useState('');
+  const [lookup, setLookup] = useState<
+    | { code: string; state: 'loading' }
+    | { code: string; state: 'found'; map: SharedMap }
+    | { code: string; state: 'failed'; error: string }
+    | null
+  >(null);
   const [replays, setReplays] = useState<ReplayListItem[] | null>(null);
   const [listError, setListError] = useState('');
   const [query, setQuery] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+
+  // Each time the dialog opens it starts on New map.
+  useEffect(() => {
+    if (open) setTab('new');
+  }, [open]);
 
   useEffect(() => {
     if (!open || replays) return;
@@ -154,22 +320,38 @@ export function ReplayImportDialog({ open, busy, error, onCancel, onImport }: Re
     return [...maps.values()].slice(0, 120);
   }, [replays, query]);
 
+  async function findCode() {
+    const wanted = code.trim();
+    if (!wanted) return;
+    setLookup({ code: wanted, state: 'loading' });
+    try {
+      const map = await fetchSharedMap(wanted);
+      setLookup((current) => (current?.code === wanted ? { code: wanted, state: 'found', map } : current));
+    } catch (nextError) {
+      const error = nextError instanceof Error ? nextError.message : String(nextError);
+      setLookup((current) => (current?.code === wanted ? { code: wanted, state: 'failed', error } : current));
+    }
+  }
+
   if (!open) return null;
 
   return (
     <div className="add-replays-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
       <section className="add-replays-dialog map-import-dialog" role="dialog" aria-modal="true" aria-labelledby="mapImportTitle">
         <header className="add-replays-header">
-          <h2 id="mapImportTitle">Import from .rep</h2>
+          <h2 id="mapImportTitle">Add a map</h2>
           <button className="recording-setup-close" type="button" aria-label="Close" disabled={busy} onClick={onCancel}>{CLOSE_ICON}</button>
         </header>
-        <p className="map-import-note">Makes a draft from the map a replay was played on: its terrain, starting units, cities, capitals and bridges.</p>
-        <div className="map-import-tabs" role="tablist" aria-label="Replay source">
+        <div className="map-import-tabs" role="tablist" aria-label="Map source">
+          <button role="tab" type="button" aria-selected={tab === 'new'} onClick={() => setTab('new')}>New map</button>
           <button role="tab" type="button" aria-selected={tab === 'library'} onClick={() => setTab('library')}>Your replays</button>
-          <button role="tab" type="button" aria-selected={tab === 'file'} onClick={() => setTab('file')}>Upload file</button>
+          <button role="tab" type="button" aria-selected={tab === 'file'} onClick={() => setTab('file')}>From file</button>
+          <button role="tab" type="button" aria-selected={tab === 'code'} onClick={() => setTab('code')}>Map code</button>
         </div>
 
-        {tab === 'library' ? (
+        {tab === 'new' ? (
+          <NewMapPanel onCreate={onCreate} />
+        ) : tab === 'library' ? (
           <div className="map-import-library" role="tabpanel">
             <label className="add-replays-link-field">
               <span className="add-replays-sr">Search replays</span>
@@ -186,26 +368,51 @@ export function ReplayImportDialog({ open, busy, error, onCancel, onImport }: Re
               </ul>
             ) : null}
           </div>
+        ) : tab === 'code' ? (
+          <div className="map-import-library" role="tabpanel">
+            <form className="map-import-code" onSubmit={(event) => { event.preventDefault(); void findCode(); }}>
+              <label className="add-replays-link-field">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18" /></svg>
+                <span className="add-replays-sr">Map code</span>
+                <input autoFocus type="text" inputMode="numeric" autoComplete="off" maxLength={10} placeholder="Map code, such as 1234" value={code}
+                  onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} />
+              </label>
+              <button className="add-replays-choose" type="submit" disabled={!code || lookup?.state === 'loading'}>Find map</button>
+            </form>
+            {/* One box of the card's size for every state, so a search never resizes the dialog. */}
+            <div className="map-code-result" aria-live="polite">
+              {lookup?.state === 'found' ? (
+                <SharedMapCard shared={lookup.map} busy={busy} imported={importedCodes.has(lookup.map.code) || librarySurfaces.has(lookup.map.map.map_surface)} onPick={() => onImport(lookup.map.title || `Map ${lookup.map.code}`, { shared: lookup.map })} />
+              ) : (
+                <PlaceholderCard
+                  state={lookup?.state === 'loading' ? 'loading' : lookup?.state === 'failed' ? 'failed' : 'empty'}
+                  message={lookup?.state === 'loading' ? `Looking up map ${lookup.code}` : lookup?.state === 'failed' ? lookup.error : 'Enter a map code to see the map here'}
+                />
+              )}
+            </div>
+          </div>
         ) : (
           <div className="add-replays-dropzone" role="tabpanel"
             onDragOver={(event) => event.preventDefault()}
             onDrop={(event) => {
               event.preventDefault();
-              const file = [...event.dataTransfer.files].find((candidate) => /\.(rep|json)$/i.test(candidate.name));
-              if (file && !busy) onImport(fileStem(file.name), { file });
+              const files = [...event.dataTransfer.files].filter((candidate) => IMPORT_FILE.test(candidate.name));
+              if (files.length && !busy) onImportFiles(files);
             }}>
             {FILE_ICON}
-            <strong>Drop a .rep file here</strong>
-            <button className="add-replays-choose" type="button" disabled={busy} onClick={() => fileInput.current?.click()}>Choose file</button>
-            <input ref={fileInput} type="file" accept=".rep,.json" hidden onChange={(event) => {
-              const file = event.target.files?.[0];
+            <strong>Drop .rep or .txt files here</strong>
+            <small>A replay gives the map it was played on; a map file (.txt) is added as it is.</small>
+            <button className="add-replays-choose" type="button" disabled={busy} onClick={() => fileInput.current?.click()}>Choose files</button>
+            <input ref={fileInput} type="file" accept=".rep,.json,.txt" multiple hidden onChange={(event) => {
+              const files = [...(event.target.files ?? [])];
               event.target.value = '';
-              if (file) onImport(fileStem(file.name), { file });
+              if (files.length) onImportFiles(files);
             }} />
           </div>
         )}
 
-        {busy ? <p className="map-import-empty" aria-live="polite">Importing the map...</p> : null}
+        {/* The map code card's button shows its own progress, so the dialog keeps its size. */}
+        {busy && tab !== 'code' && tab !== 'new' ? <p className="map-import-empty" aria-live="polite">Importing the map...</p> : null}
         {error ? <p className="dialog-error" role="alert">{error}</p> : null}
       </section>
     </div>

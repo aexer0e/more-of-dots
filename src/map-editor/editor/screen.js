@@ -80,10 +80,11 @@ const terrainName = (hex) => TERRAIN.find(([, h]) => h === hex)?.[0] ?? "";
 
 /**
  * Builds the editor in `root`. `map` is in the game's coordinates, with the
- * terrain as a data URL. `onSave(data, publish)` stores the map and resolves to
- * its status ("draft" or "published"); `onClose()` returns to the library.
+ * terrain as a data URL. `onSave(data)` saves the map to the game, which only
+ * takes maps it can load, and resolves to its status ("published"); a new map
+ * that has no file yet has the status "unsaved". `onClose()` returns to the library.
  */
-export function mountEditor(root, { map, name, status, base, saveLabel = "Save to game", onSave, onClose, onTerrainImage, onDirty, onRename }) {
+export function mountEditor(root, { map, name, status, base, saveLabel = "Save", onSave, onClose, onTerrainImage, onDirty, onRename }) {
   const sprite = (team, kind) => `${base}player-assets/${TEAM_COLOR[team]}_${kind}_100.png`;
   const toolInner = (id, team) =>
     id === "infantry" ? `<img alt="" src="${sprite(team, "infantry")}">` : id === "tank" ? `<img alt="" src="${sprite(team, "tank")}">`
@@ -102,8 +103,7 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
         <label class="btn" data-edit title="Replace the terrain with an image, snapped to the terrain colours">${svg("image")}Terrain from image<input type="file" accept="image/*" hidden data-image></label>
         <button class="btn run" type="button" data-run title="Play the map from its first frame">${svg("play")}Run</button>
         <div class="sep"></div>
-        <button class="btn" type="button" data-save="draft" data-edit>Save draft</button>
-        <button class="btn primary" type="button" data-save="game" data-edit>${escape(saveLabel)}</button>
+        <button class="btn primary" type="button" data-save="game" data-edit title="Save the map to the game (Ctrl+S)">${escape(saveLabel)}</button>
       </div>
       <div class="rail" data-edit data-slot="rail"></div>
       <div class="options" data-edit data-slot="options"></div>
@@ -226,9 +226,9 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
     const unsaved = dirty();
     if (unsaved !== ui.reportedDirty) { ui.reportedDirty = unsaved; onDirty?.(unsaved); }
     const badge = screen.querySelector("[data-badge]");
-    const text = ui.running ? "Test match, all teams" : ui.saving ? "Saving" : dirty() ? "Unsaved changes" : ui.status === "published" ? "Saved to game" : "Draft saved";
+    const text = ui.running ? "Test match, all teams" : ui.saving ? "Saving" : dirty() ? "Unsaved changes" : ui.status === "unsaved" ? "Not saved yet" : "Saved to game";
     badge.textContent = text;
-    badge.dataset.state = ui.running ? "running" : ui.saving || dirty() ? "dirty" : "saved";
+    badge.dataset.state = ui.running ? "running" : ui.saving || dirty() || ui.status === "unsaved" ? "dirty" : "saved";
   }
 
   function renderRun() {
@@ -254,14 +254,16 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
     renderStatus();
   }
 
-  async function save(publish) {
+  /** Saves the map to the game. The game only takes a map it can load, so a map
+   * that is not finished (a team without units, say) stays unsaved, with the reason shown. */
+  async function save() {
     if (ui.saving || ui.running) return false;
     ui.saving = true;
     ui.error = "";
     renderBadge();
     const version = engine.version;
     try {
-      ui.status = await onSave(engine.toMapData(), publish);
+      ui.status = await onSave(engine.toMapData());
       ui.savedVersion = version;
       return true;
     } catch (error) {
@@ -301,7 +303,7 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
     renderRun();
   }
 
-  /** With unsaved changes, asks whether to save them as a draft or discard them.
+  /** With unsaved changes, asks whether to save them to the game or discard them.
    * Resolves to true when the editor may close. */
   function confirmLeave() {
     stop();
@@ -313,9 +315,9 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
       dialog.innerHTML = `
         <div class="me-leave-card" role="alertdialog" aria-modal="true" aria-labelledby="meLeaveTitle" aria-describedby="meLeaveText">
           <h3 id="meLeaveTitle">Unsaved changes</h3>
-          <p id="meLeaveText">${escape(name)} has changes that are not saved. A draft stays in More of Dots and does not change the copy in the game.</p>
+          <p id="meLeaveText">${escape(name)} has changes that are not saved to the game.</p>
           <p class="me-leave-error" role="alert" hidden></p>
-          <div class="row"><button class="btn" type="button" data-leave="stay">Stay</button><div style="flex:1"></div><button class="btn" type="button" data-leave="discard">Discard changes</button><button class="btn primary" type="button" data-leave="save">Save draft</button></div>
+          <div class="row"><button class="btn" type="button" data-leave="stay">Stay</button><div style="flex:1"></div><button class="btn" type="button" data-leave="discard">Discard changes</button><button class="btn primary" type="button" data-leave="save">Save</button></div>
         </div>`;
       screen.append(dialog);
       const buttons = () => [...dialog.querySelectorAll("button")];
@@ -341,10 +343,10 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
         else if (choice === "discard") finish(true);
         else if (choice === "save") {
           buttons().forEach((button) => (button.disabled = true));
-          if (await save(false)) return finish(true);
+          if (await save()) return finish(true);
           const error = dialog.querySelector(".me-leave-error");
           error.hidden = false;
-          error.textContent = ui.error || "The draft could not be saved.";
+          error.textContent = ui.error || "The map could not be saved.";
           buttons().forEach((button) => (button.disabled = false));
         }
       });
@@ -450,7 +452,7 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
     else if (d.layer) { engine.setLayer(d.layer, !engine.layers[d.layer]); renderLayers(); renderOptions(); }
     else if (d.action === "mirror") engine.mirrorSelection();
     else if (d.action === "delete") engine.deleteSelection();
-    else if (d.save) void save(d.save === "game");
+    else if (d.save) void save();
     else if (el.hasAttribute("data-swap")) engine.swapColors();
     else if (el.hasAttribute("data-reset")) engine.resetColors();
     else if (el.hasAttribute("data-undo")) engine.undo();
@@ -497,7 +499,7 @@ export function mountEditor(root, { map, name, status, base, saveLabel = "Save t
     const k = event.key.toLowerCase(), mod = event.ctrlKey || event.metaKey;
     if (mod && k === "z") { event.preventDefault(); return event.shiftKey ? engine.redo() : engine.undo(); }
     if (mod && k === "y") { event.preventDefault(); return engine.redo(); }
-    if (mod && k === "s") { event.preventDefault(); return void save(false); }
+    if (mod && k === "s") { event.preventDefault(); return void save(); }
     if (mod || event.altKey) return;
     if ((k === "enter" || k === "escape" || k === "backspace") && engine.pathKey(k)) { event.preventDefault(); return; }
     if (k === "delete" || k === "backspace") { event.preventDefault(); return engine.deleteSelection(); }

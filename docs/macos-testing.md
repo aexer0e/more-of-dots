@@ -34,6 +34,6 @@ Note the macOS version and the Mac model, then for each item say whether it work
 4. **Show in folder**: the folder button on a finished export opens Finder with the video selected.
 5. **Download**: saving one replay and several replays opens the save and folder dialogs and writes the files.
 6. **Leaderboard**: your username is found and highlighted.
-7. **Map editor**: your maps are listed, and saving a draft and saving to the game both work.
+7. **Map editor**: your maps are listed, saving to the game works, and a map with a team without units is refused.
 8. **Region**: the tab is greyed out, and hovering it says it is only available on Windows.
 9. **Updates**: clicking the version number checks for updates without an error.

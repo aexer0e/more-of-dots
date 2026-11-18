@@ -3,7 +3,7 @@ import { isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useEffect, useRef, useState } from 'react';
 import { mountEditor, type EditorHandle } from '../editor/screen.js';
-import { mapSurfaceFromImageFile } from '../lib/mapCodec';
+import { mapSurfaceFromImageFile, normalizeMapData } from '../lib/mapCodec';
 import { mapStore } from '../lib/storage';
 import type { StoredMap } from '../lib/types';
 
@@ -25,8 +25,9 @@ async function imageFromBase64(base64: string) {
 
 /**
  * The map editor (src/map-editor/editor). It edits the map in the game's own
- * coordinates and saves it as a draft, or to the game. Leaving with unsaved
- * changes asks whether to save them as a draft or discard them.
+ * coordinates and saves it to the game, which only takes maps it can load.
+ * Leaving with unsaved changes asks whether to save them or discard them. A new
+ * map (status "unsaved") has no file until its first save, so it is not read.
  */
 export function EditorScreen({ initialMap, onClose, registerLeaveGuard }: EditorScreenProps) {
   const host = useRef<HTMLDivElement>(null);
@@ -51,7 +52,7 @@ export function EditorScreen({ initialMap, onClose, registerLeaveGuard }: Editor
         else unlisten = stop;
       });
     void (async () => {
-      const map = await mapStore.getGame(id);
+      const map = initialMap.status === 'unsaved' ? { ...initialMap, data: normalizeMapData(initialMap.data) } : await mapStore.getGame(id);
       if (cancelled || !host.current) return;
       handle = mountEditor(host.current, {
         map: { ...map.data, width: map.width, height: map.height, surface: `data:image/png;base64,${map.data.map_surface}` },
@@ -59,19 +60,19 @@ export function EditorScreen({ initialMap, onClose, registerLeaveGuard }: Editor
         status: map.status,
         base: import.meta.env.BASE_URL,
         saveLabel: exampleMode ? 'Save example' : 'Save to game',
-        async onSave(data, publish) {
-          const saved = await mapStore.putGame(id, { ...map.data, ...data }, publish);
-          // Saving a map from the game folder makes a draft with its own id.
+        async onSave(data) {
+          const saved = await mapStore.putGame(id, { ...map.data, ...data });
+          // A new map gets its file, and its id, on the first save.
           id = saved.id;
           latest = saved;
-          return saved.status ?? 'draft';
+          return saved.status ?? 'published';
         },
         onClose: () => onClose(latest),
         onTerrainImage: async (file, width, height) => imageFromBase64(await mapSurfaceFromImageFile(file, width, height)),
         onDirty: reportUnsaved,
         async onRename(name) {
           // Renaming a map in the game folder renames its file, so its id can change.
-          const renamed = await mapStore.rename(id, name);
+          const renamed = await mapStore.rename(id, name, map.data);
           id = renamed.id;
           latest = renamed;
           return renamed.name;

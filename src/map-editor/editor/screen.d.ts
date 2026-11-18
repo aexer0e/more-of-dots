@@ -24,9 +24,10 @@ export interface GameMapData {
 
 export interface EditorHandle {
   dirty(): boolean;
-  /** With unsaved changes, asks to save them as a draft or discard them; true when the editor may close. */
+  /** With unsaved changes, asks to save them to the game or discard them; true when the editor may close. */
   confirmLeave(): Promise<boolean>;
-  save(publish: boolean): Promise<boolean>;
+  /** Saves the map to the game; false (with the reason shown) when the game could not load it. */
+  save(): Promise<boolean>;
   stop(): void;
   destroy(): void;
 }
@@ -39,7 +40,8 @@ export function mountEditor(
     status?: string;
     base: string;
     saveLabel?: string;
-    onSave(data: GameMapData, publish: boolean): Promise<string>;
+    /** Saves the map to the game and resolves to its status. Rejects, writing nothing, when the game could not load it. */
+    onSave(data: GameMapData): Promise<string>;
     onClose(): void;
     /** An image file as terrain of this size, snapped to the terrain colours. */
     onTerrainImage(file: File, width: number, height: number): Promise<CanvasImageSource>;

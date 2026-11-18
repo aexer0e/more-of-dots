@@ -1427,15 +1427,16 @@ function renderReplayUploadDockContent(animateSelection = false): string {
   const selectedCount = browserSelectedReplayPaths.size;
   const selectionBusy = browserDeleteInFlight || browserBulkDownloadInFlight;
   if (!selectedCount) {
+    // The same button as Import on the Map Editor page (src/map-editor/App.tsx).
     return `
       <div class="replay-action-group">
-        <button id="uploadReplays" class="refresh-button upload-button" type="button" aria-haspopup="dialog" title="Add replays to War of Dots">
+        <button id="uploadReplays" class="refresh-button upload-button" type="button" aria-haspopup="dialog" title="Import replays into War of Dots">
           <svg aria-hidden="true" viewBox="0 0 24 24">
-            <path d="M12 16V4" />
-            <path d="m7.5 8.5 4.5-4.5 4.5 4.5" />
-            <path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
+            <path d="M12 4v11" />
+            <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+            <path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" />
           </svg>
-          <span>Upload</span>
+          <span>Import</span>
         </button>
       </div>
     `;

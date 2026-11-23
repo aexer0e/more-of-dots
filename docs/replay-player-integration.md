@@ -51,6 +51,8 @@ The simulator adds `"audio":[fighting,producedSides]` to each state record and t
 
 Avalanche uses the classic rules. From the game's scene setup: the live game rewrites the map (side 1 gets 7-unit clusters where cities were) and the replay stores the result, and every second side (1, 3) starts with 15,000 funds. The stored capital indices no longer name cities; the simulator then lets the side's largest group draw on its funds. That choice is empirical: replays have no native trace, so each recorded order's first waypoint (where the player clicked the unit) is compared with the simulated unit position. Across the seven sample avalanche replays 57–77% of orders start exactly on the unit and no ordered unit is missing, in line with verified classic replays (30–60%); the other funding rules tried scored lower or lost units. This is strong evidence, not proof of parity.
 
+Custom maps can be saved with no capitals at all (`"capitals": []`). A side without a capital entry is funded the same way, from its largest group. Up to 2.5.1 such a side never earned funds. On the one experimental replay of such a map (Map 7 by implodingpotatoz, 1.4.1), the funded rule starts 343 of 552 orders exactly on the unit and finds every ordered unit; with no funds, 333 matched and one unit the player ordered had already died. Giving each side its first city as a capital instead plays identically but adds capitals the map does not have, so it is not used.
+
 ## Validation during integration
 
 | Check | Result |

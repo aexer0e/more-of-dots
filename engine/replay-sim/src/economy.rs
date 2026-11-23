@@ -153,10 +153,11 @@ impl Economy {
             self.industrial_zones[side].retain(|&city| territory.city_colors[city as usize] == side);
             let mut capital_found = false;
             let mut capital_group: i32 = -1;
-            // A capital that names no city (avalanche) leaves the side's largest group
-            // drawing on its funds; this matches the orders recorded in avalanche replays.
+            // A side without a capital that names a city (avalanche, or a custom map
+            // saved with no capitals) has its largest group drawing on its funds; this
+            // matches the orders recorded in avalanche replays and on such maps.
             let has_capital = self.capitals.len() > side && is_city(self.capitals[side]);
-            let funded_group: i32 = if self.capitals.len() <= side || has_capital || self.dot_groups[side].is_empty() {
+            let funded_group: i32 = if has_capital || self.dot_groups[side].is_empty() {
                 -1
             } else {
                 let mut best = 0;

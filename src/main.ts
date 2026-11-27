@@ -17,7 +17,7 @@ import MapEditorApp from "./map-editor/App";
 import { mountRegionPage, unmountRegionPage } from "./region/page";
 import "./styles.css";
 import "./replays/styles.css";
-import { MATCH_TYPES, REPLAY_VARIANTS, matchesReplay, matchupTitle, replaySuggestions, toggleMatchType, type PlayerSuggestion, type ReplayVariant, type ReplayFilterRecord, type ReplayFilters, type ReplaySuggestion } from "./replays/filters";
+import { MATCH_TYPES, REPLAY_VARIANTS, matchType, matchesReplay, matchupTitle, replaySuggestions, toggleMatchType, type PlayerSuggestion, type ReplayVariant, type ReplayFilterRecord, type ReplayFilters, type ReplaySuggestion } from "./replays/filters";
 import { parseTroopStore, troopLinesMarkup, type TroopSides } from "./replays/troop-lines";
 import { VirtualGrid } from "./replays/virtual-grid";
 
@@ -584,17 +584,7 @@ function secondsToDurationPosition(seconds: unknown): number {
 // The replay's own mode names the format; free-for-all lobbies and older
 // replays only reveal it by their number of sides.
 function replayMatchType(replay: ReplayBrowserItem): string {
-  switch (replay.mode) {
-    case "1v1": return "1v1";
-    case "2v2": return "2v2";
-    case "v3": return "3P";
-    case "v4": return "4P";
-    case "experiment": return "Experiment";
-    case "avalanche": return "Avalanche";
-  }
-  const sides = new Set(replay.players.map((player) => player.teamIndex)).size;
-  if (sides === 2) return (replay.teamSize ?? 1) > 1 ? "2v2" : "1v1";
-  return sides >= 4 ? "4P" : "3P";
+  return matchType(replay.mode, new Set(replay.players.map((player) => player.teamIndex)).size, replay.teamSize ?? 1);
 }
 
 function filterSummary(name: string, selected: string[], total: number): string {

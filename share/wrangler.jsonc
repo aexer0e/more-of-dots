@@ -17,12 +17,17 @@
   // One room per match continued from a replay (src/match.js).
   "durable_objects": { "bindings": [{ "name": "MATCHES", "class_name": "MatchRoom" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MatchRoom"] }],
-  // Uploads per visitor address.
+  // Uploads per visitor address, and leaderboard questions no copy answers yet.
   "ratelimits": [
     {
       "name": "UPLOADS",
       "namespace_id": "1001",
       "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "LEADERBOARD",
+      "namespace_id": "1002",
+      "simple": { "limit": 30, "period": 60 }
     }
   ]
 }

@@ -1,5 +1,13 @@
 // Match formats in the game's mode menu, in its order.
 export const MATCH_TYPES = ["1v1", "2v2", "3P", "4P", "Experiment", "Avalanche"];
+const GAME_MODES: Record<string, string> = { "1v1": "1v1", "2v2": "2v2", v3: "3P", v4: "4P", experiment: "Experiment", avalanche: "Avalanche" };
+/** The match format: the replay's own mode or, for free-for-all lobbies and older
+ * replays, its number of sides and players per side. share/src/replay.js does the same. */
+export function matchType(mode: string | null | undefined, sides: number, teamSize: number): string {
+  if (mode && Object.hasOwn(GAME_MODES, mode)) return GAME_MODES[mode];
+  if (sides <= 2) return teamSize > 1 ? "2v2" : "1v1";
+  return sides >= 4 ? "4P" : "3P";
+}
 export type MapSource = "vanilla" | "custom";
 // Maps are either the game's own (vanilla) or player-made (custom).
 export type ReplayVariant = MapSource;

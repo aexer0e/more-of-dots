@@ -2,6 +2,7 @@
 // only when the visitor shares one (share.js); `shared` then holds the token that
 // stops sharing it. A replay is stored once, under the start of its SHA-256, with
 // the details the home page shows so the list never has to open the files.
+import { matchType } from "../replays/filters";
 const DATABASE = "wod-replays",
   STORE = "replays";
 
@@ -36,7 +37,7 @@ async function text(bytes) {
   return new Response(stream).text();
 }
 
-/// The players, length, version and map picture of a replay, read without simulating it.
+/// The players, length, version, match format and map of a replay, read without simulating it.
 export async function readHeader(bytes) {
   let replay;
   try {
@@ -51,14 +52,28 @@ export async function readHeader(bytes) {
     (Array.isArray(team) ? team : [team]).map((player) => (typeof player === "string" ? player : player?.username ?? "")),
   );
   const surface = typeof map?.map_surface === "string" ? map.map_surface : null;
+  // Told apart as More of Dots tells maps apart (sharing.js, mapIdentity).
+  let mapKey = null;
+  if (surface) {
+    try {
+      const image = Uint8Array.from(atob(surface), (c) => c.charCodeAt(0));
+      mapKey = `custom:${[...new Uint8Array(await crypto.subtle.digest("SHA-256", image))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+    } catch {
+      mapKey = null;
+    }
+  }
   // Official maps are only named: by their image in the game (assets/fahero_maps/map4.png) or by number.
   const named = replay.map && typeof replay.map === "object" ? replay.map.path : replay.map;
   return {
     players: teams.map((team) => team.join(" & ")),
     version: replay.version ?? null,
     frames: Number(replay.end) || 0,
+    mode: matchType(typeof replay.mode === "string" ? replay.mode : null, teams.length, Math.max(1, ...teams.map((team) => team.length))),
+    custom: Boolean(surface),
     thumb: surface ? `data:image/png;base64,${surface}` : null,
     mapRef: !surface && (typeof named === "string" || typeof named === "number") ? String(named).trim() : null,
+    mapKey: mapKey ?? (!surface && (typeof named === "string" || typeof named === "number") && String(named).trim()
+      ? `vanilla:${String(named).trim().replaceAll("\\", "/").toLowerCase()}` : null),
   };
 }
 

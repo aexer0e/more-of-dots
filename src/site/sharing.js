@@ -2,7 +2,7 @@
 // and the play page. A replay is uploaded the first time it is shared; its link
 // preview then gets a picture drawn here (card.js).
 import { getReplay, saveReplay } from "./library.js";
-import { shareReplay, unshareReplay, uploadCard } from "./share.js";
+import { shareReplay, unshareReplay, uploadCard, uploadTroops } from "./share.js";
 import { CARD_VERSION, drawCard } from "./card.js";
 import { reduceTroops } from "../replays/troop-lines";
 
@@ -49,7 +49,10 @@ export async function copyShareLink(id) {
     if (failed) throw failed;
     return `Link: ${shareLink(await uploaded)}`;
   } finally {
-    void uploaded.then(addCard, () => {});
+    void uploaded.then(async (resolved) => {
+      await addCard(resolved);
+      await addTroops(resolved);
+    }, () => {});
   }
 }
 
@@ -77,6 +80,23 @@ export async function addCard(id) {
     if (current?.shared) await saveReplay({ ...current, shared: { ...current.shared, card: CARD_VERSION } });
   } catch {
     // The preview shows the replay's details without a picture until the next share.
+  }
+}
+
+/// Gives a replay this browser shared its troop lines, once, so All replays can draw them
+/// without simulating it.
+export async function addTroops(id) {
+  const record = await getReplay(id);
+  const token = record?.shared?.token;
+  if (!token || record.shared.troops) return;
+  try {
+    const troops = await replayTroops(record);
+    if (!troops) return;
+    await uploadTroops(id, token, troops);
+    const current = await getReplay(id);
+    if (current?.shared) await saveReplay({ ...current, shared: { ...current.shared, troops: true } });
+  } catch {
+    // Sent again the next time the visitor's replays are shown.
   }
 }
 
@@ -118,11 +138,48 @@ export const publishedMaps = () =>
 /// finds it in the game: by its image path, or by number in each map set.
 /// Zolamare comes first because the game gives it the numbers both sets use.
 export function mapPicture(ref, maps) {
+  const found = officialMap(ref, maps);
+  return found ? `${base}maps/${found}` : null;
+}
+function officialMap(ref, maps) {
   if (!ref) return null;
-  const name = ref.replaceAll("\\", "/").toLowerCase();
+  const name = String(ref).replaceAll("\\", "/").toLowerCase();
   const candidates = /^\d+$/.test(name)
     ? ["zolamare", "fahero", "eronion"].map((set) => `assets/${set}_maps/map${name}.png`).concat(`map${name}.png`)
     : [name, name.split("/").pop()];
-  const found = candidates.find((candidate) => maps.has(candidate));
-  return found ? `${base}maps/${found}` : null;
+  return candidates.find((candidate) => maps.has(candidate)) ?? null;
+}
+// Maps are told apart as More of Dots tells them apart: an official map by its image,
+// whichever way a replay names it, and a custom map by the SHA-256 of its image. A
+// replay's key (library.js, share/src/listing.js) is "vanilla:<image or number>" or
+// "custom:<hash>"; its identity names an official map by the image it resolves to.
+export function mapIdentity(key, maps) {
+  if (!key) return null;
+  if (!key.startsWith("vanilla:")) return key;
+  const file = officialMap(key.slice(8), maps);
+  return file ? `vanilla:${file}` : key;
+}
+/// A map's label: "Fahero 12", or "#" and the start of a custom map's hash.
+export function mapLabel(key, maps) {
+  if (key?.startsWith("custom:")) return `#${key.slice(7, 17)}`;
+  return (key && mapName(key.slice(8), maps)) ?? "Unknown map";
+}
+/// The keys replays can give the map of this identity.
+export function mapKeys(id, maps) {
+  if (!id?.startsWith("vanilla:")) return id ? [id] : [];
+  const file = id.slice(8);
+  const keys = new Set([id, `vanilla:${file.split("/").pop()}`]);
+  const number = /map(\d+)\.png$/.exec(file)?.[1];
+  if (number && officialMap(number, maps) === file) keys.add(`vanilla:${number}`);
+  return [...keys];
+}
+/// The picture of the map of this identity, when it is an official one.
+export const identityPicture = (id, maps) => (id?.startsWith("vanilla:") ? mapPicture(id.slice(8), maps) : null);
+
+/// An official map's name as More of Dots labels it, such as "Fahero 12".
+export function mapName(ref, maps) {
+  const found = officialMap(ref, maps);
+  const match = found && /(?:(\w+?)_maps\/)?map(\d+)\.png$/.exec(found);
+  if (!match) return null;
+  return match[1] ? `${match[1][0].toUpperCase()}${match[1].slice(1)} ${match[2]}` : `Map ${match[2]}`;
 }

@@ -19,7 +19,8 @@ All code lives in this repository. The site repository holds a deploy workflow, 
 | `src/site/main.js` | The site's pages around the player: home, tournament brackets and replays, and the routes that link to them |
 | `src/site/library.js` | Replays a visitor adds, kept in the browser's IndexedDB |
 | `src/site/share.js` | Uploads, opens and stops sharing replays through the share worker, and downloads replay links |
-| `share/` | The `wod-replays` Cloudflare Worker that keeps shared replays in D1 |
+| `src/site/leaderboard.js` | The Leaderboard page: the desktop app's Leaderboard tab (`src/leaderboard`), loaded when the page opens |
+| `share/` | The `wod-replays` Cloudflare Worker that keeps shared replays in D1 and lists them for All replays (`share/src/listing.js`) |
 | `src/site/bracket.js` | Lays out a Challonge double elimination bracket |
 | `scripts/build-site.mjs` | Builds everything into `build/site` |
 | `scripts/tournaments.mjs` | Publishes the tournament folders from the site repository |
@@ -42,7 +43,8 @@ Every page has its own address under the site's folder, so any view can be share
 
 | Address | Page |
 |---|---|
-| `/wod-replay-player/` | Home: drop a .rep, the visitor's replays, and the tournaments |
+| `/wod-replay-player/` | Home: drop a .rep, the visitor's replays, every shared replay, and the tournaments |
+| `leaderboard` | The Elo and World victory top 100, with a tracked player and up to ten compared |
 | `gt3` | A tournament's bracket |
 | `gt3/105` | The bracket with match 105's replays open |
 | `gt3/replays` | Every replay of a tournament, grouped by match |
@@ -70,6 +72,7 @@ Chat apps such as Discord show a preview of a link from tags in the page's HTML,
 | A tournament | Its name, when it ran and its number of replays, no picture |
 | Its replays page | Its name and number of replays, no picture |
 | A shared replay | Its players and length, with the card its sharer's browser drew |
+| The leaderboard | Its name and description, no picture |
 | Anything else | The site's name and description, no picture |
 
 The site build writes `og/pages.json`, the title and description of every tournament page, and the tournament cards under `og/`, with `scripts/og-cards.mjs` (satori lays them out, resvg draws them). A tournament's aliases are listed there too. A shared replay's preview is read from the replay when it is shared; replays shared before previews are read on their first preview. Its card is drawn by `src/site/card.js` in the sharer's browser, in the same layout and font (Inter, under the SIL Open Font License in `scripts/og/OFL.txt`), and uploaded after the replay.
@@ -150,3 +153,37 @@ On 20 October 2026 the WebAssembly engine simulated a 43,350-tick replay in 24.7
 `notify-site.yml` runs on a push to `main` that changes `VERSION` and sends a `repository_dispatch` event to the site repository. It needs the secret `SITE_DISPATCH_TOKEN`: a fine-grained personal access token limited to `aexer0e/wod-replay-player` with read and write access to Contents.
 
 The site repository's **Deploy site** workflow can also be run by hand against any branch, tag or commit of this repository. The published `version.json` records the version and commit that were built.
+
+## Design
+
+The site follows the design of More of Dots: the same tokens (`src/styles.css` and the top of `src/site/site.css`), tabs centred in the header, the replay browser's search row (search, Mode, Map, Length and Sort) and its replay cards: the map's name, the length and the match format along the top, the players in their side colours with their Elo rank, and when the replay was added, with Play and the card's buttons on hover. Clicking a name shows that player's replays, and clicking a match format shows only that format.
+
+## Search, filters and stats
+
+Both lists search and filter as More of Dots does. Text filters the list as it is typed and matches players' names, official map names, and custom maps by the "#" and hash their labels show. The box suggests the players and maps the text could mean, with how many replays each has under the other filters; choosing one, or clicking a name or map on a card, filters by that player or map and shows it as a chip in the box. Mode, Map (Vanilla or Custom), Length and Sort keep fixed widths, so changing them never moves the bar.
+
+Maps are told apart as the app tells them apart: an official map by the image it resolves to, whether a replay names it by image or by number, and a custom map by the SHA-256 of its embedded image (`mapIdentity` in `src/site/sharing.js`, `map_key` in D1).
+
+The share worker keeps the counts in D1 instead of computing them for each request (`share/migrations/0005_stats.sql`):
+
+- `replay_players` has a row per player of each replay, indexed by name, so filtering and counting by player read only that player's rows.
+- `player_stats` and `map_stats` hold each player's and map's number of replays and latest one. Suggestions read them when no other filter is set; with filters, the worker counts through the indexes.
+- SQLite triggers keep all three in step whenever a replay is shared, described again or removed, so no code has to remember to update them.
+
+## Troop lines
+
+Each shared replay's troop lines (each side's troops over the match, 30 values a side) are kept in D1 with it, so All replays draws them without simulating anything:
+
+- The browser or app that shares a replay sends its lines with its token (`PUT /replays/<id>/troops`), as it sends the link preview's card. The site also sends them for replays it shared before.
+- `node share/scripts/troops.mjs --local|--remote` simulates replays that have none with the engine's command line, as the site build does for tournaments. Set `WOD_GAME_DIR` to the game's folder or to a built site's `maps/` folder for maps the engine does not bundle. A replay that cannot be simulated is kept with no lines and is not tried again.
+
+## Leaderboard
+
+The Leaderboard page is the desktop app's Leaderboard tab. The site reads the rankings through the share worker (`share/src/leaderboard.js`) at `<site>/api/v1/leaderboard` and `<site>/api/v1/leaderboard/refresh`, the routes of the service the app reads. The service takes a snapshot every two minutes, so every visitor shares one copy of each answer:
+
+- The worker keeps each answer at the edge and in memory until the next snapshot is due, and joins requests that arrive while it is asking. The service is asked at most once per snapshot for each question in each Cloudflare location.
+- Questions are put in one form: the board, the period and the players, sorted, at most eleven. The `since` of the app's delta requests is dropped, so visitors comparing the same players share an answer.
+- A visitor who sends more than 30 questions a minute that no copy answers is turned away for a minute and shown the last copy, if any.
+- The browser keeps the latest answer in local storage and asks again only when the next snapshot is due, and never while the page is hidden. Replay cards read the same copy for the ranks under players' names.
+
+The site cannot read the game's login, so a visitor types their username once to track their own rank.

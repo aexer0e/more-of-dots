@@ -1,8 +1,9 @@
-// The hosted site: a home page with the visitor's own replays and the published
-// tournaments, each tournament's bracket and replays, and the player. Pages are
+// The hosted site: a home page with the visitor's own replays, every shared replay and
+// the published tournaments, each tournament's bracket and replays, and the player. Pages are
 // addressed by paths under the site's folder, so every view can be shared as a
 // link with its own preview (share/ serves them):
 //   (the folder)          home
+//   leaderboard           the Elo and World rankings, as More of Dots shows them
 //   <tournament>          bracket; a tournament's earlier ids (its aliases) lead here
 //   <tournament>/<match>  bracket with that match's replays open
 //   <tournament>/replays  every replay of the tournament
@@ -17,10 +18,12 @@ import { addFile } from "../player/host.js";
 // After the player's styles, so the site's win where both style an element.
 import "./site.css";
 import { addReplay, getReplay, listReplays, refreshDetails, removeReplay, saveReplay } from "./library.js";
-import { downloadLink, fetchShared, unshareReplay } from "./share.js";
-import { copyShareLink, downloadKept, mapPicture, publishedMaps, replayTroops } from "./sharing.js";
+import { downloadLink, fetchShared, listShared, suggestShared, thumbLink, unshareReplay } from "./share.js";
+import { addTroops, copy, copyShareLink, downloadKept, identityPicture, mapIdentity, mapKeys, mapLabel, mapName, mapPicture, publishedMaps, replayTroops, shareLink } from "./sharing.js";
 import { box, connect, layout, nextMatches, roundName, sides } from "./bracket.js";
 import { troopLinesMarkup } from "../replays/troop-lines";
+import { MATCH_TYPES } from "../replays/filters";
+import { cached, leaderboardRankIndex, retrieve, setLeaderboardSource } from "../leaderboard/client";
 import { leave as leaveForPlay } from "../play/handoff.js";
 
 const base = new URL(import.meta.env.BASE_URL, document.baseURI).href;
@@ -53,11 +56,14 @@ const icons = {
 
 // Long names shrink until they fit their card or match.
 function fitNames() {
-  for (const element of site.querySelectorAll(".versus, .match .name span, .fit")) {
+  for (const element of site.querySelectorAll(".matchup, .match .name span, .fit")) {
     element.style.fontSize = "";
     if (!element.clientWidth) continue;
+    // Names keep their full width while measured; past the smallest size they are cut short.
+    element.classList.add("fitting");
     let size = parseFloat(getComputedStyle(element).fontSize);
     while (element.scrollWidth > element.clientWidth && size > 9) element.style.fontSize = `${(size -= 0.5)}px`;
+    element.classList.remove("fitting");
   }
 }
 let fitFrame;
@@ -72,8 +78,8 @@ const dropdowns = new Map();
 function dropdown(id, label, options, value, change) {
   dropdowns.set(id, change);
   const current = options.find(([key]) => key === value) ?? options[0];
-  return `<div class="dropdown" data-dropdown="${id}"><span class="dropdown-label" id="${id}-label">${escape(label)}</span>
-    <button type="button" class="dropdown-button" aria-haspopup="menu" aria-expanded="false" aria-labelledby="${id}-label ${id}-value"><span id="${id}-value">${escape(current[1])}</span>${icons.chevron}</button>
+  return `<div class="dropdown" data-dropdown="${id}">
+    <button type="button" class="dropdown-button" aria-haspopup="menu" aria-expanded="false" aria-labelledby="${id}-label ${id}-value"><span class="dropdown-label" id="${id}-label">${escape(label)}:</span><span id="${id}-value" data-current>${escape(current[1])}</span>${icons.chevron}</button>
     <div class="dropdown-menu" role="menu" hidden>${options.map(([key, text]) =>
       `<button type="button" role="menuitemradio" data-value="${key}" aria-checked="${key === current[0]}">${escape(text)}</button>`).join("")}</div></div>`;
 }
@@ -91,9 +97,14 @@ site.addEventListener("click", (event) => {
   const menu = element.querySelector(".dropdown-menu"),
     button = element.querySelector(".dropdown-button"),
     option = event.target.closest("[data-value]");
-  if (option) {
+  // A checklist's options turn on and off and leave its menu open.
+  if (option && element.hasAttribute("data-multi")) {
+    const on = option.getAttribute("aria-checked") !== "true";
+    option.setAttribute("aria-checked", String(on));
+    dropdowns.get(element.dataset.dropdown)?.(option.dataset.value, on);
+  } else if (option) {
     for (const item of menu.querySelectorAll("[data-value]")) item.setAttribute("aria-checked", String(item === option));
-    button.querySelector("span").textContent = option.textContent;
+    button.querySelector("[data-current]").textContent = option.textContent;
     menu.hidden = true;
     button.setAttribute("aria-expanded", "false");
     button.focus();
@@ -138,6 +149,85 @@ const withUsername = (name, username) => (username && plain(username) !== plain(
 const versus = (names) =>
   names.map((name, side) => `<span class="${sideClasses[side] ?? ""}">${escape(name)}</span>`).join(' <span class="vs">vs</span> ');
 
+// Elo ranks under players' names, as on the cards of More of Dots. The site reads the
+// copy of the rankings its worker keeps for every visitor (share/src/leaderboard.js).
+setLeaderboardSource(new URL("api", document.baseURI).href);
+const LATEST = "/v1/leaderboard";
+let ranks = leaderboardRankIndex(cached(LATEST)?.data);
+const rankKey = (index) => JSON.stringify([...index]);
+/// Reads the rankings once they are due to change, and shows new ranks on the cards.
+async function loadRanks() {
+  try {
+    const next = leaderboardRankIndex(await retrieve(LATEST));
+    if (rankKey(next) === rankKey(ranks)) return;
+    ranks = next;
+    if (shown === "home") {
+      void renderMine();
+      void renderAll();
+    }
+  } catch {
+    // Cards show no ranks while the rankings cannot be read.
+  }
+}
+// Names can carry a title after the username, as in "aexer0e [Champion]"; a player is
+// known by the name without it, as the share worker's stats know them.
+const baseName = (name) => name.replace(/\s*\[[^\]]*\]$/, "").trim();
+const samePlayer = (name, player) => Boolean(player) && baseName(name).toLowerCase() === player.toLowerCase();
+const rankOf = (name) => {
+  const rank = ranks.get(baseName(name).toLocaleLowerCase());
+  return rank ? `<span class="player-rank" title="Elo rank #${rank}">Rank <b>${rank}</b></span>` : "";
+};
+/// The players of a card in their side colours. Clicking a name shows that player's replays.
+function matchup(players, filter, chosen = null) {
+  if (!players.length) return '<span class="matchup"><span class="vs">Unknown players</span></span>';
+  const name = (text, side) => filter
+    ? `<button type="button" class="player-name ${sideClasses[side] ?? ""}" data-filter-player="${escape(text)}" aria-pressed="${samePlayer(text, chosen)}" title="${samePlayer(text, chosen) ? "Show every player" : `Show replays with ${escape(baseName(text))}`}">${escape(text)}</button>`
+    : `<span class="player-name ${sideClasses[side] ?? ""}">${escape(text)}</span>`;
+  const between = players.length > 2 ? "·" : "vs";
+  return `<span class="matchup${players.length > 2 ? " many" : ""}">${players.map((text, side) =>
+    `${side ? `<span class="vs">${between}</span>` : ""}<span class="rep-player">${name(text, side)}${rankOf(text)}</span>`).join("")}</span>`;
+}
+// When a card's replay was added or shared, written as More of Dots writes it: "3h ago · 5:43 PM".
+const timeFormat = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" });
+const dateFormat = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" });
+function ago(time, now = Date.now()) {
+  const minutes = Math.max(1, Math.floor((now - time) / 60_000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return days <= 7 ? `${days}d ago` : `${Math.floor(days / 7)}w ago`;
+}
+function when(time, now = new Date()) {
+  const date = new Date(time);
+  const at = timeFormat.format(date);
+  if (date.toDateString() === now.toDateString()) return at;
+  if (date.toDateString() === new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).toDateString()) return `Yesterday at ${at}`;
+  return `${dateFormat.format(date)}${date.getFullYear() !== now.getFullYear() ? `, ${date.getFullYear()}` : ""} ${at}`;
+}
+/// A replay card in the layout of More of Dots: the map with its name, length and match
+/// format along the top, the players in the middle, and when it was added at the bottom,
+/// where Play and the card's buttons show on hover.
+function card({ href, label, picture, troops = "", map, mapId = null, length = "", mode = "", players, filter = null, time = 0, title = "", actions = "", corner = "", attrs = "" }) {
+  const modeLabel = !mode ? "<span></span>"
+    : filter ? `<button type="button" class="rep-label mode" data-filter-mode="${escape(mode)}" title="Show only ${escape(mode)}">${escape(mode)}</button>`
+    : `<span class="rep-label mode">${escape(mode)}</span>`;
+  const on = filter?.map?.id === mapId;
+  const mapLabelMarkup = filter && mapId
+    ? `<button type="button" class="rep-label" data-filter-map="${escape(mapId)}" data-map-name="${escape(map)}" aria-pressed="${on}" title="${on ? "Show every map" : `Show replays on ${escape(map)}`}">${escape(map)}</button>`
+    : `<span class="rep-label">${escape(map)}</span>`;
+  return `<article class="rep-card">
+    <div class="rep-picture">${picture ? `<img class="rep-thumb" src="${escape(picture)}" alt="" loading="lazy" onerror="this.remove()">` : ""}<span class="shade"></span>${troops}</div>
+    <div class="rep-labels">${mapLabelMarkup}${length ? `<span class="rep-label length">${length}</span>` : "<span></span>"}${modeLabel}</div>
+    <div class="rep-players">${matchup(players, Boolean(filter), filter?.player)}</div>
+    ${time ? `<time class="rep-age" datetime="${new Date(time).toISOString()}" title="${escape(title)}"><span>${ago(time)}</span><span aria-hidden="true">·</span><span class="rep-date">${when(time)}</span></time>` : ""}
+    <div class="rep-actions"><a class="rep-play" href="${href}"${attrs} aria-label="${label}">${icons.play(11)}Play</a>${actions}</div>
+    ${corner}
+  </article>`;
+}
+const lengthOf = (frames) => (frames ? padded(Math.floor(frames / 30)) : "");
+const counted = (n) => `${n.toLocaleString("en-US")} ${n === 1 ? "replay" : "replays"}`;
+
 let toastTimer;
 function toast(message) {
   let element = document.querySelector(".site-toast");
@@ -154,6 +244,7 @@ function toast(message) {
 
 // Views: "page" shows the site, "watch" shows the player.
 let view = null,
+  leaving = null,
   shown = null,
   navigations = 0,
   backTarget = "";
@@ -171,14 +262,20 @@ function showPage(key, title, html) {
   document.title = title;
   const fresh = shown !== key;
   if (fresh) {
+    leaving?.();
+    leaving = null;
     site.innerHTML = html;
     shown = key;
     scrollTo(0, 0);
   }
   return fresh;
 }
-const header = (wide = false) =>
-  `<header class="site-header${wide ? " wide" : ""}"><div><a class="brand" href="${root}">${icons.logo}<span>War of Dots Replays</span></a><span class="storage" id="storage"></span></div></header>`;
+// The site's tabs, centred as in More of Dots. `active` is the path of the current tab.
+const TABS = [["", "Replays"], ["leaderboard", "Leaderboard"]];
+const header = (wide = false, active = null) =>
+  `<header class="site-header${wide ? " wide" : ""}"><div><a class="brand" href="${root}">${icons.logo}<span>War of Dots Replays</span></a>
+    <nav class="site-nav" aria-label="Site">${TABS.map(([path, text]) => `<a href="${root}${path}"${path === active ? ' aria-current="page"' : ""}>${text}</a>`).join("")}</nav>
+    <span class="storage" id="storage"></span></div></header>`;
 async function showStorage() {
   const list = await listReplays().catch(() => []);
   const element = document.getElementById("storage");
@@ -248,32 +345,451 @@ function choose() {
   input.click();
 }
 
-const home = { page: 0, query: "", sort: "added" };
-const perPage = 8;
+// Both lists on the home page sort and filter alike, as More of Dots does: by match
+// format, kind of map and length. "Your replays" are filtered here; "All replays",
+// every replay shared from the site or the app, by the share worker.
+const SORTS = [["newest", "Newest"], ["oldest", "Oldest"], ["shortest", "Shortest"], ["longest", "Longest"]];
+const MODES = MATCH_TYPES.map((type) => [type, type]);
+const MAP_KINDS = [["vanilla", "Vanilla"], ["custom", "Custom"]];
+// `min` and `max` are lengths in seconds; `max` is null when the longest replay is
+// allowed. `bound` is the length filter's end, from the longest replay listed.
+// `player` and `map` are the player and the map chosen from the search's suggestions or
+// a card, as in More of Dots: a name, and { id, name } of a map (sharing.js, mapIdentity).
+const listState = () => ({ page: 0, query: "", sort: "newest", modes: new Set(MATCH_TYPES), maps: new Set(["vanilla", "custom"]), min: 0, max: null, bound: 60, player: null, map: null });
+// The official maps the site publishes, once they are read.
+let knownMaps = new Set();
+const home = listState(),
+  everyone = listState();
+const perPage = 8,
+  allPerPage = 12;
+// Lengths on the slider as More of Dots writes them: 05:00.
+const padded = (seconds) => `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+const boundOf = (frames) => Math.max(60, Math.ceil((frames || 0) / 1800) * 60);
+const kindOf = (record) => (record.custom ? "custom" : "vanilla");
+const isFiltered = (state) => state.modes.size < MATCH_TYPES.length || state.maps.size < MAP_KINDS.length || state.min > 0 || state.max !== null;
+
+function summary(selected, options) {
+  const chosen = options.filter(([value]) => selected.has(value)).map(([, text]) => text);
+  if (chosen.length === options.length) return "All";
+  if (!chosen.length) return "None";
+  return chosen.length <= 2 ? chosen.join(", ") : `${chosen.length} of ${options.length}`;
+}
+/// A menu like dropdown() whose options are each turned on or off.
+function checklist(id, label, options, selected, change) {
+  dropdowns.set(id, change);
+  return `<div class="dropdown" data-dropdown="${id}" data-multi>
+    <button type="button" class="dropdown-button" aria-haspopup="menu" aria-expanded="false" aria-labelledby="${id}-label ${id}-value"><span class="dropdown-label" id="${id}-label">${escape(label)}:</span><span id="${id}-value" data-current>${escape(summary(selected, options))}</span>${icons.chevron}</button>
+    <div class="dropdown-menu" role="menu" hidden>${options.map(([key, text]) =>
+      `<button type="button" role="menuitemcheckbox" data-value="${key}" aria-checked="${selected.has(key)}"><span>${escape(text)}</span><span class="count" data-count="${key}"></span></button>`).join("")}</div></div>`;
+}
+
+// The length filter's two handles move along a curve, so short lengths can be picked closely.
+const STEPS = 1000;
+const toSeconds = (position, bound) => Math.round((bound * (position / STEPS) ** 2) / 5) * 5;
+const toPosition = (seconds, bound) => Math.round(Math.sqrt(Math.min(seconds, bound) / bound) * STEPS);
+// The search, as in More of Dots: the text filters the list as it is typed, and the box
+// suggests the players and maps it could mean, with how many replays each has under the
+// other filters. Choosing one filters by that player or map, shown as a chip in the box.
+const PERSON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="7" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>';
+const SUGGESTED = 8;
+function marked(text, query) {
+  const at = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1;
+  return at < 0 ? escape(text) : `${escape(text.slice(0, at))}<mark>${escape(text.slice(at, at + query.length))}</mark>${escape(text.slice(at + query.length))}`;
+}
+function searchBox(key) {
+  return `<div class="search-combobox">
+    <div class="search">${icons.search}<input type="search" id="${key}-search" placeholder="Search players or maps" aria-label="Search players or maps" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${key}-suggestions">
+      <span class="active-filters" id="${key}-chips"></span>
+      <button type="button" class="search-clear" id="${key}-search-clear" aria-label="Clear search and filters" title="Clear search and filters" hidden>×</button></div>
+    <div class="suggestion-panel" hidden><div class="suggestion-list" id="${key}-suggestions" role="listbox" aria-label="Player and map suggestions"></div></div>
+  </div>`;
+}
+/// Shows a list's chosen player and map as chips in its search box.
+function showChips(key) {
+  const state = lists[key].state;
+  const chips = [state.player && ["player", state.player], state.map && ["map", state.map.name]].filter(Boolean);
+  $(`#${key}-chips`).innerHTML = chips.map(([kind, name]) =>
+    `<button type="button" class="filter-chip" data-unfilter="${kind}" aria-label="Remove the ${kind} filter ${escape(name)}" title="Remove this filter"><span class="filter-chip-name">${escape(name)}</span><span aria-hidden="true">×</span></button>`).join("");
+  $(`#${key}-search-clear`).hidden = !(state.query || chips.length);
+}
+/// Filters a list by a player or a map, or by none when `value` is null.
+function setFilter(key, kind, value) {
+  const state = lists[key].state;
+  state[kind] = value;
+  state.page = 0;
+  showChips(key);
+  lists[key].render();
+}
+function wireSearch(key) {
+  const state = lists[key].state;
+  const input = $(`#${key}-search`),
+    clear = $(`#${key}-search-clear`),
+    chips = $(`#${key}-chips`),
+    list = $(`#${key}-suggestions`),
+    panel = list.parentElement;
+  const found = { items: [], active: -1, ticket: 0, timer: 0 };
+  const close = () => {
+    found.ticket++;
+    panel.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    found.active = -1;
+  };
+  const search = (text) => {
+    state.query = text;
+    state.page = 0;
+    showChips(key);
+    lists[key].render();
+  };
+  const paint = () => {
+    const query = state.query.trim();
+    const option = (item, index) => {
+      const chosen = item.kind === "player" ? samePlayer(item.name, state.player) : item.id === state.map?.id;
+      return `<button type="button" tabindex="-1" role="option" id="${key}-suggestion-${index}" class="suggestion${index === found.active ? " is-active" : ""}" data-suggestion="${index}" aria-selected="${index === found.active}" title="${chosen ? "Clear" : "Filter by"} ${item.kind}: ${escape(item.name)}">
+        <span class="suggestion-icon">${item.picture ? `<img src="${escape(item.picture)}" alt="" loading="lazy" onerror="this.remove()">` : item.kind === "player" ? PERSON : '<span class="suggestion-hash">#</span>'}</span>
+        <span class="suggestion-body"><span class="suggestion-primary"><span class="suggestion-name">${marked(item.name, query)}</span><span class="suggestion-meta">${counted(item.count)}</span></span>
+        ${item.detail ? `<span class="suggestion-detail">${escape(item.detail)}</span>` : ""}</span>${chosen ? '<span class="suggestion-clear">✓ Clear</span>' : ""}</button>`;
+    };
+    const groups = [["player", "Players"], ["map", "Maps"]].map(([kind, title]) => {
+      const items = found.items.map((item, index) => [item, index]).filter(([item]) => item.kind === kind);
+      return items.length ? `<div class="suggestion-group" role="group" aria-label="${title}"><div class="suggestion-heading" aria-hidden="true">${title} (${items.length})</div>${items.map(([item, index]) => option(item, index)).join("")}</div>` : "";
+    }).join("");
+    list.innerHTML = groups || '<div class="suggestion-empty" role="status">No players or maps match these filters.</div>';
+    if (found.active >= 0) {
+      input.setAttribute("aria-activedescendant", `${key}-suggestion-${found.active}`);
+      $(`#${key}-suggestion-${found.active}`)?.scrollIntoView({ block: "nearest" });
+    } else input.removeAttribute("aria-activedescendant");
+  };
+  const refresh = async () => {
+    const query = state.query.trim();
+    if (!query || document.activeElement !== input) return close();
+    const ticket = ++found.ticket;
+    let items;
+    try {
+      items = await lists[key].suggest(query);
+    } catch {
+      items = [];
+    }
+    if (ticket !== found.ticket || document.activeElement !== input) return;
+    found.items = items;
+    found.active = items.length ? 0 : -1;
+    panel.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    paint();
+  };
+  // Choosing a suggestion filters by it, or clears that filter when it is the one set.
+  const choose = (index) => {
+    const item = found.items[index];
+    if (!item) return;
+    close();
+    input.value = "";
+    state.query = "";
+    if (item.kind === "player") setFilter(key, "player", samePlayer(item.name, state.player) ? null : baseName(item.name));
+    else setFilter(key, "map", item.id === state.map?.id ? null : { id: item.id, name: item.name });
+  };
+  input.value = state.query;
+  showChips(key);
+  input.oninput = () => {
+    search(input.value);
+    clearTimeout(found.timer);
+    found.timer = setTimeout(refresh, 150);
+  };
+  input.onfocus = () => void refresh();
+  input.onblur = () => close();
+  input.onkeydown = (event) => {
+    // Backspace in an empty box removes the last chip, as in a field of tags.
+    if (event.key === "Backspace" && !input.value && (state.map || state.player)) {
+      event.preventDefault();
+      return setFilter(key, state.map ? "map" : "player", null);
+    }
+    if (event.key === "Escape" && !panel.hidden) {
+      event.preventDefault();
+      return close();
+    }
+    if (panel.hidden || !found.items.length) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const n = found.items.length;
+      found.active = event.key === "ArrowDown" ? (found.active + 1) % n : found.active <= 0 ? n - 1 : found.active - 1;
+      paint();
+    } else if (event.key === "Enter" && found.active >= 0) {
+      event.preventDefault();
+      choose(found.active);
+    }
+  };
+  // The input keeps the focus while a suggestion is clicked.
+  panel.onmousedown = (event) => event.preventDefault();
+  panel.onclick = (event) => {
+    const option = event.target.closest("[data-suggestion]");
+    if (option) choose(Number(option.dataset.suggestion));
+  };
+  chips.onclick = (event) => {
+    const chip = event.target.closest("[data-unfilter]");
+    if (chip) setFilter(key, chip.dataset.unfilter, null);
+  };
+  clear.onmousedown = (event) => event.preventDefault();
+  clear.onclick = () => {
+    input.value = "";
+    Object.assign(state, { query: "", player: null, map: null });
+    search("");
+    close();
+    input.focus();
+  };
+}
+const leading = (item, text) => (item.name.toLowerCase().startsWith(text) ? 0 : 1);
+/// Suggestions for the visitor's replays, read from the replays themselves.
+async function suggestMine(query) {
+  const [list, maps] = await Promise.all([listReplays().catch(() => []), publishedMaps()]);
+  knownMaps = maps;
+  const text = query.toLowerCase();
+  const players = new Map(),
+    places = new Map();
+  for (const r of list) {
+    if (keepMine(r, "player"))
+      r.players.forEach((full, side) => {
+        const name = baseName(full);
+        if (!name.toLowerCase().includes(text)) return;
+        const item = players.get(name.toLowerCase()) ?? { kind: "player", name, count: 0, latest: 0, against: new Map() };
+        item.count++;
+        item.latest = Math.max(item.latest, r.added);
+        r.players.forEach((other, at) => at !== side && item.against.set(baseName(other), (item.against.get(baseName(other)) ?? 0) + 1));
+        players.set(name.toLowerCase(), item);
+      });
+    const id = mapIdentity(r.mapKey, maps);
+    const name = mapLabelOf(r, maps);
+    if (!id || !keepMine(r, "map") || !name.toLowerCase().includes(text)) continue;
+    const item = places.get(id) ?? { kind: "map", id, name, count: 0, latest: 0, picture: r.custom ? r.thumb : identityPicture(id, maps), detail: r.custom ? "Custom" : "Vanilla" };
+    item.count++;
+    item.latest = Math.max(item.latest, r.added);
+    places.set(id, item);
+  }
+  const order = (a, b) => leading(a, text) - leading(b, text) || b.count - a.count || b.latest - a.latest || a.name.localeCompare(b.name);
+  return [
+    ...[...players.values()].sort(order).slice(0, SUGGESTED).map(({ against, ...item }) => ({
+      ...item,
+      detail: against.size ? `vs ${[...against].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name]) => name).join(", ")}` : "",
+    })),
+    ...[...places.values()].sort(order).slice(0, SUGGESTED),
+  ];
+}
+/// Suggestions for every shared replay, counted by the share worker from the totals it keeps.
+async function suggestAll(query) {
+  const maps = (knownMaps = await publishedMaps());
+  const text = query.toLowerCase();
+  const data = await suggestShared({ ...sharedFilters(everyone, maps), q: query, ...refsParam(query, maps) });
+  // An official map named by its image and by its number is one map.
+  const places = new Map();
+  for (const m of data.maps) {
+    const id = mapIdentity(m.key, maps);
+    const custom = m.key.startsWith("custom:");
+    const item = places.get(id) ?? { kind: "map", id, name: mapLabel(m.key, maps), count: 0, latest: 0, picture: identityPicture(id, maps), detail: custom ? "Custom" : "Vanilla" };
+    item.count += m.count;
+    item.latest = Math.max(item.latest, m.latest);
+    places.set(id, item);
+  }
+  const order = (a, b) => leading(a, text) - leading(b, text) || b.count - a.count || b.latest - a.latest;
+  return [
+    ...data.players.map((p) => ({ kind: "player", name: p.name, count: p.count, latest: p.latest, detail: `Latest ${dateFormat.format(new Date(p.latest))}` })).sort(order),
+    ...[...places.values()].sort(order).slice(0, SUGGESTED),
+  ];
+}
+/// The ways replays name the official maps whose names contain the text: by image or by
+/// number, so the share worker, which knows only images, can match map names.
+function refsParam(query, maps) {
+  const text = query.trim().toLowerCase();
+  if (text.length < 2) return {};
+  const refs = new Set();
+  for (const file of maps) {
+    if (!mapName(file, maps)?.toLowerCase().includes(text)) continue;
+    for (const key of mapKeys(`vanilla:${file}`, maps)) refs.add(key.slice(8));
+  }
+  return refs.size ? { refs: [...refs].slice(0, 200).join(",") } : {};
+}
+/// The filters of "All replays" other than its text, as the share worker reads them.
+function sharedFilters(s, maps) {
+  const params = {};
+  if (s.modes.size < MATCH_TYPES.length) params.modes = [...s.modes].join(",");
+  if (s.maps.size < MAP_KINDS.length) params.maps = [...s.maps].join(",");
+  if (s.min > 0) params.min = s.min;
+  if (s.max !== null) params.max = s.max;
+  if (s.player) params.player = s.player;
+  if (s.map) params.map = mapKeys(s.map.id, maps).join(",");
+  return params;
+}
+
+/// A list's search and filters in one row, as the replay browser of More of Dots has them.
+function toolbar(key, state) {
+  return `<div class="toolbar" id="${key}-filters">
+    ${searchBox(key)}
+    <div class="filter-controls">
+      ${checklist(`${key}-modes`, "Mode", MODES, state.modes, (value, on) => toggleFilter(key, "modes", value, on))}
+      ${checklist(`${key}-maps`, "Map", MAP_KINDS, state.maps, (value, on) => toggleFilter(key, "maps", value, on))}
+      <div class="length-filter" role="group" aria-label="Length">
+        <span class="length-value" id="${key}-min-label"></span>
+        <span class="length-slider"><span class="length-track"></span><span class="length-fill" id="${key}-fill"></span>
+          <input type="range" id="${key}-min" min="0" max="${STEPS}" step="1" value="0" aria-label="Shortest length">
+          <input type="range" id="${key}-max" min="0" max="${STEPS}" step="1" value="${STEPS}" aria-label="Longest length"></span>
+        <span class="length-value" id="${key}-max-label"></span></div>
+      ${dropdown(`${key}-sort`, "Sort", SORTS, state.sort, (sort) => {
+        state.sort = sort;
+        state.page = 0;
+        lists[key].render();
+      })}
+      <button type="button" class="btn clear-filters is-off" id="${key}-clear" disabled>Clear filters</button>
+    </div>
+  </div>`;
+}
+const lists = {
+  mine: { state: home, render: () => renderMine(), suggest: (query) => suggestMine(query) },
+  all: { state: everyone, render: () => renderAllSoon(), suggest: (query) => suggestAll(query) },
+};
+const secondsOf = (r) => Math.floor(r.frames / 30);
+/// Whether one of the visitor's replays passes the filters, leaving out one when asked.
+const keepMine = (r, omit) =>
+  (omit === "modes" || home.modes.has(r.mode)) && (omit === "maps" || home.maps.has(kindOf(r)))
+  && secondsOf(r) >= home.min && (home.max === null || secondsOf(r) <= home.max)
+  && (omit === "player" || !home.player || r.players.some((name) => samePlayer(name, home.player)))
+  && (omit === "map" || !home.map || mapIdentity(r.mapKey, knownMaps) === home.map.id);
+const mapLabelOf = (r, maps) => (r.mapKey ? mapLabel(r.mapKey, maps) : r.custom ? "Custom map" : (mapName(r.mapRef, maps) ?? "Unknown map"));
+function filtersChanged(key) {
+  lists[key].state.page = 0;
+  showFilters(key);
+  lists[key].render();
+}
+function toggleFilter(key, group, value, on) {
+  const chosen = lists[key].state[group];
+  if (on) chosen.add(value);
+  else chosen.delete(value);
+  filtersChanged(key);
+}
+/// Shows a list's filters as its state has them.
+function showFilters(key) {
+  const state = lists[key].state;
+  for (const [group, options] of [["modes", MODES], ["maps", MAP_KINDS]]) {
+    const menu = $(`[data-dropdown="${key}-${group}"]`);
+    if (!menu) return;
+    for (const item of menu.querySelectorAll("[data-value]")) item.setAttribute("aria-checked", String(state[group].has(item.dataset.value)));
+    $(`#${key}-${group}-value`).textContent = summary(state[group], options);
+  }
+  $(`#${key}-min`).value = toPosition(state.min, state.bound);
+  $(`#${key}-max`).value = state.max === null ? STEPS : toPosition(state.max, state.bound);
+  paintLength(key);
+  showClear(key);
+}
+/// Clear filters keeps its place while hidden, so the bar does not move as filters change.
+function showClear(key) {
+  const button = $(`#${key}-clear`);
+  button.classList.toggle("is-off", !isFiltered(lists[key].state));
+  button.disabled = !isFiltered(lists[key].state);
+}
+function paintLength(key) {
+  const state = lists[key].state;
+  const min = $(`#${key}-min`),
+    max = $(`#${key}-max`);
+  $(`#${key}-min-label`).textContent = padded(state.min);
+  $(`#${key}-max-label`).textContent = padded(state.max ?? state.bound);
+  $(`#${key}-fill`).style.cssText = `left:${(min.value / STEPS) * 100}%;right:${100 - (max.value / STEPS) * 100}%`;
+}
+function wireFilters(key) {
+  const state = lists[key].state;
+  const min = $(`#${key}-min`),
+    max = $(`#${key}-max`);
+  const moved = (handle) => {
+    if (Number(min.value) > Number(max.value)) handle.value = handle === min ? max.value : min.value;
+    state.min = Number(min.value) === 0 ? 0 : toSeconds(Number(min.value), state.bound);
+    state.max = Number(max.value) === STEPS ? null : toSeconds(Number(max.value), state.bound);
+    state.page = 0;
+    paintLength(key);
+    showClear(key);
+    lists[key].render();
+  };
+  min.oninput = () => moved(min);
+  max.oninput = () => moved(max);
+  $(`#${key}-clear`).onclick = () => {
+    Object.assign(state, { modes: new Set(MATCH_TYPES), maps: new Set(MAP_KINDS.map(([kind]) => kind)), min: 0, max: null });
+    filtersChanged(key);
+  };
+  showFilters(key);
+}
+/// How many replays each option would show, given the other filters.
+function showCounts(key, counts) {
+  for (const [group, values] of Object.entries(counts))
+    for (const element of site.querySelectorAll(`[data-dropdown="${key}-${group}"] [data-count]`))
+      element.textContent = String(values[element.dataset.count] ?? 0);
+}
+/// Sets the length filter's end from the longest replay listed, keeping what the visitor chose.
+function setBound(key, frames) {
+  const state = lists[key].state,
+    bound = boundOf(frames);
+  if (bound === state.bound) return;
+  state.bound = bound;
+  if (state.max !== null && state.max >= bound) state.max = null;
+  state.min = Math.min(state.min, bound);
+  showFilters(key);
+}
+/// Page buttons around the current page, with the first and last.
+function pager(state, total, per, label) {
+  const pages = Math.ceil(total / per);
+  if (pages <= 1) return "";
+  const first = state.page * per;
+  const near = [...new Set([0, state.page - 1, state.page, state.page + 1, pages - 1])].filter((i) => i >= 0 && i < pages).sort((a, b) => a - b);
+  let numbers = "",
+    previous = -1;
+  for (const i of near) {
+    if (i > previous + 1) numbers += '<span class="page-gap" aria-hidden="true">…</span>';
+    numbers += `<button type="button" class="btn page-number" data-page="${i}" aria-label="Page ${i + 1}"${i === state.page ? ' aria-current="page"' : ""}>${i + 1}</button>`;
+    previous = i;
+  }
+  return `<nav class="pager" aria-label="${label}"><span class="note">Showing ${first + 1} to ${Math.min(total, first + per)} of ${total}</span><div>
+    <button type="button" class="btn" data-page="${state.page - 1}"${state.page === 0 ? " disabled" : ""}>Previous</button>${numbers}
+    <button type="button" class="btn" data-page="${state.page + 1}"${state.page === pages - 1 ? " disabled" : ""}>Next</button></div></nav>`;
+}
+const listHead = (key, title) => `<div class="section-head"><h2 id="${key}-title">${title}</h2><span class="section-count" id="${key}-count"></span></div>
+  ${toolbar(key, lists[key].state)}`;
+function wireList(key, onClick) {
+  const state = lists[key].state;
+  wireSearch(key);
+  wireFilters(key);
+  $(`#${key}`).onclick = (event) => {
+    const name = event.target.closest("[data-filter-player]");
+    if (name) {
+      const player = baseName(name.dataset.filterPlayer);
+      return setFilter(key, "player", samePlayer(player, state.player) ? null : player);
+    }
+    const map = event.target.closest("[data-filter-map]");
+    if (map) {
+      const id = map.dataset.filterMap;
+      return setFilter(key, "map", state.map?.id === id ? null : { id, name: map.dataset.mapName });
+    }
+    const mode = event.target.closest("[data-filter-mode]");
+    if (mode) {
+      state.modes = new Set([mode.dataset.filterMode]);
+      return filtersChanged(key);
+    }
+    const page = event.target.closest("[data-page]");
+    if (!page) return onClick(event);
+    state.page = Number(page.dataset.page);
+    lists[key].render();
+    $(`#${key}-title`).scrollIntoView({ block: "start" });
+  };
+}
+
 function showHome() {
   const fresh = showPage(
     "home",
     "War of Dots Replays",
-    `${header()}<main class="page">
-      <section class="dropzone" aria-label="Add replays">${icons.file(52)}
-        <h1>Drop a .rep to watch it</h1>
-        <button type="button" class="btn btn-primary large" id="choose">Choose files</button>
+    `${header(false, "")}<main class="page">
+      <section class="dropzone" aria-label="Add replays">
+        <span class="drop-icon">${icons.file(24)}</span>
+        <span class="drop-copy"><h1>Drop a .rep to watch it</h1><span>Replays you add stay in this browser until you share them.</span></span>
+        <button type="button" class="btn btn-primary" id="choose">Choose files</button>
         <form class="link-form" id="link-form">
           <label class="search">${icons.link}<span class="sr-only">Replay link</span><input type="url" id="link" placeholder="Or paste a link to a .rep" required></label>
           <button type="submit" class="btn">Open</button>
         </form>
       </section>
-      <section class="stack" aria-labelledby="mine-title">
-        <div class="section-head"><h2 id="mine-title">Your replays</h2><span class="spacer"></span>
-          <label class="search">${icons.search}<span class="sr-only">Search players</span><input type="search" id="mine-search" placeholder="Search players"></label>
-          ${dropdown("mine-sort", "Sort", [["added", "Recently added"], ["longest", "Longest"], ["shortest", "Shortest"]], home.sort, (sort) => {
-            home.sort = sort;
-            home.page = 0;
-            renderMine();
-          })}
-        </div>
-        <div id="mine"></div>
-      </section>
+      <section class="stack" aria-labelledby="mine-title">${listHead("mine", "Your replays")}<div id="mine"></div></section>
+      <section class="stack" aria-labelledby="all-title">${listHead("all", "All replays")}<div id="all"></div></section>
       <section class="stack" id="tournaments" aria-labelledby="tournaments-title"></section>
       <button type="button" class="world-egg" id="world-egg" title="Play the world map" aria-label="Play the world map"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><ellipse cx="8" cy="8" rx="2.8" ry="6.4"/><path d="M1.6 8h12.8"/></svg></button>
     </main>`,
@@ -285,30 +801,30 @@ function showHome() {
       event.preventDefault();
       void openLink($("#link").value);
     };
-    $("#mine-search").value = home.query;
-    $("#mine-search").oninput = (event) => {
-      home.query = event.target.value;
-      home.page = 0;
-      renderMine();
-    };
-    $("#mine").onclick = (event) => {
+    wireList("mine", (event) => {
       const remove = event.target.closest("[data-remove]");
       const shareButton = event.target.closest("[data-share]");
       const downloadButton = event.target.closest("[data-download]");
-      const page = event.target.closest("[data-page]");
       if (remove) void forget(remove);
       else if (shareButton) void share(shareButton);
       else if (downloadButton) void download(downloadButton.dataset.download);
-      else if (page) {
-        home.page = Number(page.dataset.page);
-        renderMine();
-        $("#mine-title").scrollIntoView({ block: "start" });
-      }
-    };
+    });
+    wireList("all", (event) => {
+      const watch = event.target.closest("[data-browse]");
+      const downloadButton = event.target.closest("[data-download]");
+      const linkButton = event.target.closest("[data-link]");
+      // Watching a replay from this list does not keep it in "Your replays".
+      if (watch) browsing.add(watch.dataset.browse);
+      else if (downloadButton) void downloadShared(downloadButton);
+      else if (linkButton) void copyLink(linkButton.dataset.link);
+      else if (event.target.closest("[data-retry]")) void renderAll();
+    });
   }
   void renderMine();
+  void renderAll();
   void renderTournaments();
   void showStorage();
+  void loadRanks();
 }
 /// Removes a replay from this browser and, when this browser shared it, stops sharing it.
 async function forget(button) {
@@ -326,6 +842,7 @@ async function forget(button) {
   }
   await removeReplay(id);
   void renderMine();
+  if (token) void renderAll();
   void showStorage();
   const what = record?.players.join(" vs ") || "the replay";
   toast(token ? `Removed ${what} and stopped sharing it.` : `Removed ${what}.`);
@@ -339,6 +856,7 @@ async function share(button) {
     toast(error.message);
   }
   void renderMine();
+  void renderAll();
 }
 async function download(id) {
   const record = await getReplay(id);
@@ -354,52 +872,159 @@ async function renderMine() {
   const element = $("#mine");
   if (!element) return;
   let list = await listReplays().catch(() => []);
-  // Replays kept before the site read map names get them once.
-  const older = list.filter((r) => !r.thumb && !("mapRef" in r));
+  // Replays kept before the site read their match format get it once.
+  const older = list.filter((r) => !("mapKey" in r));
   if (older.length) {
     const refreshed = await Promise.all(older.map((r) => refreshDetails(r).catch(() => r)));
     list = list.filter((r) => !older.includes(r)).concat(refreshed);
   }
-  const maps = await publishedMaps();
+  const maps = (knownMaps = await publishedMaps());
+  if ($("#mine") !== element) return;
   const total = list.length;
+  $("#mine-filters").hidden = !total;
+  setBound("mine", Math.max(0, ...list.map((r) => r.frames)));
   const query = home.query.trim().toLowerCase();
-  if (query) list = list.filter((r) => [...r.players, r.name].some((text) => text.toLowerCase().includes(query)));
-  const order = { added: (a, b) => b.added - a.added, longest: (a, b) => b.frames - a.frames, shortest: (a, b) => a.frames - b.frames };
+  const found = query ? list.filter((r) => [...r.players, r.name, mapLabelOf(r, maps)].some((text) => text.toLowerCase().includes(query))) : list;
+  const keep = keepMine;
+  const count = (omit, value) => found.reduce((counts, r) => {
+    if (keep(r, omit)) counts[value(r)] = (counts[value(r)] ?? 0) + 1;
+    return counts;
+  }, {});
+  showCounts("mine", { modes: count("modes", (r) => r.mode), maps: count("maps", kindOf) });
+  list = found.filter((r) => keep(r));
+  const order = {
+    newest: (a, b) => b.added - a.added,
+    oldest: (a, b) => a.added - b.added,
+    longest: (a, b) => b.frames - a.frames || b.added - a.added,
+    shortest: (a, b) => a.frames - b.frames || b.added - a.added,
+  };
   list.sort(order[home.sort]);
   const pages = Math.max(1, Math.ceil(list.length / perPage));
   home.page = Math.min(home.page, pages - 1);
   const first = home.page * perPage,
     page = list.slice(first, first + perPage);
-  const card = (r) => {
-    const picture = r.thumb ?? mapPicture(r.mapRef, maps);
+  const mineCard = (r) => {
     const what = escape(r.players.join(" vs "));
     const removal = r.shared?.token ? "Remove from this browser and stop sharing" : "Remove from this browser";
-    return `<div class="rep-card">
-      <a href="${root}mine/${r.id}" aria-label="Watch ${what}, ${duration(r.frames)}">
-        ${picture ? `<img src="${escape(picture)}" alt="">` : ""}<span class="shade"></span>
-        <span class="replay-troops" data-troops="${r.id}">${r.troops ? troopLinesMarkup(r.troops) : ""}</span>
-        <span class="versus">${versus(r.players)}</span>
-        <span class="tag bl">${r.version ? `v${escape(r.version)} · ` : ""}${kilobytes(r.size)}</span>
-        <span class="tag br">${duration(r.frames)}</span>
-      </a>
-      <button type="button" class="rep-action rep-remove" data-remove="${r.id}" aria-label="${removal}: ${what}" title="${removal}">${icons.close(14)}</button>
-      <button type="button" class="rep-action rep-download" data-download="${r.id}" aria-label="Download: ${what}" title="Download">${icons.download}</button>
-      <button type="button" class="rep-action rep-share${r.shared ? " shared" : ""}" data-share="${r.id}" aria-label="${r.shared ? "Copy link" : "Share"}: ${what}" title="${r.shared ? "Copy link" : "Share"}">${icons.link}</button>
-    </div>`;
+    return card({
+      href: `${root}mine/${r.id}`,
+      label: `Watch ${what}, ${duration(r.frames)}`,
+      picture: r.thumb ?? mapPicture(r.mapRef, maps),
+      troops: `<span class="replay-troops" data-troops="${r.id}">${r.troops ? troopLinesMarkup(r.troops) : ""}</span>`,
+      map: mapLabelOf(r, maps),
+      mapId: mapIdentity(r.mapKey, maps),
+      filter: home,
+      length: lengthOf(r.frames),
+      mode: r.mode,
+      players: r.players,
+      time: r.added,
+      title: [`Added ${new Date(r.added).toLocaleString()}`, r.version && `v${r.version}`, kilobytes(r.size)].filter(Boolean).join(" · "),
+      actions: `<button type="button" class="rep-round" data-download="${r.id}" aria-label="Download: ${what}" title="Download">${icons.download}</button>
+        <button type="button" class="rep-round${r.shared ? " shared" : ""}" data-share="${r.id}" aria-label="${r.shared ? "Copy link" : "Share"}: ${what}" title="${r.shared ? "Copy link" : "Share"}">${icons.link}</button>`,
+      corner: `<button type="button" class="rep-round rep-remove" data-remove="${r.id}" aria-label="${removal}: ${what}" title="${removal}">${icons.close(14)}</button>`,
+    });
   };
-  const numbers = Array.from({ length: pages }, (_, i) =>
-    `<button type="button" class="btn page-number" data-page="${i}" aria-label="Page ${i + 1}"${i === home.page ? ' aria-current="page"' : ""}>${i + 1}</button>`).join("");
   element.innerHTML = !total
     ? '<p class="empty">No replays yet.</p>'
     : !page.length
-      ? `<p class="empty">No replays match “${escape(home.query)}”.</p>`
-      : `<div class="cards">${page.map(card).join("")}</div>${pages > 1
-        ? `<nav class="pager" aria-label="Replay pages"><span class="note">Showing ${first + 1} to ${first + page.length} of ${list.length}</span><div>
-            <button type="button" class="btn" data-page="${home.page - 1}"${home.page === 0 ? " disabled" : ""}>Previous</button>${numbers}
-            <button type="button" class="btn" data-page="${home.page + 1}"${home.page === pages - 1 ? " disabled" : ""}>Next</button></div></nav>`
-        : ""}`;
+      ? `<p class="empty">${query ? `No replays match “${escape(home.query)}”${isFiltered(home) ? " with these filters" : ""}.` : "No replays match these filters."}</p>`
+      : `<div class="cards">${page.map(mineCard).join("")}</div>${pager(home, list.length, perPage, "Your replay pages")}`;
+  $("#mine-count").textContent = total ? (list.length === total ? counted(total) : `${list.length.toLocaleString("en-US")} of ${counted(total)}`) : "";
   fitNames();
   page.forEach((r) => r.troops || showTroops(r));
+  list.filter((r) => r.shared?.token && !r.shared.troops).forEach((r) => void addTroops(r.id));
+}
+
+// Shared replays watched from "All replays", which are not kept in this browser.
+const browsing = new Set();
+// The replays "All replays" shows, by id, and the latest request for them.
+let shownShared = new Map(),
+  allRequest = 0,
+  allTimer;
+/// Asks for the list once typing or dragging pauses.
+function renderAllSoon() {
+  clearTimeout(allTimer);
+  allTimer = setTimeout(() => void renderAll(), 200);
+}
+async function renderAll() {
+  clearTimeout(allTimer);
+  const element = $("#all");
+  if (!element) return;
+  const ticket = ++allRequest;
+  const s = everyone;
+  element.setAttribute("aria-busy", "true");
+  let data, maps;
+  try {
+    maps = knownMaps = await publishedMaps();
+    const params = { sort: s.sort, offset: s.page * allPerPage, limit: allPerPage, ...sharedFilters(s, maps) };
+    if (s.query.trim()) Object.assign(params, { q: s.query.trim() }, refsParam(s.query, maps));
+    data = await listShared(params);
+  } catch (error) {
+    if (ticket === allRequest && $("#all") === element) {
+      element.removeAttribute("aria-busy");
+      element.innerHTML = `<p class="empty">${escape(error.message)} <button type="button" class="btn" data-retry>Try again</button></p>`;
+    }
+    return;
+  }
+  if (ticket !== allRequest || $("#all") !== element) return;
+  // A filter that leaves fewer pages shows the last of them.
+  const pages = Math.max(1, Math.ceil(data.total / allPerPage));
+  if (s.page > pages - 1) {
+    s.page = pages - 1;
+    return renderAll();
+  }
+  element.removeAttribute("aria-busy");
+  setBound("all", data.longest);
+  showCounts("all", { modes: data.modes, maps: data.maps });
+  shownShared = new Map(data.replays.map((r) => [r.id, r]));
+  const sharedCard = (r) => {
+    const what = escape(r.players.join(" vs ") || "a shared replay");
+    return card({
+      href: `${root}r/${r.id}`,
+      attrs: ` data-browse="${r.id}"`,
+      label: `Watch ${what}${r.frames ? `, ${duration(r.frames)}` : ""}`,
+      // A custom map's picture is read from the replay the first time it is asked for.
+      picture: r.thumb || r.custom ? thumbLink(r.id) : mapPicture(r.map, maps),
+      troops: r.troops?.length ? `<span class="replay-troops">${troopLinesMarkup(r.troops)}</span>` : "",
+      map: r.mapKey ? mapLabel(r.mapKey, maps) : r.custom ? "Custom map" : (mapName(r.map, maps) ?? "Unknown map"),
+      mapId: mapIdentity(r.mapKey, maps),
+      filter: everyone,
+      length: lengthOf(r.frames),
+      mode: r.mode,
+      players: r.players,
+      time: r.created,
+      title: [`Shared ${new Date(r.created).toLocaleString()}`, r.version && `v${r.version}`, kilobytes(r.size)].filter(Boolean).join(" · "),
+      actions: `<button type="button" class="rep-round" data-download="${r.id}" aria-label="Download: ${what}" title="Download">${icons.download}</button>
+        <button type="button" class="rep-round" data-link="${r.id}" aria-label="Copy link: ${what}" title="Copy link">${icons.link}</button>`,
+    });
+  };
+  $("#all-count").textContent = counted(data.total);
+  element.innerHTML = data.replays.length
+    ? `<div class="cards">${data.replays.map(sharedCard).join("")}</div>${pager(s, data.total, allPerPage, "All replay pages")}`
+    : `<p class="empty">${s.query.trim() || isFiltered(s) ? "No shared replays match." : "No replays have been shared yet."}</p>`;
+  fitNames();
+}
+/// Saves a shared replay as a file named after its players.
+async function downloadShared(button) {
+  const id = button.dataset.download;
+  button.disabled = true;
+  try {
+    const blob = await fetchShared(id);
+    if (!blob) throw new Error("This replay is no longer shared.");
+    downloadKept({ blob, name: `${id}.rep`, players: shownShared.get(id)?.players ?? [] });
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+async function copyLink(id) {
+  try {
+    await copy(Promise.resolve(shareLink(id)));
+    toast("Link copied.");
+  } catch {
+    toast(`Link: ${shareLink(id)}`);
+  }
 }
 
 // Published tournaments.
@@ -659,16 +1284,42 @@ function renderGroups(t) {
         <span class="${m.winner === 1 ? "won" : ""}">${escape(t.display(m.player1))}</span> <span class="score-box">${m.scores[0]} : ${m.scores[1]}</span>
         <span class="${m.winner === 2 ? "won" : ""}">${escape(t.display(m.player2))}</span></h2></div>
         <span class="links"><span>${games.length} of ${m.scores[0] + m.scores[1]} replays</span><a href="${root}${t.id}/${m.id}">Show in bracket</a></span></div>
-      <div class="cards small">${games.map((r) => `<div class="rep-card"><a href="${root}${t.id}/${m.id}/${r.slug}" aria-label="Watch ${escape(r.map ?? "")}, ${escape(r.names.join(" vs "))}, ${duration(r.frames)}">
-        ${r.thumb ? `<img src="${base}tournaments/${t.id}/${escape(r.thumb)}" alt="">` : ""}<span class="shade"></span>
-        <span class="replay-troops">${r.troops ? troopLinesMarkup(r.troops) : ""}</span>
-        <span class="versus">${versus(r.names)}</span><span class="tag bl">${escape(r.map ?? "Unknown map")}</span><span class="tag br">${duration(r.frames)}</span></a></div>`).join("")}</div></section>`;
+      <div class="cards small">${games.map((r) => card({
+        href: `${root}${t.id}/${m.id}/${r.slug}`,
+        label: `Watch ${escape(r.map ?? "")}, ${escape(r.names.join(" vs "))}, ${duration(r.frames)}`,
+        picture: r.thumb ? `${base}tournaments/${t.id}/${r.thumb}` : null,
+        troops: `<span class="replay-troops">${r.troops ? troopLinesMarkup(r.troops) : ""}</span>`,
+        map: r.map ?? "Unknown map",
+        length: lengthOf(r.frames),
+        players: r.names,
+      })).join("")}</div></section>`;
   }).join("") : `<p class="empty">No replays match “${escape(filters.query)}”.</p>`;
   fitNames();
 }
 
+// The Leaderboard tab of More of Dots, loaded the first time it is opened.
+let leaderboardPage = null;
+async function showLeaderboard() {
+  const fresh = showPage("leaderboard", "Leaderboard · War of Dots Replays",
+    `${header(true, "leaderboard")}<main class="site-leaderboard" id="leaderboard"><p class="empty">Loading the leaderboard.</p></main>`);
+  if (!fresh) return;
+  const element = $("#leaderboard");
+  try {
+    leaderboardPage ??= import("./leaderboard.js");
+    const page = await leaderboardPage;
+    if ($("#leaderboard") !== element) return;
+    page.mount(element);
+    leaving = page.unmount;
+  } catch {
+    leaderboardPage = null;
+    if ($("#leaderboard") === element) element.innerHTML = '<p class="empty">The leaderboard could not be loaded. Reload the page to try again.</p>';
+  }
+}
+
 // Watching.
 function enterPlayer(back) {
+  leaving?.();
+  leaving = null;
   shown = null;
   setView("watch");
   backTarget = back;
@@ -692,7 +1343,8 @@ async function watchMine(id) {
     return notFound("This replay is only on the device that added it.");
   await play(record);
 }
-/// Opens a shared replay, keeping it in this browser the first time.
+/// Opens a shared replay, keeping it in this browser the first time unless it was
+/// opened from "All replays".
 async function watchShared(id) {
   if (!/^[0-9a-f]{16}$/.test(id)) return notFound("Replay not found.");
   let record = await getReplay(id).catch(() => null);
@@ -704,6 +1356,7 @@ async function watchShared(id) {
       return notFound(error.message);
     }
     if (!blob) return notFound("This replay is no longer shared.");
+    if (browsing.has(id)) return play({ id, blob });
     try {
       ({ record } = await addReplay(new File([blob], `${id}.rep`), { shared: { token: null } }));
     } catch (error) {
@@ -762,6 +1415,7 @@ async function route() {
   if (text) return watchLink(text);
   const parts = currentPath().split("/").filter(Boolean).map(decodeURIComponent);
   if (!parts.length) return showHome();
+  if (parts[0] === "leaderboard" && parts.length === 1) return showLeaderboard();
   if (parts[0] === "mine") return parts[1] ? watchMine(parts[1]) : showHome();
   if (parts[0] === "r") return parts[1] ? watchShared(parts[1]) : showHome();
   // A tournament's earlier address leads to its current one, keeping the rest of the link.

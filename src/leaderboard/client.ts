@@ -5,7 +5,10 @@ export type HistoryPoint = { capturedAt: number; players: { nickname: string; ra
 export type History = { rows: HistoryPoint[]; from: number; to: number; step: number };
 type Entry<T> = { data: T; etag: string; expires: number; saved: number };
 const EXAMPLES = import.meta.env?.DEV && import.meta.env?.VITE_EXAMPLE_DATA === '1';
-const API = 'https://wod-nations-map.moreofdots.workers.dev';
+let API = 'https://wod-nations-map.moreofdots.workers.dev';
+/// Reads the leaderboard from another address with the same routes, such as the hosted
+/// site's copy that every visitor shares.
+export function setLeaderboardSource(url: string) { API = url.replace(/\/$/, ''); }
 const PREFIX = 'mod.leaderboard.v3:';
 const pending = new Map<string, Promise<unknown>>();
 const memory = new Map<string, Entry<unknown>>();

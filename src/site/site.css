@@ -1,23 +1,47 @@
-/* The hosted site's pages around the player: home, tournaments and their brackets.
-   The player keeps its own styles and is shown only on the watch page. */
+/* The hosted site's pages around the player: home, the leaderboard, tournaments and
+   their brackets. They follow the design of More of Dots (src/styles.css): its
+   surfaces, hairlines, one accent, two radii and control heights. The player keeps
+   its own styles and is shown only on the watch page. */
 :root {
   --bg: #0e1110;
   --surface: #161a19;
   --surface-2: #1e2321;
   --line: rgba(238, 244, 240, 0.1);
-  --line-strong: rgba(238, 244, 240, 0.16);
+  --line-strong: rgba(238, 244, 240, 0.2);
   --text: #eef4f0;
   --muted: #97a49d;
+  --faint: rgba(151, 164, 157, 0.62);
   --accent: #5a92c4;
   --accent-ink: #06192b;
-  --accent-soft: rgba(90, 146, 196, 0.14);
+  --accent-soft: rgba(90, 146, 196, 0.16);
+  --accent-line: rgba(90, 146, 196, 0.5);
   --accent-text: #8cc0ee;
+  --success: #35c0a2;
   --win: #f47b20;
   --win-ink: #1d0f04;
-  --blue: #8cc0ee;
-  --red: #ff8a8a;
+  --blue: #76aee0;
+  --red: #ff6b6b;
   --gold: #e0a458;
   --board: #1d2120;
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-pill: 999px;
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --control-h: 30px;
+  --control-h-lg: 34px;
+  --filter-h: 32px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-bold: 650;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
 }
 
 #site {
@@ -45,7 +69,8 @@ body[data-view="page"] {
 #site {
   min-height: 100vh;
   color: var(--text);
-  font-size: 14px;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: var(--fs-md);
   line-height: 1.45;
 }
 #site a {
@@ -73,18 +98,19 @@ body[data-view="page"] {
   white-space: nowrap;
 }
 
-/* Header */
+/* Header: the brand, the site's tabs in the middle as More of Dots places its tabs,
+   and what this browser keeps. */
 .site-header {
   border-bottom: 1px solid var(--line);
 }
 .site-header > div {
   max-width: 1320px;
   margin: 0 auto;
-  padding: 12px 24px;
-  display: flex;
+  padding: 10px 24px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   gap: 12px 24px;
-  flex-wrap: wrap;
 }
 .site-header.wide > div {
   max-width: none;
@@ -94,47 +120,75 @@ body[data-view="page"] {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-weight: 650;
-  font-size: 15px;
+  justify-self: start;
+  font-weight: var(--fw-bold);
+  font-size: var(--fs-lg);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.site-nav {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+.site-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--control-h);
+  padding: 0 var(--s-3);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-weight: var(--fw-medium);
   text-decoration: none;
 }
+.site-nav a:hover,
+.site-nav a:focus-visible,
+.site-nav a[aria-current="page"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--text);
+  outline: none;
+}
 .storage {
-  margin-left: auto;
-  font-size: 12px;
+  justify-self: end;
+  font-size: var(--fs-sm);
   color: var(--muted);
+  white-space: nowrap;
 }
 
-/* Buttons and fields */
+/* Buttons and fields, as More of Dots draws its controls */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 14px;
-  border-radius: 4px;
-  border: 1px solid var(--line-strong);
+  gap: var(--s-2);
+  min-height: var(--control-h-lg);
+  padding: 0 var(--s-3);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
   background: rgba(238, 244, 240, 0.05);
   color: var(--text);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   text-decoration: none;
+  white-space: nowrap;
 }
-#site .btn:hover {
-  background: rgba(238, 244, 240, 0.1);
+#site .btn:hover:not(:disabled) {
+  background: var(--line);
+  border-color: rgba(255, 255, 255, 0.3);
 }
 .btn-primary {
-  border: 0;
+  border-color: var(--accent);
   background: var(--accent);
   color: var(--accent-ink);
-  font-weight: 650;
+  font-weight: var(--fw-bold);
 }
-#site .btn-primary:hover {
+#site .btn-primary:hover:not(:disabled) {
+  border-color: #6ba0cf;
   background: #6ba0cf;
-}
-.btn.large {
-  height: 46px;
-  padding: 0 24px;
-  font-size: 15px;
 }
 .btn:disabled {
   opacity: 0.45;
@@ -142,211 +196,615 @@ body[data-view="page"] {
 .search {
   display: flex;
   align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: 4px;
+  gap: var(--s-2);
+  height: var(--control-h-lg);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
   background: var(--surface);
-  flex: 0 1 320px;
-  min-width: 200px;
+  color: var(--faint);
+  min-width: 0;
+}
+.search:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 .search input {
   flex: 1;
   min-width: 0;
+  height: 100%;
+  padding: 0;
   background: transparent;
   border: 0;
   outline: none;
+  color: var(--text);
+}
+.search input::placeholder {
+  color: var(--faint);
+}
+.search input::-webkit-search-cancel-button {
+  filter: grayscale(1);
+}
+.search-combobox {
+  position: relative;
+  min-width: 0;
+}
+.toolbar .search {
+  height: var(--filter-h);
+  padding: 0 5px 0 10px;
+  gap: 7px;
+}
+.toolbar .search input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+/* The field holds the icon, the text, the chosen player and map, and the clear button. */
+.search-combobox .search input {
+  width: 0;
+}
+.active-filters {
+  display: flex;
+  flex: 0 1 auto;
+  gap: 5px;
+  min-width: 0;
+}
+.active-filters:empty {
+  display: none;
+}
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 175px;
+  min-width: 0;
+  height: 22px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid #3c5669;
+  border-radius: 5px;
+  background: #263e50;
+  color: #e3edf5;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-normal);
+  line-height: 1;
+  white-space: nowrap;
+}
+#site .filter-chip:hover {
+  border-color: var(--accent);
+  background: #304d62;
+}
+.filter-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.filter-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.search-clear {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 24px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+}
+#site .search-clear:hover,
+.search-clear:focus-visible {
+  background: var(--line);
+  color: var(--text);
+  outline: none;
+}
+.suggestion-panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 5px);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  max-height: min(440px, calc(100dvh - 145px));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: rgba(16, 19, 18, 0.98);
+  box-shadow: var(--shadow);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+.suggestion-list {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--s-1);
+  scrollbar-color: var(--muted) transparent;
+}
+.suggestion-group + .suggestion-group {
+  margin-top: 4px;
+  padding-top: 3px;
+  border-top: 1px solid var(--line);
+}
+.suggestion-heading {
+  padding: 5px 8px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+}
+.suggestion {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 0;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+#site .suggestion:hover,
+.suggestion.is-active {
+  border-color: var(--accent-line);
+  background: var(--accent-line);
+}
+.suggestion-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  color: var(--muted);
+}
+#site .suggestion-icon svg {
+  width: 21px;
+  height: 21px;
+}
+.suggestion-icon img {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  object-fit: cover;
+}
+.suggestion-body {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 3px;
+  min-width: 0;
+}
+.suggestion-primary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 10px;
+  min-width: 0;
+}
+.suggestion-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--fs-md);
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.suggestion-meta {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  line-height: 1;
+  white-space: nowrap;
+}
+.suggestion-detail {
+  overflow: hidden;
+  color: rgba(190, 199, 189, 0.78);
+  font-size: var(--fs-xs);
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.suggestion-hash {
+  color: var(--muted);
+  font-size: 18px;
+  font-weight: var(--fw-bold);
+}
+.suggestion-clear {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: var(--fs-xs);
+}
+.suggestion-empty {
+  padding: 15px 10px;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+#site mark {
+  padding: 0 2px;
+  border-radius: var(--r-sm);
+  background: rgba(255, 221, 94, 0.82);
+  color: #12130f;
 }
 .dropdown {
   position: relative;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 13px;
 }
 .dropdown-button {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  height: 36px;
-  min-width: 150px;
-  padding: 0 10px 0 12px;
-  border-radius: 4px;
-  border: 1px solid var(--line-strong) !important;
+  gap: var(--s-2);
+  min-height: var(--filter-h);
+  padding: 0 var(--s-3);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line) !important;
   background: var(--surface) !important;
   color: var(--text);
-  font-size: 13px;
-  font-weight: 500;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-normal);
+  white-space: nowrap;
 }
 #site .dropdown-button:hover,
 .dropdown-button[aria-expanded="true"] {
-  border-color: rgba(238, 244, 240, 0.3) !important;
-  background: var(--surface-2) !important;
+  border-color: var(--line-strong) !important;
+}
+.dropdown-label {
+  margin-right: -4px;
 }
 #site .dropdown-button svg {
   color: var(--muted);
+  opacity: 0.8;
   transition: transform 0.12s;
 }
 .dropdown-button[aria-expanded="true"] svg {
   transform: rotate(180deg);
 }
-/* The same glass panel as the player's speed and volume menus. */
+/* The menu of More of Dots' filters: a raised panel with a row per option. */
 .dropdown-menu {
   position: absolute;
-  right: 0;
+  left: 0;
   top: calc(100% + 6px);
-  z-index: 4;
+  z-index: 30;
   display: grid;
+  gap: 2px;
   min-width: 100%;
-  padding: 4px;
-  border-radius: 9px;
-  background: rgba(12, 23, 25, 0.96);
-  border: 1px solid #ffffff24;
-  box-shadow: 0 12px 32px #0006;
+  padding: var(--s-1);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow);
 }
 .dropdown-menu button {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px 8px 10px;
-  border-radius: 5px;
-  color: #c4cdc8;
-  font-size: 13px;
+  gap: var(--s-2);
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: var(--fs-md);
   text-align: left;
   white-space: nowrap;
 }
 .dropdown-menu button::before {
   content: "";
+  flex: none;
   width: 6px;
   height: 6px;
+  margin: 0 3px;
   border-radius: 50%;
 }
-.dropdown-menu button[aria-checked="true"] {
-  color: #78b8ef;
-  font-weight: 650;
-}
 .dropdown-menu button[aria-checked="true"]::before {
-  background: #78b8ef;
+  background: var(--accent);
 }
 #site .dropdown-menu button:hover,
 .dropdown-menu button:focus-visible {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--accent-soft);
   outline: none;
+}
+/* A checklist's options are check boxes. */
+.dropdown[data-multi] .dropdown-menu button::before {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px var(--muted);
+}
+.dropdown[data-multi] .dropdown-menu button[aria-checked="true"]::before {
+  background: var(--accent)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%2306192b' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m3.5 8.5 3 3 6-7'/%3E%3C/svg%3E")
+    center / 11px no-repeat;
+  box-shadow: none;
+}
+.dropdown-menu .count {
+  margin-left: auto;
+  padding: 0 0 0 var(--s-3);
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
 }
 
 /* Pages */
 .page {
   max-width: 1320px;
   margin: 0 auto;
-  padding: 24px 24px 64px;
+  padding: 20px 24px 64px;
   display: flex;
   flex-direction: column;
-  gap: 36px;
+  gap: 32px;
 }
 .section-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: baseline;
   gap: 12px;
 }
 .section-head h2 {
   margin: 0;
-  font-size: 18px;
-  font-weight: 650;
+  font-size: 17px;
+  font-weight: var(--fw-bold);
+  letter-spacing: -0.01em;
 }
 .section-head .spacer {
   flex: 1 1 0;
 }
+.section-count {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
 .note {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--muted);
 }
 .empty {
+  margin: 0;
   padding: 32px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--r-md);
+  background: var(--surface);
   text-align: center;
   color: var(--muted);
 }
 
-/* Drop area */
+/* Adding replays: one row, like the panels of More of Dots */
 .dropzone {
-  border: 1.5px dashed rgba(90, 146, 196, 0.6);
-  background: rgba(90, 146, 196, 0.06);
-  border-radius: 14px;
-  padding: 48px 24px;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(240px, 380px);
   align-items: center;
-  gap: 14px;
-  text-align: center;
-  transition: background 0.12s;
+  gap: var(--s-4);
+  padding: var(--s-4) 18px;
+  border: 1px dashed var(--accent-line);
+  border-radius: var(--r-md);
+  background: rgba(90, 146, 196, 0.05);
+  transition: background 0.12s, border-color 0.12s;
 }
 body.dragging .dropzone {
   background: rgba(90, 146, 196, 0.16);
   border-color: var(--accent);
 }
-.dropzone h1 {
+.drop-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r-md);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.drop-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.drop-copy h1 {
   margin: 0;
-  font-size: 34px;
-  font-weight: 650;
-  letter-spacing: -0.02em;
-  line-height: 1.15;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-bold);
+  line-height: 1.3;
+}
+.drop-copy span {
+  color: var(--muted);
+  font-size: var(--fs-sm);
 }
 .link-form {
   display: flex;
-  gap: 8px;
-  width: 100%;
-  max-width: 460px;
+  gap: var(--s-2);
+  min-width: 0;
 }
 .link-form .search {
   flex: 1;
-  min-width: 0;
-  color: var(--muted);
 }
 
-/* Replay cards */
+/* A list's search and filters, as the replay browser's search row */
+.toolbar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) max-content;
+  align-items: center;
+  gap: var(--s-3);
+  margin-top: -4px;
+}
+.toolbar[hidden] {
+  display: none;
+}
+.filter-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+}
+.toolbar .dropdown[data-dropdown$="-sort"] .dropdown-menu {
+  left: auto;
+  right: 0;
+}
+/* Every control keeps one width whatever it shows, so changing a filter, the sort or
+   the length never moves the bar. */
+.toolbar .dropdown-button {
+  justify-content: flex-start;
+}
+.toolbar .dropdown-button [data-current] {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+}
+.toolbar .dropdown[data-dropdown$="-modes"] .dropdown-button {
+  width: 164px;
+}
+.toolbar .dropdown[data-dropdown$="-maps"] .dropdown-button {
+  width: 132px;
+}
+.toolbar .dropdown[data-dropdown$="-sort"] .dropdown-button {
+  width: 146px;
+}
+.clear-filters.is-off {
+  visibility: hidden;
+}
+.length-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--filter-h);
+  padding: 0 var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+.length-value {
+  width: 6ch;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: center;
+}
+.length-slider {
+  --thumb: 16px;
+  position: relative;
+  width: clamp(120px, 12vw, 200px);
+  height: 28px;
+}
+.length-track,
+.length-fill {
+  position: absolute;
+  top: 50%;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: var(--r-pill);
+}
+.length-track {
+  left: 0;
+  right: 0;
+  background: var(--line);
+}
+.length-fill {
+  background: var(--accent);
+}
+/* Two ranges over one track; only their handles take the pointer. */
+.length-slider input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: none;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.length-slider input:focus-visible {
+  outline: none;
+}
+.length-slider input::-webkit-slider-runnable-track {
+  background: none;
+}
+.length-slider input::-webkit-slider-thumb {
+  width: var(--thumb);
+  height: var(--thumb);
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 2px solid var(--bg);
+  background: var(--text);
+  box-shadow: 0 0 0 2px var(--accent-line);
+  cursor: pointer;
+  pointer-events: auto;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.length-slider input::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--bg);
+  background: var(--text);
+  box-shadow: 0 0 0 2px var(--accent-line);
+  cursor: pointer;
+  pointer-events: auto;
+}
+.length-slider input:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.clear-filters {
+  min-height: var(--control-h);
+  border-color: transparent;
+  background: none;
+  color: var(--accent-text);
+}
+/* A list waiting for its next page or filter. */
+#all[aria-busy="true"] {
+  opacity: 0.6;
+  transition: opacity 0.15s 0.15s;
+}
+
+/* Replay cards, laid out as in More of Dots: the map with its name, length and match
+   format along the top, the players in the middle, and when the replay was added at
+   the bottom, where Play and the card's buttons show on hover. */
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 16px;
+  gap: var(--s-3);
 }
 .cards.small {
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
 }
 .rep-card {
   position: relative;
-  aspect-ratio: 16 / 9;
-  border-radius: 8px;
+  aspect-ratio: 15 / 8;
+  border-radius: var(--r-md);
   overflow: hidden;
-  border: 1px solid rgba(238, 244, 240, 0.12);
-  background: var(--surface-2);
+  isolation: isolate;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  transition: border-color 120ms ease;
 }
-.rep-card > a {
+.rep-card:hover {
+  border-color: var(--line-strong);
+}
+/* The card itself does nothing when clicked; Play opens the replay, as in More of Dots. */
+.rep-picture {
   position: absolute;
   inset: 0;
-  display: block;
-  text-decoration: none;
 }
-.rep-card img {
+.rep-thumb {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
-  image-rendering: auto;
+  transform: scale(1.01);
 }
 .rep-card .shade {
   position: absolute;
   inset: 0;
-  background: rgba(8, 10, 9, 0.3);
-}
-#site .rep-card > a:hover .shade {
-  background: rgba(8, 10, 9, 0.12);
+  background:
+    linear-gradient(180deg, rgba(8, 10, 9, 0.14) 0%, rgba(8, 10, 9, 0.46) 42%, rgba(8, 10, 9, 0.84) 100%),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.32), rgba(0, 0, 0, 0.04));
 }
 /* Each side's troops over the match, across the picture. */
 .replay-troops {
@@ -368,10 +826,10 @@ body.dragging .dropzone {
   vector-effect: non-scaling-stroke;
 }
 .troop-side-1 {
-  color: var(--blue);
+  color: #76aee0;
 }
 .troop-side-2 {
-  color: var(--red);
+  color: #ff6b6b;
 }
 .troop-side-3 {
   color: #c084fc;
@@ -379,42 +837,150 @@ body.dragging .dropzone {
 .troop-side-4 {
   color: #ffa25c;
 }
-.tag {
+.rep-labels {
   position: absolute;
-  padding: 3px 7px;
-  border-radius: 6px;
-  background: rgba(9, 11, 10, 0.82);
-  font-size: 12px;
-  color: #c4cdc8;
+  left: 12px;
+  right: 12px;
+  top: 12px;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: start;
+  justify-items: start;
+  gap: 6px;
+  pointer-events: none;
+}
+.rep-label {
+  max-width: 100%;
+  min-height: 0;
+  padding: 5px 7px;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: rgba(9, 11, 10, 0.62);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-normal);
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.56);
+  white-space: nowrap;
+}
+.rep-label.length {
+  border-color: transparent;
   font-variant-numeric: tabular-nums;
 }
-.tag.bl {
-  left: 10px;
-  bottom: 10px;
+.rep-label.mode {
+  justify-self: end;
 }
-.tag.br {
-  right: 10px;
-  bottom: 10px;
-  color: var(--text);
+/* The map and the match format filter the list, as in More of Dots. */
+button.rep-label {
+  border-color: rgba(238, 244, 240, 0.3) !important;
+  background: rgba(9, 11, 10, 0.62) !important;
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background 120ms ease, border-color 120ms ease;
 }
-.versus {
+#site button.rep-label:hover {
+  border-color: var(--accent) !important;
+  background: rgba(28, 49, 63, 0.96) !important;
+}
+button.rep-label[aria-pressed="true"] {
+  border-color: var(--accent) !important;
+  background: rgba(39, 78, 108, 0.94) !important;
+}
+button.rep-label:focus-visible,
+button.player-name:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.rep-players {
   position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  max-width: 90%;
-  padding: 7px 12px;
-  border-radius: 6px;
-  background: rgba(9, 11, 10, 0.82);
-  font-size: 15px;
-  font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  left: 16px;
+  right: 16px;
+  top: 52%;
+  z-index: 2;
+  display: flex;
+  justify-content: center;
+  transform: translateY(-50%);
+  text-align: center;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.72);
+  pointer-events: none;
 }
-.cards.small .versus {
-  font-size: 13px;
-  padding: 6px 10px;
+.matchup {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 18px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.matchup.many {
+  flex-wrap: wrap;
+  row-gap: 2px;
+  font-size: 16px;
+}
+.matchup .vs {
+  flex: none;
+  margin: 0 0.3em;
+  color: var(--muted);
+}
+.rep-player {
+  display: inline-flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+}
+.fitting .rep-player {
+  flex-shrink: 0;
+}
+.player-name {
+  max-width: 100%;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: none;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.player-name {
+  border-radius: 2px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+/* As in More of Dots: a hovered name is underlined over a faint highlight, and the
+   player the list is filtered by stays underlined. */
+#site button.player-name:hover {
+  background: var(--line);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+button.player-name[aria-pressed="true"] {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+/* The rank sits under its name, so the line is only as wide as the names. */
+.player-rank {
+  margin-top: 0.18em;
+  color: var(--muted);
+  font-size: 0.5em;
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.player-rank b {
+  color: var(--text);
+  font-weight: inherit;
 }
 .fit {
   display: block;
@@ -432,10 +998,10 @@ body.dragging .dropzone {
   color: var(--red);
 }
 .purple {
-  color: #d3a6ef;
+  color: #c084fc;
 }
 .orange {
-  color: #ffb27a;
+  color: #ffa25c;
 }
 .stack,
 .groups-list {
@@ -446,50 +1012,152 @@ body.dragging .dropzone {
 .groups-list {
   gap: 28px;
 }
-.rep-action {
+.rep-card .blue {
+  color: var(--accent);
+}
+.rep-card .red {
+  color: #ff6b6b;
+}
+.rep-card .purple {
+  color: #c084fc;
+}
+.rep-card .orange {
+  color: #ffa25c;
+}
+.rep-age {
   position: absolute;
-  top: 8px;
-  width: 30px;
-  height: 30px;
-  border-radius: 6px;
+  left: 12px;
+  bottom: 10px;
+  z-index: 2;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: calc(100% - 64px);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--fw-medium);
+  line-height: 1;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.86);
+  white-space: nowrap;
+}
+.rep-date {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rep-actions {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  z-index: 3;
   display: flex;
   align-items: center;
+  gap: 6px;
+}
+/* Glass buttons over the map, as Play and Share on the cards of More of Dots. */
+.rep-play,
+.rep-round {
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  background: rgba(9, 11, 10, 0.82) !important;
-  color: var(--text);
+  min-height: var(--control-h-lg);
+  border: 1px solid var(--line-strong) !important;
+  border-radius: var(--r-pill);
+  background: rgba(8, 18, 15, 0.45) !important;
+  box-shadow: 0 3px 16px #0004;
+  color: white;
   opacity: 0;
+  pointer-events: none;
+  text-decoration: none;
+  transition: opacity 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+.rep-play {
+  gap: 7px;
+  padding: 0 14px;
+  font-size: var(--fs-md);
+}
+.rep-round {
+  width: var(--control-h-lg);
+  padding: 0;
+}
+#site .rep-round svg {
+  --size: 16px;
 }
 .rep-remove {
-  left: 8px;
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  z-index: 3;
 }
-.rep-share {
-  right: 8px;
-}
-.rep-download {
-  right: 44px;
-}
-/* A shared replay's link button stays in view. */
-.rep-share.shared {
-  color: var(--accent-text);
+.rep-card:hover .rep-play,
+.rep-card:focus-within .rep-play,
+.rep-card:hover .rep-round,
+.rep-card:focus-within .rep-round {
   opacity: 1;
+  pointer-events: auto;
+  backdrop-filter: blur(3px);
 }
-.rep-action:disabled {
-  opacity: 1;
+.rep-card:hover .rep-age,
+.rep-card:focus-within .rep-age {
+  visibility: hidden;
+}
+#site .rep-play:hover,
+#site .rep-round:hover:not(:disabled) {
+  border-color: white !important;
+  background: rgba(8, 18, 15, 0.65) !important;
+}
+.rep-play:focus-visible,
+.rep-round:focus-visible {
+  outline: 3px solid #83bdf0;
+  outline-offset: 3px;
+}
+/* A shared replay's link button is green, as a shared card's in More of Dots. */
+.rep-round.shared {
+  border-color: rgba(53, 192, 162, 0.75) !important;
+  color: var(--success);
+}
+.rep-round:disabled {
   cursor: progress;
 }
-.rep-card:hover .rep-action,
-.rep-action:focus-visible {
-  opacity: 1;
-}
 @media (hover: none) {
-  .rep-action {
+  .rep-play,
+  .rep-round {
     opacity: 1;
+    pointer-events: auto;
+    backdrop-filter: blur(3px);
   }
+  .rep-age {
+    visibility: hidden;
+  }
+}
+.cards.small .rep-labels {
+  left: 8px;
+  right: 8px;
+  top: 8px;
+  gap: 6px;
+}
+.cards.small .rep-label {
+  padding: 4px 7px;
+  font-size: var(--fs-xs);
+  border-radius: 6px;
+}
+.cards.small .matchup {
+  font-size: 15px;
+}
+.cards.small .rep-actions {
+  left: 8px;
+  bottom: 8px;
+}
+.cards.small .rep-play {
+  min-height: var(--control-h);
+  padding: 0 12px;
+  font-size: var(--fs-sm);
 }
 
 /* Pager */
 .pager {
-  margin-top: 24px;
+  margin-top: 20px;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -498,17 +1166,57 @@ body.dragging .dropzone {
 }
 .pager > div {
   display: flex;
-  gap: 6px;
+  gap: 4px;
 }
 .pager .page-number {
-  width: 36px;
-  padding: 0;
+  min-width: var(--control-h-lg);
+  padding: 0 6px;
+  font-variant-numeric: tabular-nums;
 }
-.pager .page-number[aria-current="page"] {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-ink);
+#site .pager .page-number[aria-current="page"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--text);
 }
+.page-gap {
+  align-self: center;
+  padding: 0 2px;
+  color: var(--muted);
+}
+
+/* The Leaderboard page: More of Dots' Leaderboard tab, filling the window under the header. */
+body[data-view="page"] #site:has(.site-leaderboard) {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 560px;
+}
+.site-leaderboard {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  background: #101519;
+}
+.site-leaderboard > .empty {
+  margin: 24px auto;
+  border: 0;
+  background: none;
+}
+.site-leaderboard .leaderboard-page {
+  max-width: 1500px;
+  margin: 0 auto;
+}
+/* The player sizes every icon in a button; the leaderboard's icons keep their own size. */
+#site .leaderboard-page svg.lucide {
+  stroke-width: 2;
+}
+#site .leaderboard-page svg.lucide[width="11"] { --size: 11px; width: 11px; height: 11px; }
+#site .leaderboard-page svg.lucide[width="12"] { --size: 12px; width: 12px; height: 12px; }
+#site .leaderboard-page svg.lucide[width="13"] { --size: 13px; width: 13px; height: 13px; }
+#site .leaderboard-page svg.lucide[width="14"] { --size: 14px; width: 14px; height: 14px; }
+#site .leaderboard-page svg.lucide[width="16"] { --size: 16px; width: 16px; height: 16px; }
+#site .leaderboard-page svg.lucide[width="18"] { --size: 18px; width: 18px; height: 18px; }
 
 /* Tournament cards */
 .tournament-cards {
@@ -1031,28 +1739,52 @@ a.match:hover {
   border: 1px solid var(--line-strong);
 }
 
+@media (max-width: 1100px) {
+  .toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .filter-controls {
+    justify-content: flex-start;
+  }
+  .dropzone {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+  .dropzone .link-form {
+    grid-column: 1 / -1;
+  }
+}
 @media (max-width: 720px) {
   .site-header > div,
   .site-header.wide > div {
-    padding: 12px 16px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 10px 16px;
+  }
+  .storage {
+    display: none;
+  }
+  .brand {
+    min-width: 0;
+  }
+  .brand span {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .page {
     padding: 16px 16px 40px;
     gap: 28px;
   }
   .dropzone {
-    padding: 28px 18px;
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: stretch;
+    padding: 16px;
   }
-  .dropzone h1 {
-    font-size: 22px;
+  .drop-icon {
+    display: none;
   }
   .dropzone > .btn {
-    width: 100%;
-    height: 48px;
+    min-height: 44px;
   }
-  .link-form .search {
-    height: 44px;
-  }
+  .link-form .search,
   .link-form .btn {
     height: 44px;
   }
@@ -1060,67 +1792,38 @@ a.match:hover {
     display: none;
   }
   .search {
-    flex: 1 1 100%;
     height: 44px;
+  }
+  .filter-controls > .dropdown {
+    flex: 1 1 0;
+  }
+  .toolbar .filter-controls .dropdown .dropdown-button {
+    width: 100%;
+  }
+  .clear-filters.is-off {
+    display: none;
+  }
+  #site .filter-controls .dropdown-button svg {
+    margin-left: auto;
+  }
+  .length-filter {
+    flex: 1 1 100%;
+  }
+  .length-slider {
+    flex: 1;
+    width: auto;
+  }
+  .pager .page-number {
+    min-width: 32px;
   }
   .cards {
     grid-template-columns: 1fr;
-    gap: 8px;
   }
-  /* Phones list replays as rows: picture, then players. */
-  .cards:not(.small) .rep-card {
-    aspect-ratio: auto;
-    height: 75px;
-    background: var(--surface);
+  .site-leaderboard {
+    display: block;
   }
-  .cards:not(.small) .rep-card img {
-    width: 112px;
-    height: 63px;
-    left: 6px;
-    top: 6px;
-    border-radius: 5px;
-  }
-  .cards:not(.small) .rep-card .shade {
-    display: none;
-  }
-  .cards:not(.small) .rep-card .replay-troops {
-    inset: auto;
-    width: 112px;
-    height: 63px;
-    left: 6px;
-    top: 6px;
-  }
-  .cards:not(.small) .versus {
-    left: 130px;
-    right: 44px;
-    top: 14px;
-    transform: none;
-    padding: 0;
-    background: none;
-    font-size: 14px;
-  }
-  .cards:not(.small) .tag.bl {
-    left: 130px;
-    bottom: 12px;
-    padding: 0;
-    background: none;
-  }
-  .cards:not(.small) .tag.br {
-    left: 10px;
-    right: auto;
-    bottom: 10px;
-    padding: 1px 5px;
-    font-size: 11px;
-  }
-  .rep-share,
-  .rep-download {
-    top: 22px;
-  }
-  .rep-remove {
-    left: 10px;
-    top: 10px;
-    width: 24px;
-    height: 24px;
+  body[data-view="page"] #site:has(.site-leaderboard) {
+    height: auto;
   }
   .tournament-cards {
     grid-template-columns: 1fr;
@@ -1303,3 +2006,10 @@ a.match:hover {
 }
 .world-egg:hover, .world-egg:focus-visible { opacity: 0.8; }
 .world-egg:disabled { cursor: progress; }
+
+/* On the narrowest phones the brand is its mark alone, beside the tabs. */
+@media (max-width: 420px) {
+  .brand span {
+    display: none;
+  }
+}

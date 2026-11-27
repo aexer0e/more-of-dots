@@ -5,11 +5,12 @@
 // (scripts/og-cards.mjs); a shared replay's are read from the replay, and its card
 // is the one the sharer's browser drew. Every other request passes through.
 // SITE_ORIGIN, when set, is where the site is served from instead, for testing.
-import { details, replayText } from "./replay.js";
+import { describe } from "./listing.js";
 
 export const SITE = "/wod-replay-player";
 const NAME = "War of Dots Replays";
 const HOME = { title: NAME, description: "Watch War of Dots replays in the browser." };
+const LEADERBOARD = { title: "Leaderboard", description: "The War of Dots Elo and World victory top 100, and how players have moved." };
 // The site's files, as opposed to its pages.
 const FILES = /^(assets|engine|maps|tournaments|audio|og)\/|\.[a-z0-9]+$/i;
 const ID = /^[0-9a-f]{16}$/;
@@ -41,10 +42,7 @@ async function sharedPreview(env, id) {
   // Replays shared before previews are described once, on their first preview.
   if (players === null) {
     const { data } = await env.DB.prepare("SELECT data FROM replays WHERE id = ?").bind(id).first();
-    const text = await replayText(new Uint8Array(data));
-    ({ players, frames, version } = details(text ?? ""));
-    players = JSON.stringify(players);
-    await env.DB.prepare("UPDATE replays SET players = ?, frames = ?, version = ? WHERE id = ?").bind(players, frames, version, id).run();
+    ({ players, frames, version } = await describe(env, id, data));
   }
   const names = JSON.parse(players);
   const facts = [frames ? clock(frames) : null, version ? `v${version}` : null].filter(Boolean).join(" · ");
@@ -64,6 +62,7 @@ async function previewFor(url, origin, path, env) {
     }
   });
   if (parts[0] === "r" && ID.test(parts[1] ?? "")) return (await sharedPreview(env, parts[1])) ?? HOME;
+  if (parts.length === 1 && parts[0] === "leaderboard") return LEADERBOARD;
   const { pages, aliases } = await pageIndex(origin);
   if (parts.length && aliases[parts[0]]) parts[0] = aliases[parts[0]];
   return pages[parts.join("/")] ?? HOME;

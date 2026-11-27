@@ -9,7 +9,7 @@ export const SITE = "https://aexer0e.dev/wod-replay-player/";
 // preview's picture (null when someone had already shared the same file).
 const SHARED_KEY = "wodSharedReplays";
 
-type SharedRecord = { token: string | null; card?: boolean | number };
+type SharedRecord = { token: string | null; card?: boolean | number; troops?: boolean };
 
 function readShared(): Record<string, SharedRecord> {
   try {
@@ -58,13 +58,26 @@ export async function uploadReplay(bytes: Uint8Array<ArrayBuffer>): Promise<stri
 /** Gives a replay this app shared the picture its link preview shows, once per card design. */
 export async function addCard(id: string, details: () => Promise<CardDetails>) {
   const record = shared[id];
-  if (!record?.token || record.card === CARD_VERSION) return;
+  if (!record?.token || (record.card === CARD_VERSION && record.troops)) return;
   try {
-    const card = await drawCard(await details(), SITE);
+    const card = await details();
+    // The card's troop lines are kept with the replay, so the site's list can draw them.
+    if (!record.troops && card.troops?.length) {
+      await request(`/replays/${id}/troops`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${record.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(card.troops),
+      }).then(() => {
+        shared[id] = { ...shared[id], troops: true };
+        saveShared();
+      }, () => {});
+    }
+    if (shared[id].card === CARD_VERSION) return;
+    const picture = await drawCard(card, SITE);
     await request(`/replays/${id}/card`, {
       method: "PUT",
       headers: { Authorization: `Bearer ${record.token}`, "Content-Type": "image/jpeg" },
-      body: card,
+      body: picture,
     });
     shared[id] = { ...shared[id], card: CARD_VERSION };
     saveShared();

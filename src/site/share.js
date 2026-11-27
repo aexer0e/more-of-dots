@@ -17,6 +17,13 @@ async function request(path, options) {
   return response;
 }
 
+/// Every shared replay, a page at a time: `params` sorts and filters them (share/src/listing.js).
+export const listShared = async (params) => (await request(`/replays?${new URLSearchParams(params)}`)).json();
+/// The players and maps a search's text could mean among every shared replay.
+export const suggestShared = async (params) => (await request(`/replays/suggest?${new URLSearchParams(params)}`)).json();
+/// The picture of a shared replay's custom map.
+export const thumbLink = (id) => `${API}/replays/${id}/thumb`;
+
 /// Uploads a replay. Resolves to `{ id, token }`; `token` lets this browser stop
 /// sharing it and is missing when someone had already shared the same file.
 export const shareReplay = async (blob) => (await request("/replays", { method: "POST", body: blob })).json();
@@ -34,6 +41,10 @@ export async function fetchShared(id) {
 /// Adds the picture a shared replay's link preview shows; only its sharer can.
 export const uploadCard = (id, token, blob) =>
   request(`/replays/${id}/card`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg" }, body: blob });
+
+/// Keeps the troop lines of a shared replay's card with it, so visitors need not simulate it.
+export const uploadTroops = (id, token, troops) =>
+  request(`/replays/${id}/troops`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(troops) });
 
 export async function unshareReplay(id, token) {
   try {

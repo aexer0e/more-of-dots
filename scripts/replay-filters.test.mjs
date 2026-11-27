@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MATCH_TYPES, matchesReplay, matchupTitle, normalize, replaySuggestions, toggleMatchType } from '../src/replays/filters.ts';
+import { MATCH_TYPES, matchType, matchesReplay, matchupTitle, normalize, replaySuggestions, toggleMatchType } from '../src/replays/filters.ts';
+import { details } from '../share/src/replay.js';
+import { canonical, expiry } from '../share/src/leaderboard.js';
+import { columns } from '../share/src/listing.js';
 
 const filters = (overrides = {}) => ({ query: '', enabledTypes: new Set(MATCH_TYPES), sources: new Set(['vanilla', 'custom']),
   durationRange: { min: 0, max: 1000 }, player: null, mapKey: null, ...overrides });
@@ -87,4 +90,48 @@ test('matchup titles group teammates', () => {
   assert.equal(matchupTitle(players), 'a & b vs c & d');
   assert.equal(matchupTitle(players, '-vs-', ' _ '), 'a _ b-vs-c _ d');
   assert.equal(matchupTitle([{ name: 'a' }, { name: 'b' }, { name: 'c' }]), 'a vs b vs c');
+});
+
+test('the match format comes from the mode, or from the sides and team size', () => {
+  assert.equal(matchType('v3', 3, 1), '3P');
+  assert.equal(matchType('avalanche', 2, 1), 'Avalanche');
+  assert.equal(matchType('ffa', 4, 1), '4P');
+  assert.equal(matchType(null, 2, 2), '2v2');
+  assert.equal(matchType(undefined, 2, 1), '1v1');
+  assert.equal(matchType('unknown', 3, 1), '3P');
+});
+
+test('the share worker reads the fields of a replay, not those of its map or orders', () => {
+  const text = JSON.stringify({ version: '1.4.1', map: { path: 'assets/fahero_maps/map4.png', mode: 'v4' },
+    player_usernames: [[{ username: 'a' }, { username: 'b' }], [{ username: 'c' }, { username: 'd' }]], mode: '2v2',
+    10: [{ mode: 'experiment', end: 3 }], 250: [] });
+  assert.deepEqual(details(text), { players: ['a & b', 'c & d'], frames: 250, version: '1.4.1', mode: '2v2', custom: false,
+    mapRef: 'assets/fahero_maps/map4.png', surface: null });
+  const custom = details(JSON.stringify({ custom_map: { map_surface: 'iVBORw0KGgo=' }, player_names: ['x', 'y', 'z'], end: 90 }));
+  assert.deepEqual([custom.mode, custom.custom, custom.mapRef, custom.frames, custom.players], ['3P', true, null, 90, ['x', 'y', 'z']]);
+});
+
+test('the share worker asks the same leaderboard question in one form', () => {
+  const ask = (query) => canonical('/v1/leaderboard/refresh', new URLSearchParams(query));
+  assert.equal(ask('player=b&days=7&player=a&player=a&since=123&board=world'), '/v1/leaderboard/refresh?board=world&days=7&player=a&player=b');
+  assert.equal(ask('board=other&days=5'), '/v1/leaderboard/refresh?board=elo&days=0');
+  assert.equal(ask(Array.from({ length: 12 }, (_, i) => `player=p${i}`).join('&')), null);
+  assert.equal(canonical('/v1/leaderboard', new URLSearchParams('player=a')), '/v1/leaderboard');
+  assert.equal(canonical('/v1/nations', new URLSearchParams()), null);
+});
+
+test('the share worker keeps a leaderboard answer until the next snapshot is due', () => {
+  const now = 1_000_000_000;
+  assert.equal(expiry({ capturedAt: now / 1000 - 30, refreshIntervalSeconds: 120 }, now), now + 100_000);
+  assert.equal(expiry({ capturedAt: now / 1000 - 500, refreshIntervalSeconds: 120 }, now), now + 20_000);
+  assert.equal(expiry({}, now), now + 120_000);
+});
+
+test('the share worker keys maps as More of Dots tells them apart', async () => {
+  const official = await columns(JSON.stringify({ map: { path: 'Assets\\Fahero_maps\\map4.png' }, player_names: ['a', 'b'], end: 30 }));
+  assert.equal(official.mapKey, 'vanilla:assets/fahero_maps/map4.png');
+  const image = 'iVBORw0KGgo=';
+  const custom = await columns(JSON.stringify({ custom_map: { map_surface: image }, player_names: ['a', 'b'], end: 30 }));
+  const digest = Buffer.from(await crypto.subtle.digest('SHA-256', Buffer.from(image, 'base64'))).toString('hex');
+  assert.equal(custom.mapKey, `custom:${digest}`);
 });

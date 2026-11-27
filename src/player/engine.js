@@ -11,6 +11,7 @@ import {
   drawProduction,
   drawStats,
 } from "./overlays.js";
+import { StatHistory } from "./stats-graph.js";
 let canvas,
   renderer,
   base,
@@ -76,13 +77,62 @@ async function chunkAt(index) {
   }
   return chunk;
 }
+// Stats once a second for the graphs. Frames read for playback fill it as they pass.
+const history = new StatHistory();
 const buffer = new FrameBuffer(async (start, count) => {
   const chunk = await chunkAt(start);
   if (!chunk) return { rows: [], bytes: 0 };
   const rows = chunk.frames.slice(start - chunk.start, start - chunk.start + count);
+  for (const row of rows) history.record(row);
   return { rows, bytes: Math.ceil((chunk.bytes * rows.length) / chunk.frames.length) };
 });
 export const bufferStats = () => buffer.stats();
+
+// After a seek, the window before the new position is decoded on its own (not
+// through the chunk cache, so playback keeps its chunks), earliest gap first. It
+// follows the latest position, so held seek keys end with the graphs they stopped
+// at. While paused, the frame is painted again as the history fills.
+let backfilling = false,
+  wanted = 0,
+  paints = 0,
+  lastPaint = 0;
+function repaintIfIdle(replay) {
+  const painted = paints;
+  setTimeout(() => {
+    if (paints === painted && replay === player.info) void paint(lastPaint).catch(() => {});
+  }, 60);
+}
+async function backfill(tick) {
+  wanted = tick;
+  if (backfilling) return;
+  backfilling = true;
+  const replay = player.info;
+  let decoded = 0;
+  try {
+    for (let second; replay === player.info && (second = history.firstMissing(wanted)) >= 0; ) {
+      const frames = replay.frameNumbers;
+      let low = 0,
+        high = frames.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (frames[middle] < second * 30) low = middle + 1;
+        else high = middle;
+      }
+      if (low >= frames.length) break;
+      const chunk = await decodeChunk(await invoke("replay_chunk", { index: low }), replay.staticRecord);
+      if (replay !== player.info) return;
+      for (const row of chunk.frames) history.record(row);
+      // A second the replay has no frame for is not looked for again.
+      if (history.firstMissing(wanted) === second) history.absent.add(second);
+      if (++decoded % 60 === 0) repaintIfIdle(replay);
+    }
+  } catch {
+    // The graphs draw what they have; the next seek tries again.
+  } finally {
+    backfilling = false;
+  }
+  if (decoded && replay === player.info) repaintIfIdle(replay);
+}
 
 // The simulation may still be writing later frames. Playback stays inside the
 // prepared range; other callers (QA captures) wait for the frame to exist.
@@ -161,6 +211,7 @@ export async function loadReplay(path) {
     player.info = await invoke("open_replay", { path });
     // A chunk decoded for the previous replay is discarded once this one is open.
     chunks.length = 0;
+    history.clear();
     sentCues = 0;
     buffer.reset(player.info.frameNumbers.length);
     player.frame = 0;
@@ -256,6 +307,8 @@ async function asset(name) {
 
 export async function paint(index) {
   const request = ++player.pending;
+  paints++;
+  lastPaint = index;
   const state = await frameAt(index);
   if (!state || request !== player.pending) return;
   const [worldW, worldH] = player.mapSize;
@@ -375,7 +428,10 @@ export async function paint(index) {
           icon[1],
         );
     }
-  if (player.options.stats) drawStats(renderer, state);
+  if (player.options.stats) {
+    drawStats(renderer, state, history);
+    if (history.firstMissing(state.frame) >= 0) void backfill(state.frame);
+  }
   const viewScale = Math.min(canvas.width / worldW, canvas.height / worldH),
     viewW = worldW * viewScale,
     viewH = worldH * viewScale;

@@ -36,6 +36,63 @@ export class Renderer extends NativeRenderer {
     ctx.fillText(draw.text, draw.position[0] * 1920, (1 - draw.position[1]) * 1080);
     ctx.restore();
   }
+  drawHud(draw, ox, oy, vw, vh) {
+    const ctx = this.context,
+      [r, g, b, a = 1] = draw.color,
+      color = `rgba(${r},${g},${b},${a})`;
+    ctx.save();
+    ctx.setTransform(vw / 1920, 0, 0, vh / 1080, ox, oy);
+    ctx.globalAlpha = 1;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    if (draw.type === "huddot") {
+      ctx.beginPath();
+      ctx.arc(...draw.position, draw.radius, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "#000";
+      ctx.stroke();
+    } else {
+      ctx.setLineDash(draw.dash || []);
+      const path = () => {
+        ctx.beginPath();
+        draw.points.forEach((point, index) => (index ? ctx.lineTo(...point) : ctx.moveTo(...point)));
+      };
+      if (draw.outline) {
+        path();
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = draw.width + draw.outline * 2;
+        ctx.stroke();
+      }
+      ctx.lineWidth = draw.width;
+      if (draw.colors) {
+        // Each segment blends between its ends' colors; the dash pattern carries
+        // on from segment to segment.
+        const css = ([r, g, b, a = 1]) => `rgba(${r},${g},${b},${a})`;
+        let along = 0;
+        for (let i = 1; i < draw.points.length; i++) {
+          const [x0, y0] = draw.points[i - 1],
+            [x1, y1] = draw.points[i],
+            gradient = ctx.createLinearGradient(x0, y0, x1, y1);
+          gradient.addColorStop(0, css(draw.colors[i - 1]));
+          gradient.addColorStop(1, css(draw.colors[i]));
+          ctx.lineDashOffset = along;
+          ctx.beginPath();
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x1, y1);
+          ctx.strokeStyle = gradient;
+          ctx.stroke();
+          along += Math.hypot(x1 - x0, y1 - y0);
+        }
+      } else {
+        path();
+        ctx.strokeStyle = color;
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
   drawLocal() {
     const ctx = this.context,
       [mw, mh] = this.mapSize;
@@ -61,6 +118,8 @@ export class Renderer extends NativeRenderer {
     for (const draw of this.draws) {
       if (draw.type === "text") {
         this.drawText(draw, ox, oy, vw, vh);
+      } else if (draw.type === "hudline" || draw.type === "huddot") {
+        this.drawHud(draw, ox, oy, vw, vh);
       } else if (draw.type === "image") {
         let image,
           position = [...draw.position],

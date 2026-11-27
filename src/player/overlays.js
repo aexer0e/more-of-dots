@@ -1,3 +1,5 @@
+import { drawStatGraphs } from "./stats-graph.js";
+
 export const displayOptions = [
   ["orders", "Orders", true],
   ["health", "Health", true],
@@ -93,7 +95,10 @@ export function drawProduction(renderer, state) {
           );
     }
 }
-export function drawStats(renderer, state) {
+/** With a stat history and a renderer that draws HUD shapes, the stats are graphs
+ * of the last minute (stats-graph.js); otherwise they are the game's counters. */
+export function drawStats(renderer, state, history = null) {
+  if (history && renderer.hudLine) return drawStatGraphs(renderer, state, history);
   const economy = state.core.economy?.fields || {},
     sides = state.core.strength?.length || 2,
     gray = [200, 200, 200];

@@ -91,6 +91,16 @@ export class Renderer {
       outline,
     });
   }
+  // HUD shapes are in 1920 by 1080 HUD pixels, like text, and ignore the map's
+  // zoom. Colors are 0 to 255 with an optional alpha; `colors`, one per point,
+  // blends the line from point to point instead. Only the browser canvas draws
+  // them for now.
+  hudLine(points, color, width, outline = 0, dash = null, colors = null) {
+    if (points.length >= 2) this.draws.push({ type: "hudline", points, color, width, outline, dash, colors });
+  }
+  hudDot(position, radius, color) {
+    this.draws.push({ type: "huddot", position, radius, color });
+  }
   line(points, color = [0, 0, 0, 1], width = 8, smooth = 1) {
     if (points.length < 2) return;
     for (let pass = 0; pass < smooth; pass++) {
@@ -122,7 +132,7 @@ export class Renderer {
         width: this.canvas.width,
         height: this.canvas.height,
         mapSize: this.mapSize,
-        draws: this.draws,
+        draws: this.draws.filter((draw) => !draw.type.startsWith("hud")),
       };
     this.pending = this.pending
       .catch(() => {})
